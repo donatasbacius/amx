@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent. Install (replaces HOME_DIR with your home directory):
+    sed "s|HOME_DIR|$HOME|g" contrib/amx.plist > ~/Library/LaunchAgents/amx.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/amx.plist
+  Stop and remove:
+    launchctl bootout gui/$(id -u)/amx && rm ~/Library/LaunchAgents/amx.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>amx</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>HOME_DIR/.local/bin/amx</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>HOME_DIR/.local/bin:HOME_DIR/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardErrorPath</key>
+  <string>HOME_DIR/Library/Logs/amx.log</string>
+  <key>StandardOutPath</key>
+  <string>HOME_DIR/Library/Logs/amx.log</string>
+</dict>
+</plist>

@@ -1,0 +1,9 @@
+# ~/.config/amx/config.toml (all keys optional)
+# port = 7341
+# data_dir = "~/.local/share/amx"   # must be an absolute path if set
+# machine = "laptop"                # name shown as agent@machine; defaults to the Tailscale machine name
+# peers = ["http://100.64.0.2:7341"]  # extra peers; tailnet peers running amx are found automatically
+# tailnet = true                    # listen on this machine's Tailscale IP and discover peers
+# tailscale_bin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+# gh_bin = "gh"
+# allow_logins = ["someone@example.com"]  # restrict tailnet callers; empty allows any identified caller
