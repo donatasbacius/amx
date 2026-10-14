@@ -106,6 +106,7 @@ impl Sim {
                 VoteIn {
                     finding: f.to_string(),
                     vote: vote.into(),
+                    severity: None,
                     reason: (vote == "disagree").then(|| format!("{agent} thinks {f} is wrong")),
                     duplicate_of: dup,
                 }
@@ -321,6 +322,15 @@ fn amend_and_withdraw() {
     };
     sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap();
     sim.s.withdraw("rev-a", &id, "F2", "fair, it's a word", sim.now).unwrap();
+    let stale = VoteIn {
+        finding: "F2".into(),
+        vote: "agree".into(),
+        severity: None,
+        reason: None,
+        duplicate_of: None,
+    };
+    let err = sim.s.vote("rev-b", &id, vec![stale], sim.now).unwrap_err().to_string();
+    assert!(err.contains("F2 was withdrawn") && err.contains("open in round 2: F1"), "{err}");
     assert!(sim.s.withdraw("rev-b", &id, "F1", "not mine", sim.now).is_err());
     assert_eq!(sim.s.review(&id).unwrap().owed_votes("rev-b").len(), 1);
     sim.vote("rev-b", &id, &[("F1", "agree")]);
@@ -517,4 +527,157 @@ fn input_validation() {
     };
     assert!(sim.s.submit("rev-a", &id, bad_sha, sim.now).is_err());
     assert_eq!(sim.phase(&id), Phase::Reviewing);
+}
+
+fn rate(finding: &str, severity: &str) -> VoteIn {
+    VoteIn {
+        finding: finding.into(),
+        vote: "agree".into(),
+        severity: Some(severity.into()),
+        reason: Some("real, but overstated".into()),
+        duplicate_of: None,
+    }
+}
+
+#[test]
+fn overstated_finding_is_confirmed_at_the_severity_its_supporters_back() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("blocking", "no benchmark guards the speedup")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.submit("rev-c", &id, &[]);
+    let mut no = rate("F1", "minor");
+    no.vote = "disagree".into();
+    let err = sim.s.vote("rev-b", &id, vec![no], sim.now).unwrap_err();
+    assert!(err.to_string().contains("severity goes with agree"), "{err}");
+    sim.s.vote("rev-b", &id, vec![rate("F1", "minor")], sim.now).unwrap();
+    sim.s.vote("rev-c", &id, vec![rate("F1", "minor")], sim.now).unwrap();
+    assert_eq!(sim.phase(&id), Phase::Voting(2), "a severity dispute gets a second round");
+    assert!(sim.events("rev-a").contains("agree, as minor"));
+    sim.s.vote("rev-b", &id, vec![rate("F1", "minor")], sim.now).unwrap();
+    sim.s.vote("rev-c", &id, vec![rate("F1", "nit")], sim.now).unwrap();
+    let r = sim.s.review(&id).unwrap();
+    let o = r.finding("F1").unwrap().outcome.clone().unwrap();
+    assert_eq!((o.status, o.severity, o.downgraded), (Status::Confirmed, amx::relay::Severity::Minor, false));
+    assert_eq!(sim.verdict(&id), Verdict::Approve);
+    let result = sim.events("alice-codex");
+    assert!(result.contains("Confirmed findings") && result.contains("raised as blocking; the votes put it at minor") && result.contains("rev-c: agree, as nit"), "{result}");
+}
+
+#[test]
+fn blocking_backed_by_a_majority_but_rated_lower_by_one_becomes_major() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("blocking", "regex is quadratic again")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.submit("rev-c", &id, &[]);
+    for _ in 0..2 {
+        sim.vote("rev-b", &id, &[("F1", "agree")]);
+        sim.s.vote("rev-c", &id, vec![rate("F1", "major")], sim.now).unwrap();
+    }
+    let o = sim.s.review(&id).unwrap().finding("F1").unwrap().outcome.clone().unwrap();
+    assert_eq!((o.severity, o.downgraded), (amx::relay::Severity::Major, true));
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
+}
+
+#[test]
+fn two_reviewers_split_on_severity_is_disputed() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("blocking", "cache key ignores the locale")]);
+    sim.submit("rev-b", &id, &[]);
+    for _ in 0..2 {
+        sim.s.vote("rev-b", &id, vec![rate("F1", "nit")], sim.now).unwrap();
+    }
+    assert_eq!(sim.phase(&id), Phase::Done);
+    let o = sim.s.review(&id).unwrap().finding("F1").unwrap().outcome.clone().unwrap();
+    assert_eq!((o.status, o.severity, o.severity_split), (Status::Disputed, amx::relay::Severity::Blocking, true));
+    assert_eq!(sim.verdict(&id), Verdict::Approve, "a severity dispute doesn't block");
+    let result = sim.events("alice-codex");
+    assert!(result.contains("Disputed") && result.contains("raised as blocking by rev-a; rev-b agrees it's real but rates it nit"), "{result}");
+    assert!(result.contains("rev-b: agree, as nit — real, but overstated"), "{result}");
+    assert!(result.contains("could not agree on F1"), "the author is told to judge it: {result}");
+    let page = amx::web::render_review(sim.s.review(&id).unwrap(), sim.now);
+    assert!(page.contains("disputed severity") && page.contains("raised as blocking by rev-a; rev-b agrees it&#39;s real but rates it nit"));
+}
+
+#[test]
+fn two_reviewers_agreeing_on_severity_confirm_it() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("blocking", "cache key ignores the locale")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.s.vote("rev-b", &id, vec![rate("F1", "blocking")], sim.now).unwrap();
+    assert_eq!(sim.phase(&id), Phase::Done);
+    let o = sim.s.review(&id).unwrap().finding("F1").unwrap().outcome.clone().unwrap();
+    assert_eq!((o.status, o.severity, o.downgraded, o.severity_split), (Status::Confirmed, amx::relay::Severity::Blocking, false, false));
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
+}
+
+#[test]
+fn three_or_more_reviewers_split_on_severity_still_resolve_by_majority() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("blocking", "cache key ignores the locale")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.submit("rev-c", &id, &[]);
+    for _ in 0..2 {
+        sim.s.vote("rev-b", &id, vec![rate("F1", "nit")], sim.now).unwrap();
+        sim.s.vote("rev-c", &id, vec![rate("F1", "minor")], sim.now).unwrap();
+    }
+    let o = sim.s.review(&id).unwrap().finding("F1").unwrap().outcome.clone().unwrap();
+    assert_eq!((o.status, o.severity, o.severity_split), (Status::Confirmed, amx::relay::Severity::Minor, false));
+
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c", "rev-d"]);
+    let id = sim.request("alice-codex", 4);
+    for r in ["rev-a", "rev-b", "rev-c", "rev-d"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("blocking", "cache key ignores the locale")]);
+    for r in ["rev-b", "rev-c", "rev-d"] {
+        sim.submit(r, &id, &[]);
+    }
+    for _ in 0..2 {
+        sim.vote("rev-b", &id, &[("F1", "agree")]);
+        sim.s.vote("rev-c", &id, vec![rate("F1", "nit")], sim.now).unwrap();
+        sim.s.vote("rev-d", &id, vec![rate("F1", "nit")], sim.now).unwrap();
+    }
+    let o = sim.s.review(&id).unwrap().finding("F1").unwrap().outcome.clone().unwrap();
+    assert_eq!((o.status, o.severity, o.severity_split), (Status::Confirmed, amx::relay::Severity::Nit, false), "a tie takes the lower severity");
+    assert_eq!(sim.verdict(&id), Verdict::Approve);
+}
+
+#[test]
+fn closing_remarks_after_the_result_do_not_change_it() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "off by one")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    assert!(sim.events("alice-codex").contains("closing remark"));
+    sim.s.say("alice-codex", &id, "Thanks, fixing the off-by-one now.", sim.now).unwrap();
+    sim.s.say("rev-a", &id, "You're welcome.", sim.now).unwrap();
+    assert!(sim.events("rev-b").contains("fixing the off-by-one"));
+    assert!(sim.s.say("rev-c", &id, "drive-by", sim.now).is_err(), "outsiders still can't talk");
+    let r = sim.s.review(&id).unwrap();
+    assert_eq!(r.phase, Phase::Done);
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
+    assert!(amx::web::render_review(r, sim.now).contains("fixing the off-by-one"));
+    assert!(sim.s.next_actions("alice-codex", sim.now).is_empty() && sim.s.busy_with("rev-a").is_none());
 }

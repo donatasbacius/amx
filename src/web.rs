@@ -1,7 +1,7 @@
 use crate::hub::Hub;
 use crate::relay::{Choice, Finding, Ms, Phase, Review, State, Status, Verdict};
 use crate::tailscale::Identity;
-use crate::text::{dur, iso, phase_badge, short_sha};
+use crate::text::{dur, iso, phase_badge, severity_split, short_sha};
 use axum::Extension;
 use axum::extract::{Path, State as AxState};
 use axum::http::{HeaderMap, StatusCode};
@@ -180,6 +180,7 @@ fn status_badge(f: &Finding) -> String {
         Status::Confirmed => ("changes", "confirmed".to_string()),
         Status::Rejected if carried => ("approved", "resolved".to_string()),
         Status::Rejected => ("closed", "rejected".to_string()),
+        Status::Disputed if o.severity_split => ("stale", "disputed severity".to_string()),
         Status::Disputed => ("stale", "disputed".to_string()),
         Status::Duplicate(t) => ("closed", format!("duplicate of {t}")),
         Status::Withdrawn => ("closed", "withdrawn".to_string()),
@@ -187,6 +188,8 @@ fn status_badge(f: &Finding) -> String {
     let mut s = format!("<span class=\"badge s-{cls}\">{}</span>", esc(&label));
     if o.downgraded {
         s.push_str("<span class=\"badge s-stale\">blocking → major (not unanimous)</span>");
+    } else if o.severity != f.severity {
+        let _ = write!(s, "<span class=\"badge s-stale\">{} → {} (by vote)</span>", f.severity.as_str(), o.severity.as_str());
     }
     s
 }
@@ -221,11 +224,14 @@ fn render_finding(out: &mut String, f: &Finding) {
     if let Some(w) = &f.withdrawn {
         let _ = write!(out, "<div class=\"facts\">withdrawn: {}</div>", esc(w));
     }
+    if let Some(split) = severity_split(f) {
+        let _ = write!(out, "<div class=\"facts\">disputed: {}</div>", esc(&split));
+    }
     if !f.votes.is_empty() {
         out.push_str("<ul class=\"votes\">");
         for (who, v) in &f.votes {
             let (cls, what) = match &v.choice {
-                Choice::Agree => ("agree", "agree".to_string()),
+                Choice::Agree => ("agree", v.severity.map_or("agree".to_string(), |s| format!("agree, as {}", s.as_str()))),
                 Choice::Disagree => ("disagree", "disagree".to_string()),
                 Choice::Duplicate(t) => ("dup", format!("duplicate of {t}")),
             };

@@ -1,4 +1,4 @@
-use crate::relay::{Agent, AgentEvent, Choice, Finding, Ms, OnlineAgent, Phase, Review, Role, Status, Verdict};
+use crate::relay::{Agent, AgentEvent, Choice, Finding, Ms, OnlineAgent, Phase, Review, Role, Status, Verdict, Vote};
 use std::fmt::Write;
 
 pub fn iso(ms: Ms) -> String {
@@ -84,13 +84,14 @@ pub fn review_task(r: &Review, left: &str) -> String {
     if let Some(since) = &r.since_sha {
         let _ = write!(
             s,
-            "This is re-review #{} (previous: {}). Focus on what changed since {}:\n    gh api repos/{}/{}/compare/{}...<headRefOid>\n",
+            "This is re-review #{} (previous: {}). Focus on what changed since {}:\n    gh api repos/{}/{}/compare/{}...{}\n",
             r.iteration,
             r.parent.as_deref().unwrap_or("?"),
             short_sha(since),
             r.pr.owner,
             r.pr.repo,
-            since
+            since,
+            r.head_sha.as_deref().unwrap_or("<headRefOid>")
         );
         let carried: Vec<&Finding> = r.findings.iter().filter(|f| f.by.is_none()).collect();
         if !carried.is_empty() {
@@ -135,7 +136,10 @@ fn votes_lines(f: &Finding) -> String {
     let mut s = String::new();
     for (who, v) in &f.votes {
         let what = match &v.choice {
-            Choice::Agree => "agree".to_string(),
+            Choice::Agree => match v.severity {
+                Some(sev) => format!("agree, as {}", sev.as_str()),
+                None => "agree".to_string(),
+            },
             Choice::Disagree => "disagree".to_string(),
             Choice::Duplicate(t) => format!("duplicate of {t}"),
         };
@@ -191,7 +195,7 @@ pub fn vote_task(r: &Review, agent: &str, owed: &[&Finding], left: &str) -> Stri
         )
     } else {
         format!(
-            "Cross-examination round {round}: these findings drew disagreement. Read the reasons, re-check the code, and vote again (you may change your mind).\n"
+            "Cross-examination round {round}: these findings drew disagreement on whether they are real or on their severity. Read the reasons, re-check the code, and vote again (you may change your mind).\n"
         )
     };
     s.push_str("You must vote on:\n");
@@ -206,8 +210,8 @@ pub fn vote_task(r: &Review, agent: &str, owed: &[&Finding], left: &str) -> Stri
     }
     let _ = writeln!(
         s,
-        "NEXT: call `vote` with review_id \"{}\" and votes like [{{finding: \"{}\", vote: \"agree\"}}, {{finding: \"F2\", vote: \"disagree\", reason: \"why it is wrong\"}}, {{finding: \"F3\", vote: \"duplicate\", duplicate_of: \"F1\"}}]. \
-         A disagree vote needs a concrete reason. Use `say` to discuss with the other reviewers. Round ends in {left}; reviewers who have not voted by then are dropped.",
+        "NEXT: call `vote` with review_id \"{}\" and votes like [{{finding: \"{}\", vote: \"agree\"}}, {{finding: \"F2\", vote: \"agree\", severity: \"minor\", reason: \"real, but overstated\"}}, {{finding: \"F3\", vote: \"disagree\", reason: \"why it is wrong\"}}, {{finding: \"F4\", vote: \"duplicate\", duplicate_of: \"F1\"}}]. \
+         Disagree only when the problem is not real (with a concrete reason); if it is real but its severity is wrong, agree and give the severity you think is fair. Use `say` to discuss with the other reviewers. Round ends in {left}; reviewers who have not voted by then are dropped.",
         r.id,
         owed.first().map(|f| f.id.as_str()).unwrap_or("F1")
     );
@@ -220,7 +224,7 @@ pub fn vote_task(r: &Review, agent: &str, owed: &[&Finding], left: &str) -> Stri
         let ids: Vec<&str> = mine.iter().map(|f| f.id.as_str()).collect();
         let _ = writeln!(
             s,
-            "Your own findings {} are disputed: you may `amend_finding` (clarify, change severity) or `withdraw_finding` if the objection is right.",
+            "Your own findings {} are disputed: you may `amend_finding` (clarify, change severity) or `withdraw_finding` if the objection is right. Do it now: the round ends as soon as the others have voted.",
             ids.join(", ")
         );
     }
@@ -229,11 +233,35 @@ pub fn vote_task(r: &Review, agent: &str, owed: &[&Finding], left: &str) -> Stri
     s
 }
 
+/// How the two supporters of a severity-split finding rate it.
+pub fn severity_split(f: &Finding) -> Option<String> {
+    if !f.outcome.as_ref().is_some_and(|o| o.severity_split) {
+        return None;
+    }
+    let rates = |v: &Vote| v.severity.unwrap_or(f.severity).as_str();
+    let mut voters = f.votes.iter().filter(|(_, v)| v.choice != Choice::Disagree);
+    Some(match &f.by {
+        Some(by) => {
+            let (who, v) = voters.next()?;
+            format!("raised as {} by {by}; {who} agrees it's real but rates it {}", f.severity.as_str(), rates(v))
+        }
+        None => {
+            let (a, va) = voters.next()?;
+            let (b, vb) = voters.next()?;
+            format!("{a} rates it {}; {b} rates it {}", rates(va), rates(vb))
+        }
+    })
+}
+
 fn outcome_line(f: &Finding, carried_label: bool) -> String {
     let o = f.outcome.as_ref().expect("decided");
     let mut s = format!("- {} [{}", f.id, o.severity.as_str());
-    if o.downgraded {
+    if let Some(split) = severity_split(f) {
+        let _ = write!(s, ", disputed: {split}");
+    } else if o.downgraded {
         s.push_str(", downgraded from blocking: not unanimous");
+    } else if o.severity != f.severity {
+        let _ = write!(s, ", raised as {}; the votes put it at {}", f.severity.as_str(), o.severity.as_str());
     }
     let _ = write!(s, "] {}", f.text.trim());
     if let Some(u) = &f.url {
@@ -304,12 +332,16 @@ pub fn result(r: &Review, web: &str) -> String {
         s.push_str("\nConfirmed findings:\n");
         for f in &new_confirmed {
             let _ = writeln!(s, "{}", outcome_line(f, false));
+            if f.outcome.as_ref().is_some_and(|o| o.severity != f.severity) {
+                s.push_str(&votes_lines(f));
+            }
             for d in by_status(&|st| *st == Status::Duplicate(f.id.clone())) {
                 let _ = writeln!(s, "    merged duplicate {} by {}: {}", d.id, d.by.as_deref().unwrap_or("?"), d.text.lines().next().unwrap_or(""));
             }
         }
     }
     let disputed = by_status(&|s| *s == Status::Disputed);
+    let disputed_ids: Vec<&str> = disputed.iter().map(|f| f.id.as_str()).collect();
     if !disputed.is_empty() {
         s.push_str("\nDisputed (reviewers split; use your judgement):\n");
         for f in disputed {
@@ -339,12 +371,24 @@ pub fn result(r: &Review, web: &str) -> String {
         Verdict::ChangesRequested => {
             let _ = write!(
                 s,
-                "NEXT: fix the confirmed findings (and any disputed ones you agree with), push, then call `request_rereview` with review_id \"{}\", new_head_sha and a note on what you changed.",
+                "NEXT: fix the confirmed findings (and any disputed ones you agree with), push, then call `request_rereview` with review_id \"{}\", new_head_sha and a note on what you changed. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                r.id, r.id
+            );
+        }
+        Verdict::Approve if !disputed_ids.is_empty() => {
+            let _ = write!(
+                s,
+                "NEXT: the verdict does not require changes, but the reviewers could not agree on {}: read both sides above and decide whether to fix them (ask your human if unsure). Address minor findings or nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                disputed_ids.join(", "),
                 r.id
             );
         }
         Verdict::Approve => {
-            s.push_str("NEXT: nothing required. Address minor findings or nits if you like; after pushing changes you can `request_rereview`.");
+            let _ = write!(
+                s,
+                "NEXT: nothing required. Address minor findings or nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                r.id
+            );
         }
     }
     s

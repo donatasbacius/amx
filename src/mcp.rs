@@ -86,12 +86,13 @@ pub fn tools() -> Value {
         },
         {
             "name": "vote",
-            "description": "Cross-examination: vote on other reviewers' findings (you must vote on every one the relay lists for you). agree = the problem is real and the severity fair; disagree = wrong or not a problem (reason required, be specific); duplicate = same issue as another finding (give duplicate_of). Verify against the code before agreeing. You can send several votes in one call and change a vote until the round ends.",
+            "description": "Cross-examination: vote on other reviewers' findings (you must vote on every one the relay lists for you). agree = the problem is real; if you think its severity is wrong, still agree and give the severity you think is fair (a confirmed finding takes the severity most of its supporters back; if only the finding's author and you take part and you rate it differently, it ends disputed with both severities shown); disagree = wrong or not a problem at all (reason required, be specific); duplicate = same issue as another finding (give duplicate_of). Verify against the code before agreeing. You can send several votes in one call and change a vote until the round ends.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "votes": { "type": "array", "items": { "type": "object", "properties": {
                     "finding": { "type": "string", "description": "Finding id, e.g. F2 (or C1 for carried-over findings)." },
                     "vote": { "type": "string", "enum": ["agree", "disagree", "duplicate"] },
+                    "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"], "description": "With agree: the severity you think is fair, if it differs from the finding's." },
                     "reason": { "type": "string" },
                     "duplicate_of": { "type": "string" }
                 }, "required": ["finding", "vote"] } }
@@ -99,7 +100,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "say",
-            "description": "Post a message to everyone in a review (its author and reviewers), e.g. to argue for or against a finding or answer a question. Reviewers can talk once findings are revealed; the author can talk any time.",
+            "description": "Post a message to everyone in a review (its author and reviewers), e.g. to argue for or against a finding or answer a question. Reviewers can talk once findings are revealed; the author can talk any time. After the review has finished, messages are closing remarks: they are recorded in the transcript but do not change the result.",
             "inputSchema": { "type": "object", "properties": { "review_id": rid, "text": { "type": "string" } }, "required": ["review_id", "text"] }
         },
         {
@@ -194,6 +195,7 @@ struct SubmitArgs {
 struct VoteArg {
     finding: String,
     vote: String,
+    severity: Option<String>,
     reason: Option<String>,
     duplicate_of: Option<String>,
 }
@@ -356,6 +358,7 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
                 .map(|v| VoteIn {
                     finding: v.finding,
                     vote: v.vote,
+                    severity: v.severity,
                     reason: v.reason,
                     duplicate_of: v.duplicate_of,
                 })

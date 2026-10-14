@@ -87,6 +87,7 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: 
 .when { margin-left: auto; color: var(--muted); font-size: 12px; }
 .facts { font-size: 13px; color: var(--muted); margin-top: 4px; }
 .body { margin-top: 6px; overflow-wrap: anywhere; }
+.md { overflow-wrap: anywhere; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
 .md img { max-width: 100%; }

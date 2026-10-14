@@ -231,6 +231,8 @@ pub enum Choice {
 #[derive(Debug, Clone)]
 pub struct Vote {
     pub choice: Choice,
+    /// On an agree vote: the severity the voter thinks is fair, when it differs.
+    pub severity: Option<Severity>,
     pub reason: Option<String>,
     pub round: u8,
     pub revision: u32,
@@ -251,6 +253,8 @@ pub struct Outcome {
     pub status: Status,
     pub severity: Severity,
     pub downgraded: bool,
+    /// Disputed because its only two supporters rate it differently.
+    pub severity_split: bool,
     pub agree: usize,
     pub disagree: usize,
 }
@@ -428,26 +432,34 @@ pub fn decide(findings: &mut [Finding], c: &Consensus) {
                 status: Status::Withdrawn,
                 severity: f.severity,
                 downgraded: false,
+                severity_split: false,
                 agree: 0,
                 disagree: 0,
             });
             continue;
         }
-        let mut agree = usize::from(f.by.is_some());
+        let mut rated: Vec<Severity> = f.by.iter().map(|_| f.severity).collect();
         let mut disagree = 0;
         for v in f.votes.values() {
             match v.choice {
                 Choice::Disagree => disagree += 1,
-                _ => agree += 1,
+                _ => rated.push(v.severity.unwrap_or(f.severity)),
             }
         }
+        let agree = rated.len();
         let total = (agree + disagree) as f64;
         let mut severity = f.severity;
         let mut downgraded = false;
+        rated.sort();
+        let severity_split = disagree == 0 && agree == 2 && rated[0] != rated[1];
         let status = if let Some(t) = merged.get(&f.id) {
             Status::Duplicate(t.clone())
+        } else if severity_split {
+            Status::Disputed
         } else if total > 0.0 && agree as f64 > c.confirm_fraction * total {
-            if severity == Severity::Blocking && c.blocking_unanimous && disagree > 0 {
+            severity = rated[agree / 2];
+            let unanimous = disagree == 0 && rated.iter().all(|s| *s == Severity::Blocking);
+            if severity == Severity::Blocking && c.blocking_unanimous && !unanimous {
                 severity = Severity::Major;
                 downgraded = true;
             }
@@ -461,6 +473,7 @@ pub fn decide(findings: &mut [Finding], c: &Consensus) {
             status,
             severity,
             downgraded,
+            severity_split,
             agree,
             disagree,
         });
@@ -529,6 +542,7 @@ pub struct FindingIn {
 pub struct VoteIn {
     pub finding: String,
     pub vote: String,
+    pub severity: Option<String>,
     pub reason: Option<String>,
     pub duplicate_of: Option<String>,
 }
@@ -1008,6 +1022,13 @@ impl State {
         if votes.is_empty() {
             bail!("no votes given");
         }
+        let open: Vec<&str> = r
+            .findings
+            .iter()
+            .filter(|f| f.withdrawn.is_none() && f.by.as_deref() != Some(agent) && f.open_round == round)
+            .map(|f| f.id.as_str())
+            .collect();
+        let open = format!("nothing was recorded; resend only votes on findings open in round {round}: {}", open.join(", "));
         let mut parsed = Vec::new();
         for v in &votes {
             let f = r.finding(&v.finding).ok_or_else(|| anyhow!("{} has no finding {}", r.id, v.finding))?;
@@ -1015,17 +1036,30 @@ impl State {
                 bail!("{} is your own finding; use amend_finding or withdraw_finding instead", f.id);
             }
             if f.withdrawn.is_some() {
-                bail!("{} was withdrawn", f.id);
+                bail!("{} was withdrawn, so it needs no vote; {open}", f.id);
             }
             if f.open_round != round {
-                bail!("{} is not open for voting in round {round}", f.id);
+                bail!("{} is not open for voting in round {round}; {open}", f.id);
             }
             let reason = v.reason.as_deref().map(|s| clip(s, MAX_TEXT)).filter(|s| !s.is_empty());
+            let severity = v
+                .severity
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| Severity::parse(s).ok_or_else(|| anyhow!("{}: severity must be blocking, major, minor or nit", f.id)))
+                .transpose()?;
             let choice = match v.vote.trim().to_ascii_lowercase().replace('-', "_").as_str() {
                 "agree" => Choice::Agree,
                 "disagree" => {
                     if reason.is_none() {
                         bail!("disagreeing with {} needs a reason", f.id);
+                    }
+                    if severity.is_some() {
+                        bail!(
+                            "{}: severity goes with agree. If the problem is real but over- or understated, vote agree with the severity you think is fair; disagree only if it is not a real problem",
+                            f.id
+                        );
                     }
                     Choice::Disagree
                 }
@@ -1039,20 +1073,23 @@ impl State {
                 }
                 other => bail!("{}: vote must be agree, disagree or duplicate (got {other})", f.id),
             };
-            parsed.push((f.id.clone(), choice, reason));
+            let severity = severity.filter(|s| choice == Choice::Agree && *s != f.severity);
+            parsed.push((f.id.clone(), choice, severity, reason));
         }
         let n = parsed.len();
-        for (fid, choice, reason) in parsed {
-            let line = match &choice {
-                Choice::Agree => format!("{fid}: agree"),
-                Choice::Disagree => format!("{fid}: disagree"),
-                Choice::Duplicate(t) => format!("{fid}: duplicate of {t}"),
+        for (fid, choice, severity, reason) in parsed {
+            let line = match (&choice, severity) {
+                (Choice::Agree, Some(s)) => format!("{fid}: agree, as {}", s.as_str()),
+                (Choice::Agree, None) => format!("{fid}: agree"),
+                (Choice::Disagree, _) => format!("{fid}: disagree"),
+                (Choice::Duplicate(t), _) => format!("{fid}: duplicate of {t}"),
             } + &reason.as_deref().map(|s| format!(" — {s}")).unwrap_or_default();
             let f = r.findings.iter_mut().find(|f| f.id == fid).expect("validated");
             f.votes.insert(
                 agent.to_string(),
                 Vote {
                     choice,
+                    severity,
                     reason,
                     round,
                     revision: f.revision,
@@ -1068,14 +1105,11 @@ impl State {
     pub fn say(&mut self, agent: &str, id: &str, msg: &str, now: Ms) -> Result<()> {
         let msg = need_text(msg, "message")?;
         let r = self.review_mut(id)?;
-        if !r.phase.active() {
-            bail!("{} is finished", r.id);
-        }
         let reviewer = r.slot(agent).is_some_and(Slot::active);
         if !reviewer && r.author != agent {
             bail!("only the author and active reviewers of {} can talk in it", r.id);
         }
-        if reviewer && !matches!(r.phase, Phase::Voting(_)) {
+        if reviewer && matches!(r.phase, Phase::Offering | Phase::Reviewing) {
             bail!("reviewers can discuss once findings are revealed (cross-examination); work independently until then");
         }
         r.log(now, agent, "say", msg.clone());
@@ -1397,7 +1431,8 @@ impl State {
                         .filter(|(_, f)| {
                             let disagree = f.votes.values().any(|v| v.choice == Choice::Disagree);
                             let agree = f.by.is_some() || f.votes.values().any(|v| v.choice != Choice::Disagree);
-                            f.withdrawn.is_none() && disagree && agree
+                            let rerated = f.votes.values().any(|v| v.severity.is_some());
+                            f.withdrawn.is_none() && agree && (disagree || rerated)
                         })
                         .map(|(i, _)| i)
                         .collect();
