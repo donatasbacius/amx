@@ -2,19 +2,19 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   launchd user agent. Install (replaces HOME_DIR with your home directory):
-    sed "s|HOME_DIR|$HOME|g" contrib/amx.plist > ~/Library/LaunchAgents/amx.plist
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/amx.plist
+    sed "s|HOME_DIR|$HOME|g" contrib/amx-relay.plist > ~/Library/LaunchAgents/amx-relay.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/amx-relay.plist
   Stop and remove:
-    launchctl bootout gui/$(id -u)/amx && rm ~/Library/LaunchAgents/amx.plist
+    launchctl bootout gui/$(id -u)/amx-relay && rm ~/Library/LaunchAgents/amx-relay.plist
 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>amx</string>
+  <string>amx-relay</string>
   <key>ProgramArguments</key>
   <array>
     <string>HOME_DIR/.local/bin/amx</string>
-    <string>serve</string>
+    <string>relay</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -28,8 +28,8 @@
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardErrorPath</key>
-  <string>HOME_DIR/Library/Logs/amx.log</string>
+  <string>HOME_DIR/Library/Logs/amx-relay.log</string>
   <key>StandardOutPath</key>
-  <string>HOME_DIR/Library/Logs/amx.log</string>
+  <string>HOME_DIR/Library/Logs/amx-relay.log</string>
 </dict>
 </plist>

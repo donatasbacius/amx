@@ -1,127 +1,120 @@
-mod common;
+//! The binary: relay process, stdio MCP proxy, Stop hook and watch.
 
-use common::{PR, free_port};
-use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use serde_json::Value;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_amx");
 
-fn spawn(dir: &Path, name: &str, port: u16, peer: u16) -> Child {
-    Command::new(BIN)
-        .args(["serve", "--no-tailnet", "--sync-interval", "1", "--machine", name])
-        .args(["--port", &port.to_string()])
-        .args(["--data-dir", &dir.join(name).to_string_lossy()])
-        .args(["--peer", &format!("http://127.0.0.1:{peer}")])
-        .args(["--gh-bin", "/nonexistent/gh"])
-        .env("XDG_CONFIG_HOME", dir)
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+struct Kill(Child);
+
+impl Drop for Kill {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn relay() -> (Kill, String) {
+    let port = free_port();
+    let child = Command::new(BIN)
+        .args(["relay", "--no-tailnet", "--port", &port.to_string()])
+        .env("XDG_CONFIG_HOME", "/nonexistent")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "relay did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    (Kill(child), url)
 }
 
-fn cli(port: u16, args: &[&str]) -> Output {
-    Command::new(BIN)
-        .env("AMX_NODE", format!("http://127.0.0.1:{port}"))
-        .args(args)
+#[test]
+fn missing_explicit_config_is_an_error() {
+    let out = Command::new(BIN)
+        .args(["relay", "--no-tailnet", "--config", "/nonexistent/amx.toml"])
         .output()
-        .unwrap()
+        .unwrap();
+    assert!(!out.status.success());
 }
 
-fn count(port: u16) -> Option<i64> {
-    let out = cli(port, &["status", "--json"]);
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    v["messages"].as_i64()
-}
-
-fn wait_count(port: u16, n: i64) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if count(port) == Some(n) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("node on {port} never reached {n} messages (has {:?})", count(port));
-}
-
-#[test]
-fn killed_process_catches_up_after_restart() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (pa, pb) = (free_port(), free_port());
-    let mut a = spawn(tmp.path(), "a", pa, pb);
-    let mut b = spawn(tmp.path(), "b", pb, pa);
-    let post = |port: u16, agent: &str, body: &str| {
-        let out = cli(port, &["post", "reply", PR, "-m", body, "--agent", agent]);
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    };
-    wait_count(pa, 0);
-    wait_count(pb, 0);
-    post(pa, "alice", "one");
-    wait_count(pb, 1);
-
-    b.kill().unwrap();
-    b.wait().unwrap();
-    for i in 0..5 {
-        post(pa, "alice", &format!("while b is dead {i}"));
-    }
-    std::thread::sleep(Duration::from_millis(1500));
-    b = spawn(tmp.path(), "b", pb, pa);
-    wait_count(pb, 6);
-    post(pb, "bob", "back");
-    wait_count(pa, 7);
-
-    let out = cli(pb, &["inbox", "--agent", "alice", "--json"]);
+fn hook(url: &str, agent: &str, extra: &[&str]) -> String {
+    let mut child = Command::new(BIN)
+        .args(["hook", "codex", "stop", "--relay", url, "--agent", agent])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"hook_event_name":"Stop","stop_hook_active":false}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
-    let thread = cli(pa, &["thread", PR]);
-    let text = String::from_utf8_lossy(&thread.stdout);
-    assert!(text.contains("bob@b replied") && text.contains("while b is dead 4"), "{text}");
-
-    a.kill().unwrap();
-    b.kill().unwrap();
-    let _ = (a.wait(), b.wait());
+    String::from_utf8(out.stdout).unwrap()
 }
 
 #[test]
-fn hook_output_and_unreachable_node() {
-    let tmp = tempfile::tempdir().unwrap();
-    let p = free_port();
-    let mut a = spawn(tmp.path(), "a", p, free_port());
-    wait_count(p, 0);
-    let run_hook = |event: &str, stdin: &str| {
-        let mut child = Command::new(BIN)
-            .env("AMX_NODE", format!("http://127.0.0.1:{p}"))
-            .args(["hook", "codex", event, "--agent", "bob"])
+fn stdio_proxy_hook_and_watch() {
+    let (_relay, url) = relay();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut proxy = Kill(
+        Command::new(BIN)
+            .args(["mcp", "--relay", &format!("{url}/mcp"), "--agent", "rev-codex", "--role", "reviewer"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .unwrap();
-        use std::io::Write;
-        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
-        child.wait_with_output().unwrap()
+            .unwrap(),
+    );
+    let mut stdin = proxy.0.stdin.take().unwrap();
+    let mut lines = BufReader::new(proxy.0.stdout.take().unwrap()).lines();
+    let mut call = |line: &str| -> Value {
+        writeln!(stdin, "{line}").unwrap();
+        serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap()
     };
-    let out = run_hook("stop", r#"{"hook_event_name":"Stop","stop_hook_active":false}"#);
-    assert!(out.status.success());
-    assert!(out.stdout.is_empty(), "no mail, no output");
-    let o = cli(p, &["post", "request", PR, "--to", "bob", "-m", "review please", "--agent", "alice"]);
-    assert!(o.status.success());
-    let out = run_hook("stop", "{}");
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let init = call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"codex-mcp-client"}}}"#);
+    assert!(init["result"]["instructions"].as_str().unwrap().contains("rev-codex"));
+    let tools = call(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 13);
+
+    let mut watcher = Kill(
+        Command::new(BIN)
+            .args(["watch", "--relay", &url, "--agent", "rev-codex"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut watch_lines = BufReader::new(watcher.0.stdout.take().unwrap()).lines();
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert_eq!(hook(&url, "rev-codex", &[]), "", "idle reviewer may stop");
+    assert!(hook(&url, "rev-codex", &["--keep-waiting"]).contains("\"decision\":\"block\""));
+
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_review","arguments":{"pr_url":"https://github.com/rust-lang/rust/pull/1","reviewers":1}}}"#;
+    let out = Command::new("curl")
+        .args(["-sS", "-H", "content-type: application/json", "-d", body])
+        .arg(format!("{url}/mcp?agent=owner-claude"))
+        .output()
+        .unwrap();
+    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r["result"]["isError"], false, "{r}");
+
+    let line = watch_lines.next().unwrap().unwrap();
+    assert!(line.starts_with("amx r1 [r1] Review offer"), "{line}");
+    let block = hook(&url, "rev-codex", &[]);
+    let v: Value = serde_json::from_str(&block).unwrap();
     assert_eq!(v["decision"], "block");
-    assert!(v["reason"].as_str().unwrap().contains("review please"));
-    let again = run_hook("stop", "{}");
-    assert!(again.stdout.is_empty(), "each item is surfaced once");
-    let start = run_hook("session-start", "{}");
-    let v: serde_json::Value = serde_json::from_slice(&start.stdout).unwrap();
-    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
-    let ups = run_hook("", r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#);
-    assert!(ups.stdout.is_empty());
-    a.kill().unwrap();
-    let _ = a.wait();
-    let down = run_hook("stop", "{}");
-    assert!(down.status.success() && down.stdout.is_empty(), "node down must not break the agent");
+    assert!(v["reason"].as_str().unwrap().contains("accept_review"));
+
+    let w = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wait","arguments":{"timeout_seconds":5}}}"#);
+    assert!(w["result"]["content"][0]["text"].as_str().unwrap().contains("Review offer"), "{w}");
+    assert_eq!(hook("http://127.0.0.1:1", "rev-codex", &[]), "", "unreachable relay never blocks");
 }

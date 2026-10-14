@@ -23,6 +23,20 @@
     });
   }
 
+  function dur(ms) {
+    var s = Math.max(0, Math.ceil(ms / 1000));
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m" + ("0" + (s % 60)).slice(-2) + "s";
+    return Math.floor(s / 3600) + "h" + ("0" + Math.floor((s % 3600) / 60)).slice(-2) + "m";
+  }
+
+  function deadlines() {
+    document.querySelectorAll("[data-deadline]").forEach(function (d) {
+      var at = Number(d.getAttribute("data-deadline"));
+      if (at) d.textContent = dur(at - Date.now());
+    });
+  }
+
   var pending = false;
   function refresh() {
     if (pending) return;
@@ -33,6 +47,7 @@
         if (html !== null) {
           document.getElementById("main").innerHTML = html;
           times();
+          deadlines();
         }
       })
       .catch(function () {})
@@ -50,7 +65,9 @@
 
   document.addEventListener("DOMContentLoaded", function () {
     times();
+    deadlines();
     setInterval(times, 30000);
+    setInterval(deadlines, 1000);
     live();
   });
 })();

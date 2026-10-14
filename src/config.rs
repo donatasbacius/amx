@@ -9,37 +9,77 @@ pub const DEFAULT_PORT: u16 = 7341;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub port: u16,
-    pub data_dir: PathBuf,
-    /// Display name for this machine; defaults to the Tailscale machine name, then the hostname.
-    pub machine: Option<String>,
-    /// Extra peers to sync with, e.g. "http://100.64.0.2:7341".
-    pub peers: Vec<String>,
-    /// Listen on the Tailscale address and discover peers from `tailscale status`.
+    /// Also listen on this machine's Tailscale IPv4 address.
     pub tailnet: bool,
     pub tailscale_bin: Option<PathBuf>,
-    pub gh_bin: PathBuf,
-    pub sync_interval_secs: u64,
-    pub discover_interval_secs: u64,
     /// Tailscale logins allowed to connect over the tailnet. Empty allows any identified caller.
     pub allow_logins: Vec<String>,
     /// Testing only: listen here with tailnet (whois) identity rules instead of the Tailscale IP.
     pub tailnet_listen: Option<SocketAddr>,
+    pub timing: Timing,
+    pub consensus: Consensus,
+    /// Finished reviews kept in memory for the web page and `review_status`.
+    pub history: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Timing {
+    /// An agent is online while it has called the relay within this many seconds.
+    pub online_secs: u64,
+    /// An assigned reviewer silent this long is dropped from its review.
+    pub drop_after_secs: u64,
+    pub offer_secs: u64,
+    pub review_secs: u64,
+    pub vote_secs: u64,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Timing {
+            online_secs: 90,
+            drop_after_secs: 300,
+            offer_secs: 120,
+            review_secs: 1200,
+            vote_secs: 600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Consensus {
+    pub reviewers: usize,
+    /// A finding is confirmed when more than this fraction of its voters (author included) agree,
+    /// and rejected when more than this fraction disagree; anything else is disputed.
+    pub confirm_fraction: f64,
+    /// Blocking findings stay blocking only if nobody disagrees; otherwise they become major.
+    pub blocking_unanimous: bool,
+    pub vote_rounds: u8,
+}
+
+impl Default for Consensus {
+    fn default() -> Self {
+        Consensus {
+            reviewers: 2,
+            confirm_fraction: 0.5,
+            blocking_unanimous: true,
+            vote_rounds: 2,
+        }
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             port: DEFAULT_PORT,
-            data_dir: data_home().join("amx"),
-            machine: None,
-            peers: Vec::new(),
             tailnet: true,
             tailscale_bin: None,
-            gh_bin: PathBuf::from("gh"),
-            sync_interval_secs: 5,
-            discover_interval_secs: 60,
             allow_logins: Vec::new(),
             tailnet_listen: None,
+            timing: Timing::default(),
+            consensus: Consensus::default(),
+            history: 50,
         }
     }
 }
@@ -58,13 +98,6 @@ pub fn config_home() -> PathBuf {
         .unwrap_or_else(|| home().join(".config"))
 }
 
-pub fn data_home() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share"))
-}
-
 pub fn default_path() -> PathBuf {
     config_home().join("amx/config.toml")
 }
@@ -79,10 +112,6 @@ impl Config {
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
-
-    pub fn local_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
 }
 
 #[cfg(test)]
@@ -91,9 +120,11 @@ mod tests {
 
     #[test]
     fn parses_partial_config() {
-        let c: Config = toml::from_str("port = 9000\npeers = [\"http://1.2.3.4:9000\"]").unwrap();
+        let c: Config = toml::from_str("port = 9000\n[timing]\nvote_secs = 60\n[consensus]\nreviewers = 3").unwrap();
         assert_eq!(c.port, 9000);
-        assert_eq!(c.peers.len(), 1);
+        assert_eq!(c.timing.vote_secs, 60);
+        assert_eq!(c.timing.offer_secs, 120);
+        assert_eq!(c.consensus.reviewers, 3);
         assert!(c.tailnet);
         assert!(toml::from_str::<Config>("prot = 1").is_err());
     }

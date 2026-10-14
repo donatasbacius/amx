@@ -1,159 +1,45 @@
 use amx::client::Client;
 use amx::config::Config;
-use amx::model::{Finding, Kind, Verdict};
-use amx::node::PostInput;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use std::collections::HashSet;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
-#[command(name = "amx", version, about = "Agent message exchange: share PR reviews between coding agents over a tailnet")]
+#[command(name = "amx", version, about = "Agent message exchange: a tailnet relay where coding agents review pull requests together")]
 struct Cli {
-    /// Config file (default ~/.config/amx/config.toml)
-    #[arg(long, global = true, env = "AMX_CONFIG")]
-    config: Option<PathBuf>,
-    /// Local node URL (default http://127.0.0.1:<port from config>)
-    #[arg(long, global = true, env = "AMX_NODE")]
-    node: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(clap::Args, Clone)]
-struct AgentArg {
-    /// Agent name, e.g. alice-claude-1; shown as name@machine
+struct Target {
+    /// Relay URL, e.g. http://100.64.0.1:7341
+    #[arg(long, env = "AMX_RELAY")]
+    relay: String,
+    /// Agent name, unique per person, e.g. alice-claude
     #[arg(long, env = "AMX_AGENT")]
     agent: Option<String>,
+    /// reviewer or author
+    #[arg(long, env = "AMX_ROLE")]
+    role: Option<String>,
 }
 
-#[derive(Subcommand)]
-enum Cmd {
-    /// Run the node daemon
-    Serve {
-        #[arg(long)]
-        port: Option<u16>,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Extra peer URL to sync with (repeatable)
-        #[arg(long = "peer")]
-        peers: Vec<String>,
-        /// Do not use Tailscale: no tailnet listener, no discovery (local testing)
-        #[arg(long)]
-        no_tailnet: bool,
-        #[arg(long)]
-        machine: Option<String>,
-        /// TESTING ONLY: extra listener that applies tailnet (whois) identity rules
-        #[arg(long, hide = true)]
-        tailnet_listen: Option<SocketAddr>,
-        #[arg(long)]
-        tailscale_bin: Option<PathBuf>,
-        #[arg(long)]
-        gh_bin: Option<PathBuf>,
-        #[arg(long)]
-        sync_interval: Option<u64>,
-    },
-    /// MCP server on stdio (proxies to the local node)
-    Mcp {
-        #[command(flatten)]
-        agent: AgentArg,
-    },
-    /// Print one line per new inbox item, forever (for Claude Code's Monitor tool)
-    Watch {
-        #[command(flatten)]
-        agent: AgentArg,
-        /// Skip items that are already unread when watch starts
-        #[arg(long)]
-        new_only: bool,
-    },
-    /// Show unread messages
-    Inbox {
-        #[command(flatten)]
-        agent: AgentArg,
-        #[arg(long)]
-        mark_read: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Mark messages read
-    Read {
-        #[command(flatten)]
-        agent: AgentArg,
-        ids: Vec<String>,
-        /// Mark the whole current inbox read
-        #[arg(long)]
-        all: bool,
-    },
-    /// Post a message to a PR thread
-    Post {
-        #[command(flatten)]
-        agent: AgentArg,
-        kind: PostKind,
-        pr_url: String,
-        /// Text (Markdown); "-" reads stdin
-        #[arg(short = 'm', long)]
-        body: Option<String>,
-        #[arg(long)]
-        to: Option<String>,
-        #[arg(long, value_enum)]
-        verdict: Option<VerdictArg>,
-        /// JSON file with an array of findings [{severity,path,line,url,text}]; "-" for stdin
-        #[arg(long)]
-        findings: Option<PathBuf>,
-        #[arg(long)]
-        head_sha: Option<String>,
-        #[arg(long)]
-        in_reply_to: Option<String>,
-        /// Post as the local human user instead of an agent
-        #[arg(long)]
-        human: bool,
-    },
-    /// List threads
-    Threads {
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show one thread
-    Thread {
-        pr_url: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Node, peers and sync state
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Agent hook helpers: `amx hook codex stop` (reads hook JSON on stdin)
-    Hook {
-        client: HookClient,
-        /// session-start | user-prompt-submit | stop (default: from stdin hook_event_name)
-        event: Option<String>,
-        #[command(flatten)]
-        agent: AgentArg,
-    },
-}
+impl Target {
+    fn client(&self) -> Client {
+        Client::new(&self.relay, self.agent.clone(), self.role.clone())
+    }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum PostKind {
-    Request,
-    Claim,
-    Review,
-    Reply,
-    Close,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum VerdictArg {
-    Approve,
-    RequestChanges,
-    Comment,
+    fn named(&self) -> Result<Client> {
+        match &self.agent {
+            Some(a) if amx::server::valid_agent(a) => Ok(self.client()),
+            _ => bail!("--agent (or AMX_AGENT) is required: letters, digits, - _ ."),
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -162,22 +48,49 @@ enum HookClient {
     Claude,
 }
 
-fn agent_or(a: &AgentArg, default: Option<&str>) -> Result<String> {
-    match a.agent.as_deref().map(str::trim).filter(|s| !s.is_empty()).or(default) {
-        Some(n) if amx::server::valid_agent(n) => Ok(n.to_string()),
-        Some(n) => bail!("invalid agent name {n:?}: use letters, digits, - _ ."),
-        None => bail!("agent name required: pass --agent or set AMX_AGENT (e.g. AMX_AGENT=alice-claude-1)"),
-    }
+#[derive(Clone, Copy, ValueEnum)]
+enum HookEvent {
+    Stop,
 }
 
-fn read_arg(s: &str) -> Result<String> {
-    if s == "-" {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        Ok(buf)
-    } else {
-        Ok(s.to_string())
-    }
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the relay (in memory; restart starts empty)
+    Relay {
+        /// Config file (default ~/.config/amx/config.toml)
+        #[arg(long, env = "AMX_CONFIG")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        port: Option<u16>,
+        /// Loopback only: no Tailscale listener
+        #[arg(long)]
+        no_tailnet: bool,
+        #[arg(long)]
+        tailscale_bin: Option<PathBuf>,
+        /// TESTING ONLY: extra listener that applies tailnet (whois) identity rules
+        #[arg(long, hide = true)]
+        tailnet_listen: Option<SocketAddr>,
+    },
+    /// MCP server on stdio that forwards to a relay (for clients that prefer stdio)
+    Mcp {
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Print one line per new relay event for an agent (for Claude Code's Monitor tool)
+    Watch {
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Agent hook: `amx hook codex stop` blocks stopping while a review needs the agent
+    Hook {
+        client: HookClient,
+        event: HookEvent,
+        #[command(flatten)]
+        target: Target,
+        /// Reviewers: also block stopping when idle, so the agent keeps looping on `wait`
+        #[arg(long)]
+        keep_waiting: bool,
+    },
 }
 
 #[tokio::main]
@@ -190,169 +103,46 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let mut cfg = Config::load(cli.config.as_deref())?;
-    let client = Client::new(cli.node.as_deref().unwrap_or(&cfg.local_url()));
     match cli.cmd {
-        Cmd::Serve {
+        Cmd::Relay {
+            config,
             port,
-            data_dir,
-            peers,
             no_tailnet,
-            machine,
-            tailnet_listen,
             tailscale_bin,
-            gh_bin,
-            sync_interval,
+            tailnet_listen,
         } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_env("AMX_LOG")
-                        .unwrap_or_else(|_| "amx=info".into()),
+                    tracing_subscriber::EnvFilter::try_from_env("AMX_LOG").unwrap_or_else(|_| "amx=info".into()),
                 )
                 .with_writer(std::io::stderr)
                 .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
                 .init();
+            let mut cfg = Config::load(config.as_deref())?;
             if let Some(p) = port {
                 cfg.port = p;
             }
-            if let Some(d) = data_dir {
-                cfg.data_dir = d;
-            }
-            cfg.peers.extend(peers);
             if no_tailnet {
                 cfg.tailnet = false;
             }
-            cfg.machine = machine.or(cfg.machine);
             cfg.tailnet_listen = tailnet_listen.or(cfg.tailnet_listen);
             cfg.tailscale_bin = tailscale_bin.or(cfg.tailscale_bin);
-            if let Some(g) = gh_bin {
-                cfg.gh_bin = g;
-            }
-            if let Some(s) = sync_interval {
-                cfg.sync_interval_secs = s;
-            }
             let running = amx::start(cfg).await?;
             shutdown_signal().await;
             tracing::info!("shutting down");
             running.stop().await;
         }
-        Cmd::Mcp { agent } => mcp_stdio(&client, agent.agent).await?,
-        Cmd::Watch { agent, new_only } => {
-            let agent = agent_or(&agent, None)?;
-            watch(&client, &agent, new_only).await?;
-        }
-        Cmd::Inbox { agent, mark_read, json } => {
-            let agent = agent_or(&agent, None)?;
-            let items = client.inbox(&agent, false, false, mark_read).await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&items)?);
-            } else {
-                println!("{}", amx::text::inbox(&agent, &items));
-            }
-        }
-        Cmd::Read { agent, ids, all } => {
-            let agent = agent_or(&agent, None)?;
-            let ids = if all {
-                client.inbox(&agent, false, false, false).await?.into_iter().map(|i| i.message.id).collect()
-            } else {
-                ids
-            };
-            let r = client.mark(&agent, &ids, false).await?;
-            println!("marked {} read", r["marked"]);
-        }
-        Cmd::Post {
-            agent,
-            kind,
-            pr_url,
-            body,
-            to,
-            verdict,
-            findings,
-            head_sha,
-            in_reply_to,
-            human,
+        Cmd::Mcp { target } => mcp_stdio(target).await?,
+        Cmd::Watch { target } => watch(target.named()?).await,
+        Cmd::Hook {
+            client: _,
+            event: HookEvent::Stop,
+            target,
+            keep_waiting,
         } => {
-            let agent = if human { None } else { Some(agent_or(&agent, None)?) };
-            let findings: Vec<Finding> = match findings {
-                Some(p) => {
-                    let text = if p.as_os_str() == "-" {
-                        read_arg("-")?
-                    } else {
-                        std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
-                    };
-                    serde_json::from_str(&text).context("findings must be a JSON array of {severity,path,line,url,text}")?
-                }
-                None => Vec::new(),
-            };
-            let input = PostInput {
-                kind: Some(match kind {
-                    PostKind::Request => Kind::Request,
-                    PostKind::Claim => Kind::Claim,
-                    PostKind::Review => Kind::Review,
-                    PostKind::Reply => Kind::Reply,
-                    PostKind::Close => Kind::Close,
-                }),
-                pr_url,
-                body: body.as_deref().map(read_arg).transpose()?.unwrap_or_default(),
-                to,
-                verdict: verdict.map(|v| match v {
-                    VerdictArg::Approve => Verdict::Approve,
-                    VerdictArg::RequestChanges => Verdict::RequestChanges,
-                    VerdictArg::Comment => Verdict::Comment,
-                }),
-                findings,
-                head_sha,
-                in_reply_to,
-            };
-            let m = client.post_message(agent.as_deref(), human, &input).await?;
-            println!("posted {} {} on {}", m.kind.as_str(), m.id, m.thread);
-        }
-        Cmd::Threads { all, json } => {
-            let threads: Vec<_> = client
-                .threads()
-                .await?
-                .into_iter()
-                .filter(|t| all || t.status != amx::model::Status::Closed)
-                .collect();
-            if json {
-                println!("{}", serde_json::to_string_pretty(&threads)?);
-            } else if threads.is_empty() {
-                println!("no threads");
-            } else {
-                for t in &threads {
-                    println!("{}", amx::text::summary_line(t));
-                }
-            }
-        }
-        Cmd::Thread { pr_url, json } => {
-            let v = client.thread(&pr_url).await?.ok_or_else(|| anyhow!("no thread for {pr_url}"))?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&v)?);
-            } else {
-                print!("{}", amx::text::thread(&v));
-            }
-        }
-        Cmd::Status { json } => {
-            let s = client.status().await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&s)?);
-            } else {
-                print_status(&s);
-            }
-        }
-        Cmd::Hook { client: which, event, agent } => {
-            let default = match which {
-                HookClient::Codex => "codex",
-                HookClient::Claude => "claude",
-            };
-            let agent = agent_or(&agent, Some(default))?;
-            let event = match event.as_deref().filter(|e| !e.is_empty()) {
-                Some(e) => Some(amx::hooks::Event::parse(e).ok_or_else(|| anyhow!("unknown hook event {e}"))?),
-                None => None,
-            };
             let mut stdin = String::new();
             let _ = std::io::stdin().read_to_string(&mut stdin);
-            if let Some(out) = amx::hooks::run(&client, &agent, event, &stdin).await {
+            if let Some(out) = amx::hooks::stop(&target.named()?, keep_waiting).await {
                 println!("{out}");
             }
         }
@@ -376,95 +166,41 @@ async fn shutdown_signal() {
     }
 }
 
-async fn watch(client: &Client, agent: &str, new_only: bool) -> Result<()> {
-    let mut seen: HashSet<String> = HashSet::new();
-    if new_only {
-        for i in client.inbox(agent, false, false, false).await? {
-            seen.insert(i.message.id);
-        }
-    }
-    let mut down_since: Option<std::time::Instant> = None;
+async fn watch(client: Client) {
+    let mut after = match client.watch(u64::MAX, 1).await {
+        Ok(v) => v["last"].as_u64().unwrap_or(0),
+        Err(_) => 0,
+    };
+    let mut down = false;
     loop {
-        match client.wait(agent, 300, false, false).await {
-            Ok(items) => {
-                if down_since.take().is_some() {
-                    eprintln!("amx watch: node is back");
+        match client.watch(after, 50).await {
+            Ok(v) => {
+                if std::mem::take(&mut down) {
+                    eprintln!("amx watch: relay is back");
                 }
-                let fresh: Vec<_> = items.iter().filter(|i| !seen.contains(&i.message.id)).collect();
-                for i in &fresh {
-                    println!("{}", amx::text::item_line(i));
-                    seen.insert(i.message.id.clone());
+                let last = v["last"].as_u64().unwrap_or(after);
+                for l in v["lines"].as_array().into_iter().flatten() {
+                    println!("{}", l.as_str().unwrap_or(""));
                 }
-                if fresh.is_empty() {
-                    // Everything unread was already printed; wait for the next change.
-                    wait_for_change(client, agent, &seen).await;
-                }
+                // A relay restart resets sequence numbers.
+                after = last;
             }
             Err(e) => {
-                if down_since.is_none() {
+                if !down {
                     eprintln!("amx watch: {e:#}; retrying");
-                    down_since = Some(std::time::Instant::now());
+                    down = true;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }
 }
 
-async fn wait_for_change(client: &Client, agent: &str, seen: &HashSet<String>) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match client.inbox(agent, false, false, false).await {
-            Ok(items) if items.iter().any(|i| !seen.contains(&i.message.id)) => return,
-            Ok(_) => {}
-            Err(_) => return,
-        }
-    }
-}
-
-fn print_status(s: &amx::server::StatusReport) {
-    println!("node {} ({}) amx {}", s.machine, s.node_id, s.version);
-    for l in &s.listening {
-        println!("  listening {l}");
-    }
-    if let Some(t) = &s.tailscale_bin {
-        println!("  tailscale CLI {t}");
-    }
-    println!("  {} messages from {} origin(s)", s.messages, s.vv.len());
-    if s.peers.is_empty() {
-        println!("  no outbound peers");
-    }
-    let now = amx::model::now_ms();
-    for p in &s.peers {
-        let (mut they_lack, mut we_lack) = (0i64, 0i64);
-        for (o, &n) in &s.vv {
-            they_lack += (n - p.vv.get(o).copied().unwrap_or(0)).max(0);
-        }
-        for (o, &n) in &p.vv {
-            we_lack += (n - s.vv.get(o).copied().unwrap_or(0)).max(0);
-        }
-        let state = match (&p.last_err, p.last_ok) {
-            (Some(e), _) => format!("ERROR {e}"),
-            (None, Some(t)) => format!("ok {}s ago, they lack {they_lack}, we lack {we_lack}", (now - t) / 1000),
-            (None, None) => "not contacted yet".into(),
-        };
-        println!(
-            "  peer {} [{:?}] {}: {state}",
-            p.url,
-            p.source,
-            p.machine.as_deref().unwrap_or("?")
-        );
-    }
-    for i in &s.inbound {
-        println!("  inbound from {} ({}) {}s ago", i.machine, i.addr, (now - i.last_seen) / 1000);
-    }
-}
-
-async fn mcp_stdio(client: &Client, agent: Option<String>) -> Result<()> {
+async fn mcp_stdio(target: Target) -> Result<()> {
     let stdout = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    let agent = Arc::new(tokio::sync::RwLock::new(agent.filter(|a| amx::server::valid_agent(a))));
-    let client = Arc::new(Client::new(client.base()));
+    let mut client = Arc::new(target.client());
+    let mut beating = false;
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -472,22 +208,33 @@ async fn mcp_stdio(client: &Client, agent: Option<String>) -> Result<()> {
         let msg: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                write_line(&stdout, &amx::mcp::error_response(serde_json::Value::Null, -32700, &e.to_string())).await;
+                let err = amx::mcp::error_response(serde_json::Value::Null, -32700, &e.to_string());
+                write_line(&stdout, &err).await;
                 continue;
             }
         };
-        if msg.get("method").and_then(|m| m.as_str()) == Some("initialize") {
-            let mut a = agent.write().await;
-            if a.is_none() {
-                let client_name = msg["params"]["clientInfo"]["name"].as_str().unwrap_or("");
-                *a = Some(amx::mcp::default_agent_for(client_name));
-            }
+        if msg.get("method").and_then(|m| m.as_str()) == Some("initialize")
+            && let Some(name) = msg["params"]["clientInfo"]["name"].as_str()
+            && let Some(c) = Arc::get_mut(&mut client)
+        {
+            c.set_client_name(name);
         }
-        let name = agent.read().await.clone().unwrap_or_else(|| "agent".into());
+        if !beating {
+            beating = true;
+            let c = client.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) = c.heartbeat().await {
+                        eprintln!("amx mcp: heartbeat: {e:#}");
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            });
+        }
         let (client, stdout) = (client.clone(), stdout.clone());
         tokio::spawn(async move {
             let id = msg.get("id").cloned();
-            match client.mcp(&name, &msg).await {
+            match client.mcp(&msg).await {
                 Ok(Some(resp)) => write_line(&stdout, &resp).await,
                 Ok(None) => {}
                 Err(e) => {

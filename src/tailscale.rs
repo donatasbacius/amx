@@ -46,17 +46,9 @@ pub struct Identity {
 }
 
 #[derive(Debug, Clone)]
-pub struct PeerInfo {
-    pub name: String,
-    pub ips: Vec<IpAddr>,
-    pub online: bool,
-}
-
-#[derive(Debug, Clone)]
 pub struct SelfStatus {
     pub name: String,
     pub ips: Vec<IpAddr>,
-    pub peers: Vec<PeerInfo>,
 }
 
 #[derive(Deserialize)]
@@ -89,8 +81,6 @@ struct WhoisUser {
 struct StatusJson {
     #[serde(rename = "Self")]
     me: Option<StatusNode>,
-    #[serde(default)]
-    peer: HashMap<String, StatusNode>,
 }
 
 #[derive(Deserialize)]
@@ -102,8 +92,6 @@ struct StatusNode {
     dns_name: String,
     #[serde(rename = "TailscaleIPs", default)]
     tailscale_ips: Vec<IpAddr>,
-    #[serde(default)]
-    online: bool,
 }
 
 pub fn first_label(dns: &str) -> &str {
@@ -141,20 +129,9 @@ pub fn parse_whois(json: &[u8]) -> Result<Identity> {
 pub fn parse_status(json: &[u8]) -> Result<SelfStatus> {
     let s: StatusJson = serde_json::from_slice(json).context("parsing status")?;
     let me = s.me.ok_or_else(|| anyhow!("tailscale status has no Self"))?;
-    let mut peers: Vec<PeerInfo> = s
-        .peer
-        .values()
-        .map(|p| PeerInfo {
-            name: p.name(),
-            ips: p.tailscale_ips.clone(),
-            online: p.online,
-        })
-        .collect();
-    peers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(SelfStatus {
         name: me.name(),
         ips: me.tailscale_ips,
-        peers,
     })
 }
 
@@ -246,7 +223,5 @@ mod tests {
         let s = parse_status(json).unwrap();
         assert_eq!(s.name, "alpha");
         assert_eq!(s.ips.len(), 2);
-        assert_eq!(s.peers[0].name, "beta");
-        assert!(!s.peers[0].online);
     }
 }

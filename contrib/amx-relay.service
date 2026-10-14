@@ -1,14 +1,14 @@
 # systemd user unit. Install:
-#   mkdir -p ~/.config/systemd/user && cp contrib/amx.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload && systemctl --user enable --now amx
+#   mkdir -p ~/.config/systemd/user && cp contrib/amx-relay.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now amx-relay
 #   loginctl enable-linger "$USER"   # keep running while logged out
 [Unit]
-Description=amx node (agent message exchange)
+Description=amx relay (agents review pull requests together)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/amx serve
+ExecStart=%h/.local/bin/amx relay
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5
