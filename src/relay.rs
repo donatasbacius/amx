@@ -336,7 +336,8 @@ pub enum Status {
     Disputed,
     Duplicate(String),
     Withdrawn,
-    /// Nobody still in the review stood by it and nobody voted on it.
+    /// Nobody else voted on its current revision, and its author's word alone doesn't count: the
+    /// author was dropped, or the others voted on an earlier revision.
     Unverified,
 }
 
@@ -525,7 +526,7 @@ impl Review {
 }
 
 /// Merges duplicates, then applies the voting rule to every finding. `active` are the reviewers still in the review:
-/// only they stand by their own findings when nobody voted on them.
+/// only they stand by their own findings when nobody voted on any revision of them.
 pub fn decide(findings: &mut [Finding], c: &Consensus, active: &HashSet<String>) {
     let ids: Vec<String> = findings.iter().map(|f| f.id.clone()).collect();
     let rating: BTreeMap<String, Severity> = findings.iter().map(|f| (f.id.clone(), f.severity)).collect();
@@ -581,7 +582,7 @@ pub fn decide(findings: &mut [Finding], c: &Consensus, active: &HashSet<String>)
             }
         }
         let agree = rated.len();
-        let examined = f.current_votes().next().is_some() || f.by.as_ref().is_some_and(|b| active.contains(b));
+        let examined = f.current_votes().next().is_some() || (f.votes.is_empty() && f.by.as_ref().is_some_and(|b| active.contains(b)));
         let total = (agree + disagree) as f64;
         let mut severity = f.severity;
         let mut downgraded = false;
@@ -1486,8 +1487,12 @@ impl State {
         let open = format!("nothing was recorded; resend only votes on findings open in round {round}: {}", open.join(", "));
         let mut parsed = Vec::new();
         let mut ignored = Vec::new();
+        let mut seen = HashSet::new();
         for v in &votes {
             let f = r.finding(&v.finding).ok_or_else(|| anyhow!("{} has no finding {}", r.id, v.finding))?;
+            if !seen.insert(f.id.clone()) {
+                bail!("{} is voted on twice; nothing was recorded", f.id);
+            }
             if f.by.as_deref() == Some(agent) {
                 bail!("{} is your own finding; use amend_finding or withdraw_finding instead", f.id);
             }
@@ -1694,7 +1699,7 @@ impl State {
         if prev.phase != Phase::Done {
             bail!("{} has not finished ({})", prev.id, prev.phase.label());
         }
-        if let Some(r) = self.reviews.iter().find(|r| r.parent.as_deref() == Some(&prev.id)) {
+        if let Some(r) = self.reviews.iter().find(|r| r.parent.as_deref() == Some(&prev.id) && r.phase != Phase::Failed) {
             bail!("{} is already re-reviewed as {}", prev.id, r.id);
         }
         let reviewed = prev
@@ -1707,14 +1712,9 @@ impl State {
         req.note = note.to_string();
         req.head_sha = Some(head_sha.to_string());
         req.reviewers = Some(prev.params.reviewers);
-        req.confirm_fraction = Some(prev.params.consensus.confirm_fraction);
-        req.blocking_unanimous = Some(prev.params.consensus.blocking_unanimous);
-        req.vote_rounds = Some(prev.params.consensus.vote_rounds);
-        req.offer_secs = Some(prev.params.offer_secs);
-        req.review_secs = Some(prev.params.review_secs);
-        req.vote_secs = Some(prev.params.vote_secs);
         let mut r = self.new_review(author, req, now)?;
-        r.params.reply_secs = prev.params.reply_secs;
+        r.params = prev.params;
+        r.deadline = now + r.params.offer_secs * 1000;
         let busy: HashSet<String> = self
             .reviews
             .iter()
@@ -1725,7 +1725,8 @@ impl State {
             .slots
             .iter()
             .filter(|s| {
-                self.agents.online(&s.agent, now)
+                s.active()
+                    && self.agents.online(&s.agent, now)
                     && !busy.contains(&s.agent)
                     && self.agents.get(&s.agent).is_some_and(|a| a.role == Role::Reviewer && a.login == s.login)
             })
@@ -1929,19 +1930,25 @@ impl State {
                     open_votes(r, agents, false, now);
                     return true;
                 }
-                let owing = |r: &Review| -> Vec<String> {
+                // Not voting again on a finding amended since one's vote is no reason to drop a reviewer.
+                let owing = |r: &Review, amended_too: bool| -> Vec<String> {
                     r.active_slots()
-                        .filter(|s| !r.owed_votes(&s.agent).is_empty())
+                        .filter(|s| {
+                            r.owed_votes(&s.agent)
+                                .iter()
+                                .any(|f| amended_too || f.votes.get(&s.agent).is_none_or(|v| v.revision == f.revision))
+                        })
                         .map(|s| s.agent.clone())
                         .collect()
                 };
-                if now >= r.deadline {
-                    for a in owing(r) {
+                let late = now >= r.deadline;
+                if late {
+                    for a in owing(r, false) {
                         drop_slot(r, agents, &a, &format!("missed the round {round} voting deadline"), now);
                     }
                     changed = true;
                 }
-                if owing(r).is_empty() {
+                if late || owing(r, true).is_empty() {
                     let contested: Vec<usize> = r
                         .findings
                         .iter()

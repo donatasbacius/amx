@@ -1,6 +1,6 @@
 use crate::hub::Hub;
 use crate::relay::{Choice, Finding, Ms, Phase, Review, Severity, State, Status, Verdict};
-use crate::text::{dur, iso, phase_badge, severity_split, short_sha, split_note, split_range};
+use crate::text::{dur, iso, phase_badge, short_sha, split_note, split_range};
 use axum::extract::{Path, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -146,7 +146,6 @@ fn outcome(f: &Finding) -> Option<(&'static str, String)> {
         Status::Confirmed => ("changes", "confirmed".to_string()),
         Status::Rejected if carried => ("approved", "resolved".to_string()),
         Status::Rejected => ("closed", "rejected".to_string()),
-        Status::Disputed if o.severity_split => ("stale", "disputed severity".to_string()),
         Status::Disputed => ("stale", "disputed".to_string()),
         Status::Unverified => ("stale", "unverified".to_string()),
         Status::Duplicate(t) => ("closed", format!("duplicate of {t}")),
@@ -394,9 +393,6 @@ fn severity_note(f: &Finding) -> Option<String> {
     }
     if let Some(split) = split_note(f) {
         return Some(format!("Severity {split}; the lower stands."));
-    }
-    if let Some(split) = severity_split(f) {
-        return Some(format!("Severity disputed: {split}."));
     }
     let raised = f.severity.as_str();
     if o.downgraded {
