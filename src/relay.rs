@@ -160,6 +160,8 @@ impl AgentEvent {
 pub struct Agent {
     pub name: String,
     pub login: String,
+    #[serde(default)]
+    pub user_id: u64,
     pub node: String,
     pub role: Role,
     pub first_seen: Ms,
@@ -877,6 +879,14 @@ impl State {
     /// Records that `name` is alive and binds the name to the caller's Tailscale login.
     /// The supplied role is an initial default; only `set_role` changes an existing agent's role.
     pub fn touch(&mut self, name: &str, who: &Identity, role: Option<Role>, now: Ms) -> Result<()> {
+        if let Some(old) = self
+            .agents
+            .get(name)
+            .filter(|a| a.user_id != 0 && a.user_id == who.user_id && !a.login.eq_ignore_ascii_case(&who.login))
+        {
+            let old = old.login.clone();
+            self.rename_login(&old, who);
+        }
         self.check_name(name, who, now)?;
         let timing = self.timing;
         if self.agents.get(name).is_some_and(|a| !a.login.eq_ignore_ascii_case(&who.login)) {
@@ -888,6 +898,7 @@ impl State {
         let a = self.agents.map.entry(name.to_string()).or_insert_with(|| Agent {
             name: name.to_string(),
             login: who.login.clone(),
+            user_id: who.user_id,
             node: who.node.clone(),
             role: role.unwrap_or(Role::Author),
             first_seen: now,
@@ -903,7 +914,23 @@ impl State {
         }
         a.last_seen = now;
         a.node = who.node.clone();
+        if who.user_id != 0 {
+            a.user_id = who.user_id;
+        }
         Ok(())
+    }
+
+    /// Moves everything bound to login `from` over to `to`: a renamed Tailscale login, or `local`
+    /// once the relay knows its owner.
+    pub fn rename_login(&mut self, from: &str, to: &Identity) {
+        let mut logins: Vec<&mut String> = self.agents.map.values_mut().map(|a| &mut a.login).collect();
+        for r in &mut self.reviews {
+            logins.push(&mut r.author_login);
+            logins.extend(r.slots.iter_mut().map(|s| &mut s.login));
+        }
+        for l in logins.into_iter().filter(|l| l.eq_ignore_ascii_case(from)) {
+            l.clone_from(&to.login);
+        }
     }
 
     /// Forgets an offline, unengaged agent if a new one for `login` would exceed the caps.
@@ -930,13 +957,13 @@ impl State {
         }
     }
 
-    /// Refuses `name`, in any letter case, while another login holds it and is online or in an
-    /// unfinished review.
+    /// Refuses `name`, in any letter case, while another login holds it and is online, in an
+    /// unfinished review, or has events it hasn't read (such as a result).
     pub fn check_name(&self, name: &str, who: &Identity, now: Ms) -> Result<()> {
         if let Some(holder) = self.agents.all().find(|a| {
             a.name.eq_ignore_ascii_case(name)
                 && !a.login.eq_ignore_ascii_case(&who.login)
-                && (self.agents.online(&a.name, now) || self.engaged(&a.name))
+                && (self.agents.online(&a.name, now) || self.engaged(&a.name) || self.has_undelivered(&a.name))
         }) {
             bail!(
                 "agent name `{name}` is in use by another tailnet user ({}); pick a different name, e.g. one prefixed with your own user name",
@@ -1454,7 +1481,7 @@ impl State {
                 summary,
             });
         }
-        r.log(now, agent, "submit", format!("submitted {n} finding(s), suggests {} at {head_sha}", verdict.as_str()));
+        r.log(now, agent, "submit", format!("submitted {n} finding(s) at {head_sha}"));
         self.advance(now);
         Ok(n)
     }

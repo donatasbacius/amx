@@ -54,7 +54,11 @@ impl Client {
     }
 
     fn unreachable(&self, e: reqwest::Error) -> anyhow::Error {
-        anyhow!("cannot reach the amx relay at {} ({e})", self.base)
+        if e.is_connect() || e.is_timeout() {
+            anyhow!("cannot reach the amx relay at {} ({e})", self.base)
+        } else {
+            anyhow!("the amx relay at {} closed the connection; it may be over its connection limits ({e})", self.base)
+        }
     }
 
     async fn parse<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T> {

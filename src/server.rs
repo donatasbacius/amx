@@ -5,15 +5,12 @@ use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -59,15 +56,15 @@ pub struct ConnSlot {
 }
 
 impl Conns {
+    /// This machine's own connections are neither refused nor counted.
     pub fn admit(self: &Arc<Self>, ip: IpAddr, limits: &ConnLimits) -> Option<ConnSlot> {
         let mut open = self.open.lock().unwrap();
-        let total: usize = open.values().sum();
-        let mine = open.get(&ip).copied().unwrap_or(0);
-        let local = ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST);
-        if total >= limits.max || (mine >= limits.per_ip && !local) {
-            return None;
+        if ip != IpAddr::V4(Ipv4Addr::LOCALHOST) && ip != IpAddr::V6(Ipv6Addr::LOCALHOST) {
+            if open.values().sum::<usize>() >= limits.max || open.get(&ip).is_some_and(|n| *n >= limits.per_ip) {
+                return None;
+            }
+            *open.entry(ip).or_default() += 1;
         }
-        *open.entry(ip).or_default() += 1;
         Some(ConnSlot { conns: self.clone(), ip })
     }
 }
@@ -146,7 +143,6 @@ pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
         .route("/static/app.js", get(static_js))
         .route("/api/reviews", get(crate::web::api_reviews))
         .route("/api/reviews/{id}", get(crate::web::api_review))
-        .route("/api/events", get(events))
         .route("/api/heartbeat", post(heartbeat))
         .route("/api/watch", get(watch))
         .route("/api/obligation", get(obligation))
@@ -192,13 +188,17 @@ fn origin_matches(headers: &HeaderMap) -> bool {
         .is_some_and(|o| o.eq_ignore_ascii_case(host))
 }
 
-/// A browser request made by another site's page; agents' own clients don't send this header.
+/// A browser request made by another site's page. Browsers send this header on every request,
+/// so requests without it (and without an `Origin`) come from agents' own clients.
 fn from_another_site(headers: &HeaderMap) -> bool {
     headers
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case("cross-site") || v.eq_ignore_ascii_case("same-site"))
 }
+
+const OWNER_UNKNOWN: &str =
+    "the relay is waiting for Tailscale to identify this machine's owner; start Tailscale, or run the relay with --no-tailnet";
 
 async fn identify(
     State((hub, listener)): State<(Arc<Hub>, Listener)>,
@@ -219,11 +219,11 @@ async fn identify(
     if agent_api && from_another_site(headers) {
         return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
     }
-    if path == "/api/watch" && !headers.contains_key("x-amx-client") && !headers.contains_key("x-amx-agent") {
-        return (StatusCode::FORBIDDEN, "send an X-Amx-Client header (amx watch does)").into_response();
-    }
     let who = match listener {
-        Listener::Local if addr.ip().is_loopback() => hub.owner.lock().unwrap().clone(),
+        Listener::Local if addr.ip().is_loopback() => match hub.owner.lock().unwrap().clone() {
+            Some(owner) => owner,
+            None => return (StatusCode::SERVICE_UNAVAILABLE, OWNER_UNKNOWN).into_response(),
+        },
         Listener::Local => return (StatusCode::FORBIDDEN, "not a local caller").into_response(),
         Listener::Tailnet => match hub.ts.whois(addr.ip()).await {
             Some(id) => {
@@ -254,18 +254,6 @@ async fn static_js() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../assets/app.js"),
     )
-}
-
-async fn events(State(hub): St) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    use futures_util::StreamExt;
-    let rx = hub.subscribe();
-    let mut down = hub.shutdown.subscribe();
-    let stream = tokio_stream::wrappers::WatchStream::from_changes(rx)
-        .map(|v| Ok(Event::default().event("change").data(v.to_string())))
-        .take_until(async move {
-            let _ = down.wait_for(|d| *d).await;
-        });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
 }
 
 #[derive(Deserialize)]
@@ -468,10 +456,10 @@ mod tests {
     }
 
     #[test]
-    fn connections_are_capped_per_address_except_loopback_and_in_total() {
+    fn connections_are_capped_per_address_and_in_total_except_loopback() {
         let conns = Arc::new(Conns::default());
         let limits = ConnLimits {
-            max: 5,
+            max: 3,
             per_ip: 2,
             header_timeout: Duration::from_secs(1),
         };
@@ -479,11 +467,12 @@ mod tests {
         let a = conns.admit(ip("100.64.0.1"), &limits).unwrap();
         let _a2 = conns.admit(ip("100.64.0.1"), &limits).unwrap();
         assert!(conns.admit(ip("100.64.0.1"), &limits).is_none(), "per address");
+        let _b = conns.admit(ip("100.64.0.2"), &limits).unwrap();
+        assert!(conns.admit(ip("100.64.0.3"), &limits).is_none(), "in total");
         let local = [conns.admit(ip("127.0.0.1"), &limits), conns.admit(ip("::1"), &limits), conns.admit(ip("127.0.0.1"), &limits)];
-        assert!(local.iter().all(Option::is_some), "loopback isn't capped per address");
-        assert!(conns.admit(ip("100.64.0.2"), &limits).is_none(), "in total");
+        assert!(local.iter().all(Option::is_some), "loopback is never refused");
         drop(a);
-        assert!(conns.admit(ip("100.64.0.1"), &limits).is_some(), "a closed connection frees its slot");
+        assert!(conns.admit(ip("100.64.0.3"), &limits).is_some(), "a closed connection frees its slot");
     }
 
     #[test]

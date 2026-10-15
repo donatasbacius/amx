@@ -66,37 +66,34 @@ async fn tailnet_addr(hub: &Hub) -> Result<(SocketAddr, Option<String>)> {
     Ok((SocketAddr::new(ip, hub.cfg.port), status.dns_name))
 }
 
-/// Binds the tailnet listener, retrying until Tailscale is up (e.g. at boot).
+/// Learns the relay owner with whois of our own address, then binds the tailnet listener.
+/// Anything bound to `local` (from `--no-tailnet`) becomes the owner's.
+async fn tailnet_listener(hub: &Hub) -> Result<tokio::net::TcpListener> {
+    let (addr, dns_name) = tailnet_addr(hub).await?;
+    if hub.cfg.tailnet_listen.is_none() && hub.owner.lock().unwrap().is_none() {
+        let id = hub.ts.whois(addr.ip()).await.context("whois of our own address failed")?;
+        tracing::info!("relay owner (loopback callers): {} on {}", id.login, id.node);
+        hub.write(|st, _| st.rename_login("local", &id));
+        *hub.owner.lock().unwrap() = Some(id);
+    }
+    let l = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("cannot bind {addr}"))?;
+    tracing::info!("listening on http://{addr} (tailnet, callers identified with tailscale whois)");
+    hub.listening.lock().unwrap().push(format!("http://{addr}"));
+    if hub.cfg.tailnet_listen.is_none() && hub.cfg.public_url.is_none() {
+        hub.set_web_url(&tailnet_url(addr, dns_name.as_deref()));
+    }
+    Ok(l)
+}
+
+/// Retries until Tailscale is up (e.g. at boot); loopback callers wait for the owner until then.
 async fn tailnet_listener_loop(hub: Arc<Hub>) {
     let mut warned = false;
     loop {
-        match tailnet_addr(&hub).await {
-            Ok((addr, dns_name)) => match tokio::net::TcpListener::bind(addr).await {
-                Ok(l) => {
-                    tracing::info!("listening on http://{addr} (tailnet, callers identified with tailscale whois)");
-                    hub.listening.lock().unwrap().push(format!("http://{addr}"));
-                    if hub.cfg.tailnet_listen.is_none() {
-                        if hub.cfg.public_url.is_none() {
-                            hub.set_web_url(&tailnet_url(addr, dns_name.as_deref()));
-                        }
-                        match hub.ts.whois(addr.ip()).await {
-                            Some(id) => {
-                                tracing::info!("relay owner (loopback callers): {} on {}", id.login, id.node);
-                                *hub.owner.lock().unwrap() = id;
-                            }
-                            None => tracing::warn!("whois of our own address failed; tailnet callers will be refused"),
-                        }
-                    }
-                    let h = spawn_server(&hub, l, Listener::Tailnet);
-                    let _ = h.await;
-                    return;
-                }
-                Err(e) if !warned => {
-                    tracing::warn!("cannot bind {addr}: {e}; retrying");
-                    warned = true;
-                }
-                Err(_) => {}
-            },
+        match tailnet_listener(&hub).await {
+            Ok(l) => {
+                let _ = spawn_server(&hub, l, Listener::Tailnet).await;
+                return;
+            }
             Err(e) if !warned => {
                 tracing::warn!("tailnet listener not started: {e:#}; retrying");
                 warned = true;

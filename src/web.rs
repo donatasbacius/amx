@@ -1,6 +1,6 @@
 use crate::hub::Hub;
 use crate::relay::{Choice, Finding, Ms, Phase, Review, Severity, State, Status, Verdict};
-use crate::text::{dur, iso, phase_badge, short_sha, split_note, split_range};
+use crate::text::{bidi, dur, iso, phase_badge, short_sha, split_note, split_range};
 use axum::extract::{Path, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -19,6 +19,7 @@ pub fn esc(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&#39;"),
+            c if bidi(c) => {}
             _ => out.push(c),
         }
     }
@@ -34,7 +35,8 @@ pub fn markdown(src: &str) -> String {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     let mut events = Vec::new();
     let mut image = None;
-    for e in Parser::new_ext(src, opts) {
+    let src: String = src.chars().filter(|&c| !bidi(c)).collect();
+    for e in Parser::new_ext(&src, opts) {
         match e {
             Event::Html(s) | Event::InlineHtml(s) => events.push(Event::Text(s)),
             Event::Start(Tag::Image { dest_url, title, id, .. }) => {
@@ -616,6 +618,7 @@ fn render_reviewers(out: &mut String, r: &Review) {
             (Some(d), _) => format!("<span class=\"badge s-closed\">dropped</span> <span class=\"muted\">{}</span>", esc(d)),
             (None, Some(x)) => {
                 let (cls, label) = match x.verdict {
+                    _ if !r.revealed() => ("waiting", "submitted"),
                     Verdict::Approve => ("approved", "approves"),
                     Verdict::ChangesRequested => ("changes", "requests changes"),
                 };
@@ -755,6 +758,7 @@ pub fn review_json(r: &Review, rereviews: &[String], now: Ms) -> Value {
             for s in slots {
                 if let Some(sub) = s.get_mut("submission").and_then(Value::as_object_mut) {
                     sub.insert("summary".into(), Value::String(String::new()));
+                    sub.insert("verdict".into(), Value::Null);
                 }
             }
         }
@@ -796,6 +800,21 @@ fn partial(headers: &HeaderMap) -> bool {
     headers.contains_key("x-amx-partial")
 }
 
+/// A page's main part for the page script, which polls it; 304 if it hasn't changed.
+fn fragment(headers: &HeaderMap, main: String) -> Response {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    main.hash(&mut h);
+    let tag = format!("\"{:x}\"", h.finish());
+    let mut r = if headers.get(header::IF_NONE_MATCH).is_some_and(|v| v.as_bytes() == tag.as_bytes()) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        Html(main).into_response()
+    };
+    r.headers_mut().insert(header::ETAG, HeaderValue::from_str(&tag).expect("hex"));
+    no_store(r)
+}
+
 fn no_store(mut r: Response) -> Response {
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
@@ -804,7 +823,7 @@ fn no_store(mut r: Response) -> Response {
 pub async fn index(AxState(hub): AxState<Arc<Hub>>, headers: HeaderMap) -> Response {
     let main = hub.read(render_index);
     if partial(&headers) {
-        return no_store(Html(main).into_response());
+        return fragment(&headers, main);
     }
     Html(page("amx", &main)).into_response()
 }
@@ -823,7 +842,7 @@ pub async fn review_page(
     };
     let main = render_review_page(&r, &children, now);
     if partial(&headers) {
-        return no_store(Html(main).into_response());
+        return fragment(&headers, main);
     }
     Html(page(&format!("{} · {}", r.pr.short(), r.id), &main)).into_response()
 }
@@ -851,6 +870,8 @@ mod tests {
     #[test]
     fn escapes_html() {
         assert_eq!(esc("<a href=\"x\">'&'</a>"), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;");
+        assert_eq!(esc("\u{202E}live\u{2066}"), "live");
+        assert_eq!(markdown("**\u{202E}evil**"), "<p><strong>evil</strong></p>\n");
     }
 
     #[test]

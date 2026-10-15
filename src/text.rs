@@ -46,8 +46,13 @@ pub const LEFT: &str = "\u{E000}left\u{E000}";
 fn clean(line: &str) -> String {
     line.chars()
         .filter(|&c| !(c.is_control() && c != '\t'))
-        .filter(|c| !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{E000}'))
+        .filter(|&c| !bidi(c) && c != '\u{E000}')
         .collect()
+}
+
+/// Bidi embedding, override and isolate controls, which can make text read differently.
+pub fn bidi(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// Another agent's text as a block quote, so none of its lines can pass for the relay's own.
