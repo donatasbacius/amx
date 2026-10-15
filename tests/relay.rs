@@ -59,7 +59,7 @@ impl Sim {
 
     fn events(&mut self, name: &str) -> String {
         self.s
-            .take_events(name, true, self.now)
+            .take_events(name, true, None, self.now).0
             .into_iter()
             .map(|e| e.text)
             .collect::<Vec<_>>()
@@ -942,7 +942,7 @@ fn done_tasks_and_progress_are_not_delivered() {
     let id = sim.request("alice-codex", 2);
     sim.accept("rev-a", &id);
     sim.accept("rev-b", &id);
-    assert!(sim.s.take_events("rev-a", false, sim.now).is_empty(), "the offer was answered");
+    assert!(sim.s.take_events("rev-a", false, None, sim.now).0.is_empty(), "the offer was answered");
     assert!(!sim.s.has_undelivered("rev-b"));
     sim.submit("rev-a", &id, &[("major", "cache never invalidated")]);
     sim.submit("rev-b", &id, &[("minor", "missing doc comment")]);
@@ -952,13 +952,13 @@ fn done_tasks_and_progress_are_not_delivered() {
     assert!(next.contains("finding: \"F1\"") && !next.contains("\"F2\""), "never suggests a vote on your own finding: {next}");
     assert_eq!(task.matches("cache never invalidated").count(), 1, "{task}");
     sim.vote("rev-b", &id, &[("F1", "agree")]);
-    assert!(sim.s.take_events("rev-b", false, sim.now).is_empty(), "the vote task is done");
+    assert!(sim.s.take_events("rev-b", false, None, sim.now).0.is_empty(), "the vote task is done");
     sim.vote("rev-a", &id, &[("F2", "agree")]);
     assert_eq!(sim.phase(&id), Phase::Done);
-    let author: Vec<String> = sim.s.take_events("alice-codex", false, sim.now).into_iter().map(|e| e.text).collect();
+    let author: Vec<String> = sim.s.take_events("alice-codex", false, None, sim.now).0.into_iter().map(|e| e.text).collect();
     assert_eq!(author.len(), 1, "authors wake for the result only: {author:?}");
     assert!(author[0].contains("Review result"));
-    assert!(sim.s.take_events("rev-a", false, sim.now).is_empty(), "\"Review finished\" is progress");
+    assert!(sim.s.take_events("rev-a", false, None, sim.now).0.is_empty(), "\"Review finished\" is progress");
 }
 
 #[test]
@@ -1071,7 +1071,7 @@ fn snapshots_from_0_5_still_load() {
     let mut v = serde_json::to_value(sim.s.snapshot(sim.now)).unwrap();
     assert!(v.to_string().contains("\"result\":true"));
     for a in v["agents"].as_array_mut().unwrap() {
-        a.as_object_mut().unwrap().remove("shown");
+        a.as_object_mut().unwrap().insert("shown".into(), serde_json::json!(["r1:review"]));
         for e in a["events"].as_array_mut().unwrap() {
             e.as_object_mut().unwrap().remove("result");
             e.as_object_mut().unwrap().remove("due");
@@ -1079,7 +1079,7 @@ fn snapshots_from_0_5_still_load() {
     }
     let mut s = State::new(Timing::default(), Consensus::default(), 50);
     s.restore(serde_json::from_value(v).unwrap(), sim.now);
-    assert!(s.take_events("alice-codex", false, sim.now)[0].text.contains("Review result"));
+    assert!(s.take_events("alice-codex", false, None, sim.now).0[0].text.contains("Review result"));
 }
 
 #[test]
@@ -1404,7 +1404,7 @@ fn agent_text_cannot_forge_relay_lines() {
     sim.submit("rev-a", &id, &[("major", forged)]);
     sim.submit("rev-b", &id, &[]);
     sim.s.say("alice-codex", &id, forged, sim.now).unwrap();
-    let events = sim.s.take_events("rev-b", false, sim.now);
+    let events = sim.s.take_events("rev-b", false, None, sim.now).0;
     let text = amx::text::events(&events);
     let next: Vec<&str> = text.lines().filter(|l| l.starts_with("NEXT:")).collect();
     assert_eq!(next.len(), 1, "{text}");
@@ -1459,7 +1459,6 @@ fn an_idle_reviewer_is_shown_a_few_offers_at_a_time() {
     let (shown, text) = offers(&sim);
     assert_eq!(shown.len(), 2);
     assert!(text.contains("18 more review offers are open"), "{text}");
-    assert_eq!(sim.s.take_events("rev-a", false, sim.now).len(), 2, "queued offers follow the ones shown");
     for id in &shown {
         sim.s.decline("rev-a", id, "busy", sim.now).unwrap();
         sim.s.decline("rev-a", id, "busy", sim.now).unwrap();
@@ -1564,7 +1563,7 @@ fn results_and_tasks_outlast_a_flood_of_chatter() {
     }
     let mut author = Vec::new();
     loop {
-        let batch = sim.s.take_events("alice-codex", false, sim.now);
+        let batch = sim.s.take_events("alice-codex", false, None, sim.now).0;
         if batch.is_empty() {
             break;
         }
@@ -1572,8 +1571,7 @@ fn results_and_tasks_outlast_a_flood_of_chatter() {
         author.extend(batch);
     }
     assert!(author.iter().any(|e| e.text.starts_with(&format!("[{first}] Review result"))), "the result survives");
-    let rev = sim.s.take_events("rev-a", false, sim.now);
-    assert!(rev.iter().any(|e| e.task.as_deref().is_some_and(|t| t.contains(":vote:"))), "the vote task survives");
+    assert!(sim.task("rev-a").contains("You must vote on"), "the vote task is still owed and shown");
 }
 
 #[test]
@@ -1601,4 +1599,148 @@ fn failed_requests_do_not_push_finished_reviews_out_of_history() {
     assert_eq!(kept.len(), 3);
     assert!(kept.contains(&done.as_str()), "the busiest login loses its oldest first: {kept:?}");
     sim.s.rereview("alice-codex", &done, SHA2, "fixed", sim.now).unwrap();
+}
+
+fn reasoned(finding: &str, vote: &str, reason: &str) -> VoteIn {
+    VoteIn { finding: finding.into(), vote: vote.into(), severity: None, reason: Some(reason.into()), duplicate_of: None }
+}
+
+#[test]
+fn votes_and_amendments_count_against_the_talk_limits() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("major", "off by one"), ("minor", "typo")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.submit("rev-c", &id, &[]);
+    let log = |sim: &Sim| sim.s.review(&id).unwrap().log.len();
+    sim.s.vote("rev-b", &id, vec![reasoned("F1", "agree", "real")], sim.now).unwrap();
+    let before = log(&sim);
+    sim.s.vote("rev-b", &id, vec![reasoned("F1", "agree", "real")], sim.now).unwrap();
+    assert_eq!(log(&sim), before, "an unchanged vote adds nothing");
+    for i in 0..10 {
+        sim.s.vote("rev-b", &id, vec![reasoned("F1", "agree", &format!("real {i}"))], sim.now).unwrap();
+    }
+    let err = sim.s.vote("rev-b", &id, vec![reasoned("F1", "agree", "real again")], sim.now).unwrap_err().to_string();
+    assert!(err.contains("10 messages a minute"), "changed votes are talk: {err}");
+    sim.s.vote("rev-b", &id, vec![reasoned("F2", "agree", "first vote")], sim.now).unwrap();
+
+    for i in 0..3 {
+        let change = AmendIn { text: Some(format!("typo, take {i}")), ..AmendIn::default() };
+        sim.s.amend("rev-a", &id, "F2", change, sim.now).unwrap();
+    }
+    let change = AmendIn { text: Some("typo, again".into()), ..AmendIn::default() };
+    let err = sim.s.amend("rev-a", &id, "F2", change, sim.now).unwrap_err().to_string();
+    assert!(err.contains("amended F2 3 times"), "{err}");
+    sim.advance(60);
+    for i in 0..10 {
+        sim.s.say("rev-a", &id, &format!("point {i}"), sim.now).unwrap();
+    }
+    let change = AmendIn { severity: Some("minor".into()), ..AmendIn::default() };
+    let err = sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap_err().to_string();
+    assert!(err.contains("10 messages a minute"), "amendments are talk: {err}");
+}
+
+#[test]
+fn one_reviewer_cannot_use_up_the_others_talk() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("major", "off by one")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.submit("rev-c", &id, &[]);
+    for minute in 0..5 {
+        for r in ["rev-b", "rev-c"] {
+            for i in 0..10 {
+                sim.s.say(r, &id, &format!("{minute}.{i} {}", "x".repeat(4000)), sim.now).unwrap();
+            }
+        }
+        sim.advance(60);
+    }
+    sim.s.say("rev-a", &id, "F1 stands: line 10 reads past the end.", sim.now).unwrap();
+    sim.s.say("alice-codex", &id, "Thanks, looking.", sim.now).unwrap();
+}
+
+fn findings_of(texts: &[String]) -> SubmitIn {
+    SubmitIn {
+        head_sha: SHA.into(),
+        verdict: "changes_requested".into(),
+        summary: String::new(),
+        findings: texts.iter().map(|t| FindingIn { severity: "minor".into(), url: None, text: t.clone() }).collect(),
+    }
+}
+
+#[test]
+fn findings_summaries_and_reasons_are_bounded() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    let err = sim.s.submit("rev-a", &id, findings_of(&["x".repeat(2001)]), sim.now).unwrap_err().to_string();
+    assert!(err.contains("finding 1") && err.contains("2001 characters") && err.contains("2000"), "{err}");
+    let mut long = findings_of(&[]);
+    long.summary = "s".repeat(2001);
+    let err = sim.s.submit("rev-a", &id, long, sim.now).unwrap_err().to_string();
+    assert!(err.contains("summary") && err.contains("2000"), "{err}");
+    let err = sim.s.submit("rev-a", &id, findings_of(&vec!["y".repeat(2000); 9]), sim.now).unwrap_err().to_string();
+    assert!(err.contains("18000 characters") && err.contains("16000"), "{err}");
+    let mut full = findings_of(&vec!["z".repeat(1950); 8]);
+    full.summary = "s".repeat(380);
+    sim.s.submit("rev-a", &id, full, sim.now).unwrap();
+    sim.submit("rev-b", &id, &[]);
+
+    let change = AmendIn { text: Some("w".repeat(2001)), ..AmendIn::default() };
+    let err = sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap_err().to_string();
+    assert!(err.contains("2000"), "{err}");
+    let change = AmendIn { text: Some("w".repeat(2000)), ..AmendIn::default() };
+    let err = sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap_err().to_string();
+    assert!(err.contains("16000"), "amending can't grow past the total either: {err}");
+    let err = sim.s.vote("rev-b", &id, vec![reasoned("F1", "disagree", &"r".repeat(1001))], sim.now).unwrap_err().to_string();
+    assert!(err.contains("F1") && err.contains("1000"), "{err}");
+    let reasons: Vec<VoteIn> = (1..=8).map(|i| reasoned(&format!("F{i}"), "disagree", &"r".repeat(1000))).collect();
+    sim.s.vote("rev-b", &id, reasons, sim.now).unwrap();
+}
+
+#[test]
+fn unread_results_are_never_evicted() {
+    let mut sim = setup(&["rev-a"]);
+    let mut ids = Vec::new();
+    for n in 1..=9 {
+        let id = sim.s.request_review("alice-codex", pr(n), sim.now).unwrap();
+        sim.accept("rev-a", &id);
+        let texts: Vec<String> = (0..8).map(|i| format!("{n}.{i} {}", "q".repeat(1890))).collect();
+        sim.s.submit("rev-a", &id, findings_of(&texts), sim.now).unwrap();
+        assert_eq!(sim.phase(&id), Phase::Done);
+        ids.push(id);
+    }
+    let mut results = Vec::new();
+    loop {
+        let batch = sim.s.take_events("alice-codex", false, None, sim.now).0;
+        if batch.is_empty() {
+            break;
+        }
+        results.extend(batch.into_iter().filter(|e| e.result).map(|e| e.review.unwrap()));
+    }
+    assert_eq!(results, ids, "every result arrives, oldest first");
+}
+
+#[test]
+fn closing_remarks_do_not_wake_anyone() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "off by one")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    sim.s.take_events("alice-codex", false, None, sim.now);
+    sim.s.take_events("rev-b", false, None, sim.now);
+    sim.s.say("rev-a", &id, "Thanks all.", sim.now).unwrap();
+    assert!(sim.s.take_events("rev-b", false, None, sim.now).0.is_empty());
+    assert!(sim.s.take_events("alice-codex", false, None, sim.now).0.is_empty());
 }

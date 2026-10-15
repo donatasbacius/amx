@@ -21,10 +21,16 @@ const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_WAIT_BYTES: usize = 64 * 1024;
 const MAX_TEXT: usize = 8000;
 const MAX_SAY: usize = 4000;
+/// Says, amendments and changed votes, per agent and review.
 const SAYS_PER_REVIEW: usize = 50;
 const SAYS_PER_MINUTE: usize = 10;
+const TALK: &[&str] = &["say", "amend", "revote"];
 const CLOSING_REMARKS: usize = 3;
-const MAX_TALK_BYTES: usize = 200 * 1024;
+/// Characters in a finding or summary, and in all that one reviewer submits, or gives as vote reasons in a round.
+const MAX_FINDING: usize = 2000;
+const MAX_REVIEWER_TEXT: usize = 16_000;
+const MAX_REASON: usize = 1000;
+const AMENDS_PER_FINDING: u32 = 3;
 /// Offers listed in full in an idle reviewer's next actions.
 const OFFERS_SHOWN: usize = 2;
 /// Reviews that failed before anyone took them, kept on top of `history`.
@@ -171,10 +177,11 @@ pub struct Agent {
     pub waiting: u32,
     events: VecDeque<AgentEvent>,
     next_seq: u64,
+    /// Events up to here were received: handed out, or acknowledged by a later `wait`.
     delivered: u64,
-    /// Task parts (see `task_parts`) given in full to the current session.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    shown: HashSet<String>,
+    /// Events up to here were handed out, received or not.
+    #[serde(skip)]
+    sent: u64,
 }
 
 pub struct Agents {
@@ -223,27 +230,20 @@ impl Agents {
         self.push(name, AgentEvent { result: true, ..AgentEvent::new(review, text, now) });
     }
 
-    /// Queues `ev`; when the queue is full, delivered events go first, then progress, chatter
-    /// and the newest offers (`next_actions` lists offers oldest first), and other tasks and
-    /// results only as a last resort.
+    /// Queues `ev`; over the caps the oldest events go first. Unread results never do, and a
+    /// task that goes is still shown by `next_actions`.
     fn push(&mut self, name: &str, mut ev: AgentEvent) {
         let Some(a) = self.map.get_mut(name) else { return };
         a.next_seq += 1;
         ev.seq = a.next_seq;
         a.events.push_back(ev);
-        let mut bytes: usize = a.events.iter().map(|e| e.text.len()).sum();
-        while a.events.len() > MAX_EVENTS || (bytes > MAX_EVENT_BYTES && a.events.len() > 1) {
-            let delivered = a.delivered;
-            let q = &a.events;
-            let i = q
-                .iter()
-                .position(|e| e.seq <= delivered)
-                .or_else(|| q.iter().position(|e| e.progress))
-                .or_else(|| q.iter().position(|e| e.task.is_none() && !e.result))
-                .or_else(|| q.iter().rposition(|e| e.task.as_deref().is_some_and(|t| t.ends_with(":offer"))))
-                .unwrap_or(0);
-            if let Some(e) = a.events.remove(i) {
-                bytes -= e.text.len();
+        let delivered = a.delivered;
+        let kept = |e: &AgentEvent| e.result && e.seq > delivered;
+        let mut bytes: usize = a.events.iter().filter(|e| !kept(e)).map(|e| e.text.len()).sum();
+        while a.events.len() > MAX_EVENTS || bytes > MAX_EVENT_BYTES {
+            match a.events.iter().position(|e| !kept(e)).filter(|&i| i + 1 < a.events.len()) {
+                Some(i) => bytes -= a.events.remove(i).map_or(0, |e| e.text.len()),
+                None => break,
             }
         }
     }
@@ -728,14 +728,6 @@ pub fn vote_task(r: &Review, owed: &[&Finding]) -> String {
     format!("{}:vote:{}:{}", r.id, r.round(), ids.join(","))
 }
 
-/// A vote task counts as shown once each finding revision in it has been, so a shrinking list isn't repeated.
-fn task_parts(task: &str) -> Vec<String> {
-    match task.rsplit_once(':') {
-        Some((head, ids)) if head.contains(":vote:") => ids.split(',').map(|i| format!("{head}:{i}")).collect(),
-        _ => vec![task.to_string()],
-    }
-}
-
 #[derive(Debug)]
 /// What a `vote` call recorded, and the votes it skipped because their finding was withdrawn.
 pub struct Voted {
@@ -804,7 +796,45 @@ fn need_text(s: &str, what: &str) -> Result<String> {
     if t.is_empty() {
         bail!("{what} must not be empty");
     }
-    Ok(clip(t, MAX_TEXT))
+    check_len(t, what, MAX_FINDING)?;
+    Ok(t.to_string())
+}
+
+fn check_len(s: &str, what: &str, max: usize) -> Result<()> {
+    let n = s.chars().count();
+    if n > max {
+        bail!("{what} is {n} characters; at most {max} are allowed, so be more concise");
+    }
+    Ok(())
+}
+
+/// What `agent` has put in front of the other reviewers of `r`: its live findings and summary.
+fn reviewer_text(r: &Review, agent: &str) -> usize {
+    let findings = r.findings.iter().filter(|f| f.by.as_deref() == Some(agent) && f.withdrawn.is_none());
+    let summary = r.slot(agent).and_then(|s| s.submission.as_ref()).map_or(0, |s| s.summary.chars().count());
+    findings.map(|f| f.text.chars().count()).sum::<usize>() + summary
+}
+
+fn check_reviewer_text(n: usize) -> Result<()> {
+    if n > MAX_REVIEWER_TEXT {
+        bail!("your findings and summary would be {n} characters; at most {MAX_REVIEWER_TEXT} in all, so merge or shorten them");
+    }
+    Ok(())
+}
+
+/// Says, amendments and changed votes share one allowance per agent and review.
+fn check_talk(r: &Review, agent: &str, n: usize, now: Ms) -> Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    let mine: Vec<&LogEntry> = r.log.iter().filter(|e| e.who == agent && TALK.contains(&e.kind.as_str())).collect();
+    if mine.len() + n > SAYS_PER_REVIEW {
+        bail!("you have had enough discussion in {}; vote, or call `wait`", r.id);
+    }
+    if mine.iter().filter(|e| now.saturating_sub(e.at) < 60_000).count() + n > SAYS_PER_MINUTE {
+        bail!("at most {SAYS_PER_MINUTE} messages a minute; call `wait` and let the others answer");
+    }
+    Ok(())
 }
 
 impl State {
@@ -907,7 +937,7 @@ impl State {
             events: VecDeque::new(),
             next_seq: 0,
             delivered: 0,
-            shown: HashSet::new(),
+            sent: 0,
         });
         if now.saturating_sub(a.last_seen) >= timing.online_secs * 1000 && a.waiting == 0 {
             a.first_seen = now;
@@ -1020,36 +1050,45 @@ impl State {
         Ok(())
     }
 
-    /// New events for `name`, minus tasks it has already done and, unless asked for, progress.
-    pub fn take_events(&mut self, name: &str, progress: bool, now: Ms) -> Vec<AgentEvent> {
+    /// Undelivered events for `name`, minus tasks it has already done and, unless asked for,
+    /// progress, and the seq they reach. With `ack`, the caller has received everything up to it,
+    /// and what is handed out now counts as delivered only once a later call acknowledges it;
+    /// without, at once.
+    pub fn take_events(&mut self, name: &str, progress: bool, ack: Option<u64>, now: Ms) -> (Vec<AgentEvent>, u64) {
         let open = self.open_tasks(name);
         let Some(a) = self.agents.map.get_mut(name) else {
-            return Vec::new();
+            return (Vec::new(), 0);
         };
+        if let Some(n) = ack.filter(|&n| n <= a.next_seq) {
+            a.delivered = a.delivered.max(n);
+        }
         let mut fresh = Vec::new();
         let mut bytes = 0;
-        let mut delivered = a.next_seq;
+        let mut reached = a.next_seq;
         for e in a.events.iter().filter(|e| e.seq > a.delivered) {
             if (progress || !e.progress) && e.task.as_ref().is_none_or(|t| open.contains(t)) {
                 if !fresh.is_empty() && bytes + e.text.len() > MAX_WAIT_BYTES {
-                    delivered = e.seq - 1;
+                    reached = e.seq - 1;
                     break;
                 }
                 bytes += e.text.len();
                 fresh.push(e.clone().rendered(now));
             }
         }
-        a.delivered = delivered;
-        fresh
+        if ack.is_none() {
+            a.delivered = reached;
+        }
+        a.sent = a.sent.max(reached);
+        (fresh, reached)
     }
 
-    /// Undelivered events that need the agent; talk on finished reviews doesn't.
+    /// Events not yet handed out that need the agent; talk on finished reviews doesn't.
     pub fn has_undelivered(&self, name: &str) -> bool {
         let open = self.open_tasks(name);
         self.agents.get(name).is_some_and(|a| {
             a.events
                 .iter()
-                .any(|e| e.seq > a.delivered && !e.progress && self.live(name, e, &open))
+                .any(|e| e.seq > a.delivered.max(a.sent) && !e.progress && self.live(name, e, &open))
         })
     }
 
@@ -1067,8 +1106,7 @@ impl State {
         }
     }
 
-    /// A new MCP session under `name`: forgets what the previous one was shown and the queued
-    /// events it no longer needs.
+    /// A new MCP session under `name`: drops the queued events it no longer needs.
     pub fn new_session(&mut self, name: &str) {
         let open = self.open_tasks(name);
         let Some(a) = self.agents.get(name) else {
@@ -1077,23 +1115,7 @@ impl State {
         let keep: HashSet<u64> = a.events.iter().filter(|e| self.live(name, e, &open)).map(|e| e.seq).collect();
         if let Some(a) = self.agents.map.get_mut(name) {
             a.events.retain(|e| keep.contains(&e.seq));
-            a.shown.clear();
         }
-    }
-
-    /// Records that `name` has been given these tasks in full.
-    pub fn mark_shown(&mut self, name: &str, tasks: &[String]) {
-        let open: HashSet<String> = self.open_tasks(name).iter().flat_map(|t| task_parts(t)).collect();
-        if let Some(a) = self.agents.map.get_mut(name) {
-            a.shown.extend(tasks.iter().flat_map(|t| task_parts(t)));
-            a.shown.retain(|p| open.contains(p));
-        }
-    }
-
-    pub fn was_shown(&self, name: &str, task: &str) -> bool {
-        self.agents
-            .get(name)
-            .is_some_and(|a| task_parts(task).iter().all(|p| a.shown.contains(p)))
     }
 
     fn open_tasks(&self, name: &str) -> HashSet<String> {
@@ -1453,8 +1475,12 @@ impl State {
             if let Some(u) = url {
                 check_url(&r.pr, u).map_err(|e| anyhow!("finding {}: {e}", i + 1))?;
             }
-            parsed.push((severity, url.map(String::from), need_text(&f.text, "finding text")?));
+            let text = need_text(&f.text, &format!("finding {}", i + 1))?;
+            parsed.push((severity, url.map(String::from), text));
         }
+        let summary = summary.trim().to_string();
+        check_len(&summary, "summary", MAX_FINDING)?;
+        check_reviewer_text(parsed.iter().map(|(_, _, t)| t.chars().count()).sum::<usize>() + summary.chars().count())?;
         for (severity, url, text) in parsed {
             r.next_finding += 1;
             r.findings.push(Finding {
@@ -1472,7 +1498,6 @@ impl State {
             });
         }
         let n = findings.len();
-        let summary = clip(&summary, MAX_TEXT);
         if let Some(s) = r.slot_mut(agent) {
             s.submission = Some(Submission {
                 at: now,
@@ -1512,7 +1537,7 @@ impl State {
             .map(|f| f.id.as_str())
             .collect();
         let open = format!("nothing was recorded; resend only votes on findings open in round {round}: {}", open.join(", "));
-        let mut parsed = Vec::new();
+        let mut parsed: Vec<(String, Vote, Option<&'static str>)> = Vec::new();
         let mut ignored = Vec::new();
         let mut seen = HashSet::new();
         for v in &votes {
@@ -1530,7 +1555,10 @@ impl State {
             if f.open_round != round {
                 bail!("{} is not open for voting in round {round}; {open}", f.id);
             }
-            let reason = v.reason.as_deref().map(|s| clip(s, MAX_TEXT)).filter(|s| !s.is_empty());
+            let reason = v.reason.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+            if let Some(why) = &reason {
+                check_len(why, &format!("your reason on {}", f.id), MAX_REASON)?;
+            }
             let severity = v
                 .severity
                 .as_deref()
@@ -1563,11 +1591,6 @@ impl State {
                 other => bail!("{}: vote must be agree, disagree or duplicate (got {other})", f.id),
             };
             let severity = severity.filter(|s| choice == Choice::Agree && *s != f.severity);
-            parsed.push((f.id.clone(), choice, severity, reason));
-        }
-        let recorded = parsed.len();
-        for (fid, choice, severity, reason) in parsed {
-            let f = r.findings.iter_mut().find(|f| f.id == fid).expect("validated");
             let vote = Vote {
                 choice,
                 severity,
@@ -1576,17 +1599,45 @@ impl State {
                 revision: f.revision,
                 at: now,
             };
+            let kind = match f.votes.get(agent) {
+                Some(old) if old.round == round && old.revision == f.revision => {
+                    (old.choice != vote.choice || old.severity != vote.severity || old.reason != vote.reason).then_some("revote")
+                }
+                _ => Some("vote"),
+            };
+            parsed.push((f.id.clone(), vote, kind));
+        }
+        let reasons: usize = r
+            .findings
+            .iter()
+            .filter(|f| !parsed.iter().any(|(id, ..)| *id == f.id))
+            .filter_map(|f| f.votes.get(agent).filter(|v| v.round == round))
+            .chain(parsed.iter().map(|(_, v, _)| v))
+            .filter_map(|v| v.reason.as_ref().map(|s| s.chars().count()))
+            .sum();
+        if reasons > MAX_REVIEWER_TEXT {
+            bail!("your reasons in round {round} would be {reasons} characters; at most {MAX_REVIEWER_TEXT} in all, so be more concise");
+        }
+        check_talk(r, agent, parsed.iter().filter(|(.., k)| *k == Some("revote")).count(), now)?;
+        let recorded = parsed.len();
+        for (fid, vote, kind) in parsed {
+            let f = r.findings.iter_mut().find(|f| f.id == fid).expect("validated");
             let line = format!("{fid}: {}", text::vote_label(f, &vote))
                 + &vote.reason.as_deref().map(|s| format!(" — {s}")).unwrap_or_default();
             f.votes.insert(agent.to_string(), vote);
-            r.log(now, agent, "vote", line);
+            if let Some(kind) = kind {
+                r.log(now, agent, kind, line);
+            }
         }
         self.advance(now);
         Ok(Voted { recorded, ignored })
     }
 
     pub fn say(&mut self, agent: &str, id: &str, msg: &str, now: Ms) -> Result<()> {
-        let msg = clip(&need_text(msg, "message")?, MAX_SAY);
+        let msg = clip(msg, MAX_SAY);
+        if msg.is_empty() {
+            bail!("message must not be empty");
+        }
         let login = self.login_of(agent);
         let r = self.review_mut(id)?;
         r.check_login(agent, &login)?;
@@ -1597,26 +1648,22 @@ impl State {
         if reviewer && matches!(r.phase, Phase::Offering | Phase::Reviewing) {
             bail!("reviewers can discuss once findings are revealed (cross-examination); work independently until then");
         }
-        let said: Vec<&LogEntry> = r.log.iter().filter(|e| e.kind == "say" && e.who == agent).collect();
-        let talk: usize = r.log.iter().filter(|e| e.kind == "say").map(|e| e.text.len()).sum();
-        if let Some(ended) = r.ended {
-            if said.iter().filter(|e| e.at >= ended).count() >= CLOSING_REMARKS {
+        match r.ended {
+            Some(ended) if r.log.iter().filter(|e| e.kind == "say" && e.who == agent && e.at >= ended).count() >= CLOSING_REMARKS => {
                 bail!("you have made your {CLOSING_REMARKS} closing remarks on {}", r.id);
             }
-        } else if said.len() >= SAYS_PER_REVIEW || talk + msg.len() > MAX_TALK_BYTES {
-            bail!("{} has had enough discussion; vote, or call `wait`", r.id);
-        } else if said.iter().filter(|e| now.saturating_sub(e.at) < 60_000).count() >= SAYS_PER_MINUTE {
-            bail!("at most {SAYS_PER_MINUTE} messages a minute; call `wait` and let the others answer");
+            Some(_) => {}
+            None => check_talk(r, agent, 1, now)?,
         }
         r.log(now, agent, "say", msg.clone());
         if r.replying {
             r.replied.insert(agent.to_string());
         }
         let to = r.others(agent);
-        let rid = r.id.clone();
-        let quoted = text::quote(&msg);
+        let text = format!("[{}] {agent} says:\n{}", r.id, text::quote(&msg).trim_end());
+        let ev = AgentEvent { progress: r.ended.is_some(), ..AgentEvent::new(&r.id, text, now) };
         for a in to {
-            self.agents.notify(&a, &rid, format!("[{rid}] {agent} says:\n{}", quoted.trim_end()), now);
+            self.agents.push(&a, ev.clone());
         }
         self.advance(now);
         Ok(())
@@ -1661,7 +1708,15 @@ impl State {
         if severity.is_none() && url.is_none() && new_text.is_none() {
             bail!("nothing to amend: give severity, url and/or text");
         }
+        let total = reviewer_text(r, agent);
+        check_talk(r, agent, 1, now)?;
         let f = Self::own_finding(r, agent, fid)?;
+        if f.revision >= AMENDS_PER_FINDING {
+            bail!("you have amended {} {AMENDS_PER_FINDING} times; withdraw it or `say` why it stands", f.id);
+        }
+        if let Some(t) = &new_text {
+            check_reviewer_text(total - f.text.chars().count() + t.chars().count())?;
+        }
         if let Some(s) = severity {
             f.severity = s;
         }

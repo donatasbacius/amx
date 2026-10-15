@@ -58,9 +58,14 @@ impl Hub {
     }
 
     pub fn write<R>(&self, f: impl FnOnce(&mut State, Ms) -> R) -> R {
-        let r = f(&mut self.state.lock().unwrap(), now_ms());
+        let r = self.quiet(f);
         self.bump();
         r
+    }
+
+    /// A change nobody else needs to see or the state file to keep.
+    pub fn quiet<R>(&self, f: impl FnOnce(&mut State, Ms) -> R) -> R {
+        f(&mut self.state.lock().unwrap(), now_ms())
     }
 
     fn bump(&self) {
@@ -118,8 +123,8 @@ impl Hub {
     }
 
     /// Blocks until `name` has new events or something it must act on, or the timeout passes.
-    /// Progress events are dropped unless `progress` is set.
-    pub async fn wait(&self, name: &str, timeout: Duration, progress: bool) -> Vec<AgentEvent> {
+    /// Progress events are dropped unless `progress` is set. See `State::take_events` for `ack`.
+    pub async fn wait(&self, name: &str, timeout: Duration, progress: bool, ack: Option<u64>) -> (Vec<AgentEvent>, u64) {
         let mut rx = self.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         self.state.lock().unwrap().set_waiting(name, 1, now_ms());
@@ -129,20 +134,19 @@ impl Hub {
         };
         loop {
             rx.borrow_and_update();
-            let (events, urgent) = {
+            let (taken, urgent) = {
                 let mut st = self.state.lock().unwrap();
                 let now = now_ms();
-                let ev = st.take_events(name, progress, now);
-                (ev, st.next_actions(name, now).iter().any(|a| a.urgent))
+                (st.take_events(name, progress, ack, now), st.next_actions(name, now).iter().any(|a| a.urgent))
             };
-            if !events.is_empty() || urgent {
-                return events;
+            if !taken.0.is_empty() || urgent {
+                return taken;
             }
             let mut down = self.shutdown.subscribe();
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => return events,
-                r = rx.changed() => if r.is_err() { return events },
-                _ = down.wait_for(|d| *d) => return events,
+                _ = tokio::time::sleep_until(deadline) => return taken,
+                r = rx.changed() => if r.is_err() { return taken },
+                _ = down.wait_for(|d| *d) => return taken,
             }
         }
     }
