@@ -88,6 +88,54 @@ async fn ok_tool(base: &str, agent: &str, name: &str, args: Value) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn configured_role_does_not_override_hello_on_requests_or_heartbeats() {
+    let relay = start(None, vec![]).await;
+    for (initial, chosen) in [("author", "reviewer"), ("reviewer", "author")] {
+        let agent = format!("initial-{initial}");
+        let client = amx::client::Client::new(&relay.local, Some(agent.clone()), Some(initial.into()));
+        let init = client
+            .mcp(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(init["result"]["instructions"].as_str().unwrap().contains(&format!("Your role is {initial}")));
+
+        let hello = client
+            .mcp(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hello","arguments":{"role":chosen}}}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hello["result"]["isError"], false, "{hello}");
+
+        let online = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"online","arguments":{}}});
+        let response = client.mcp(&online).await.unwrap().unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("{agent} (you) ({chosen},")), "request reset role: {text}");
+
+        client.heartbeat().await.unwrap();
+        let text = ok_tool(&relay.local, &agent, "online", json!({})).await;
+        assert!(text.contains(&format!("{agent} (you) ({chosen},")), "heartbeat reset role: {text}");
+    }
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_role_applies_to_a_new_session() {
+    let relay = start(None, vec![]).await;
+    let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
+    let first = amx::client::Client::new(&relay.local, Some("returning".into()), Some("author".into()));
+    let init = first.mcp(&initialize).await.unwrap().unwrap();
+    assert!(init["result"]["instructions"].as_str().unwrap().contains("Your role is author"));
+
+    let second = amx::client::Client::new(&relay.local, Some("returning".into()), Some("reviewer".into()));
+    let init = second.mcp(&initialize).await.unwrap().unwrap();
+    assert!(init["result"]["instructions"].as_str().unwrap().contains("Your role is reviewer"), "{init}");
+    let text = ok_tool(&relay.local, "returning", "online", json!({})).await;
+    assert!(text.contains("returning (you) (reviewer,"), "{text}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unidentified_tailnet_callers_are_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let ts_fail = write_script(tmp.path(), "ts-fail", "echo 'peer not found' >&2; exit 1");

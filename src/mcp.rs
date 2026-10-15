@@ -442,6 +442,11 @@ pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, 
             if let Err(e) = touched {
                 return Some(error_response(id, -32000, &format!("{e:#}")));
             }
+            if let Some(r) = role
+                && let Err(e) = hub.write(|s, now| s.set_role(agent, r, now))
+            {
+                return Some(error_response(id, -32000, &format!("{e:#}")));
+            }
             let requested = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
             let version = if PROTOCOL_VERSIONS.contains(&requested) {
                 requested
