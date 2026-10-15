@@ -147,6 +147,8 @@ async fn unidentified_tailnet_callers_are_refused() {
     assert_eq!(status, 403);
     let hb = http.post(format!("{}/api/heartbeat?agent=x", relay.tailnet)).send().await.unwrap();
     assert_eq!(hb.status(), 403);
+    let api = http.get(format!("{}/api/reviews", relay.tailnet)).send().await.unwrap();
+    assert_eq!(api.status(), 403);
     let local = http.get(format!("{}/", relay.local)).send().await.unwrap();
     assert_eq!(local.status(), 200, "loopback is the relay's owner");
     relay.running.stop().await;
@@ -236,6 +238,61 @@ async fn review_over_mcp_with_long_polls() {
     assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     let status = ok_tool(&author, "owner-codex", "review_status", json!({"review_id":"r1"})).await;
     assert!(status.contains("Transcript"), "{status}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    let http = reqwest::Client::new();
+    let get = |path: &str| http.get(format!("{base}{path}")).send();
+    for rev in ["rev-a", "rev-b"] {
+        ok_tool(&base, rev, "hello", json!({"role":"reviewer"})).await;
+    }
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev-a", "rev-b"]})).await;
+    for rev in ["rev-a", "rev-b"] {
+        ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
+    }
+    let finding = json!([{"severity":"major","text":"SECRET until revealed\nsecond line"}]);
+    ok_tool(&base, "rev-a", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","summary":"PRIVATE","findings":finding})).await;
+
+    let r = get("/api/reviews/r1").await.unwrap();
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let body = r.text().await.unwrap();
+    assert!(!body.contains("SECRET") && !body.contains("PRIVATE"), "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((v["phase"].as_str(), v["revealed"].as_bool(), v["hidden_findings"].as_u64()), (Some("reviewing"), Some(false), Some(1)));
+    assert_eq!(v["timeline"][1]["state"], "active");
+    assert!(v["deadline_left_ms"].as_u64().unwrap() > 0);
+
+    ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+    ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree"}]})).await;
+    let v: Value = get("/api/reviews/r1").await.unwrap().json().await.unwrap();
+    assert_eq!(v["phase"], "done");
+    assert_eq!(v["verdict"], "changes_requested");
+    assert_eq!(v["findings"][0]["votes"]["rev-b"]["choice"], "Agree");
+    assert_eq!(v["summary"][0], json!({"id":"F1","title":"SECRET until revealed","severity":"major","by":"rev-a","origin":null,"outcome":"confirmed","agree":2,"disagree":0}));
+    assert!(v["result"]["text"].as_str().unwrap().contains("CHANGES REQUESTED"));
+    assert!(v["log"].as_array().unwrap().iter().any(|e| e["kind"] == "result"));
+    let stages: Vec<&str> = v["timeline"].as_array().unwrap().iter().map(|s| s["state"].as_str().unwrap()).collect();
+    assert_eq!(stages, ["done", "done", "done", "done"]);
+    assert!(v.get("next_finding").is_none());
+
+    ok_tool(&base, "author", "request_review", json!({"pr_url": "https://github.com/rust-lang/rust/pull/2", "reviewers": 1})).await;
+    let list: Value = get("/api/reviews").await.unwrap().json().await.unwrap();
+    let ids: Vec<&str> = list["reviews"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["r2", "r1"], "newest first");
+    assert_eq!(list["reviews"][0]["active"], true);
+    assert_eq!(list["reviews"][1]["verdict"], "changes_requested");
+
+    let missing = get("/api/reviews/r9").await.unwrap();
+    assert_eq!(missing.status(), 404);
+    let page = get("/r/r1").await.unwrap().text().await.unwrap();
+    assert!(page.contains("summary-table") && page.contains("Consensus result") && !page.contains("<pre>"), "{page}");
+    let partial = http.get(format!("{base}/r/r1")).header("X-Amx-Partial", "1").send().await.unwrap();
+    assert_eq!(partial.headers()["cache-control"], "no-store");
+    assert!(!partial.text().await.unwrap().contains("<html"));
     relay.running.stop().await;
 }
 
