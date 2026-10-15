@@ -17,6 +17,7 @@ pub struct Hub {
     pub listening: Mutex<Vec<String>>,
     pub shutdown: watch::Sender<bool>,
     saving: Mutex<()>,
+    pub conns: Arc<crate::server::Conns>,
 }
 
 struct Waiting<'a> {
@@ -46,6 +47,7 @@ impl Hub {
             listening: Mutex::new(Vec::new()),
             shutdown: watch::Sender::new(false),
             saving: Mutex::new(()),
+            conns: Arc::default(),
         })
     }
 

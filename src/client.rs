@@ -44,15 +44,13 @@ impl Client {
     }
 
     fn request(&self, method: reqwest::Method, path: &str, timeout: Duration) -> reqwest::RequestBuilder {
-        let mut rb = self
+        let rb = self
             .http
             .request(method, format!("{}{path}", self.base))
             .timeout(timeout)
             .query(&self.query());
-        if let Some(c) = &self.client_name {
-            rb = rb.header("x-amx-client", c);
-        }
-        rb
+        let client = self.client_name.as_deref().unwrap_or(concat!("amx/", env!("CARGO_PKG_VERSION")));
+        rb.header("x-amx-client", client)
     }
 
     fn unreachable(&self, e: reqwest::Error) -> anyhow::Error {

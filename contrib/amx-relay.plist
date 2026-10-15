@@ -25,6 +25,16 @@
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardErrorPath</key>

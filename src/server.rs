@@ -12,9 +12,10 @@ use axum::{Extension, Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,118 @@ pub enum Listener {
 }
 
 type St = State<Arc<Hub>>;
+
+/// Connection caps; fixed outside tests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConnLimits {
+    /// Open connections over all listeners.
+    pub max: usize,
+    /// Per peer address, except this machine's own.
+    pub per_ip: usize,
+    /// Time a client gets to send a request's headers; also closes idle keep-alive connections.
+    pub header_timeout: Duration,
+}
+
+impl Default for ConnLimits {
+    fn default() -> Self {
+        ConnLimits {
+            max: 512,
+            per_ip: 64,
+            header_timeout: Duration::from_secs(15),
+        }
+    }
+}
+
+/// Open connections per peer address, shared by all listeners.
+#[derive(Default)]
+pub struct Conns {
+    open: Mutex<HashMap<IpAddr, usize>>,
+}
+
+pub struct ConnSlot {
+    conns: Arc<Conns>,
+    ip: IpAddr,
+}
+
+impl Conns {
+    pub fn admit(self: &Arc<Self>, ip: IpAddr, limits: &ConnLimits) -> Option<ConnSlot> {
+        let mut open = self.open.lock().unwrap();
+        let total: usize = open.values().sum();
+        let mine = open.get(&ip).copied().unwrap_or(0);
+        let local = ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST);
+        if total >= limits.max || (mine >= limits.per_ip && !local) {
+            return None;
+        }
+        *open.entry(ip).or_default() += 1;
+        Some(ConnSlot { conns: self.clone(), ip })
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        let mut open = self.conns.open.lock().unwrap();
+        if let Some(n) = open.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Serves HTTP/1 until shutdown. Connections over the caps are closed at once, and clients that
+/// don't send a request's headers within `header_timeout_secs` (idle keep-alive included) are cut
+/// off, all before the caller is identified.
+pub async fn serve(hub: Arc<Hub>, listener: tokio::net::TcpListener, kind: Listener) {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use tower::ServiceExt;
+    let app = router(hub.clone(), kind);
+    let limits = hub.cfg.conn_limits;
+    let mut down = hub.shutdown.subscribe();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+            _ = down.wait_for(|d| *d) => break,
+        };
+        let (stream, addr) = match accepted {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("accept: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Some(slot) = hub.conns.admit(addr.ip(), &limits) else {
+            tracing::debug!("refused a connection from {addr}: too many open");
+            continue;
+        };
+        let app = app.clone();
+        let mut down = hub.shutdown.subscribe();
+        tasks.spawn(async move {
+            let _slot = slot;
+            let svc = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+                req.extensions_mut().insert(ConnectInfo(addr));
+                app.clone().oneshot(req.map(axum::body::Body::new))
+            });
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(limits.header_timeout)
+                .serve_connection(TokioIo::new(stream), svc);
+            tokio::pin!(conn);
+            let stopping = tokio::select! {
+                _ = conn.as_mut() => false,
+                _ = down.wait_for(|d| *d) => true,
+            };
+            if stopping {
+                conn.as_mut().graceful_shutdown();
+                let _ = conn.await;
+            }
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+}
 
 pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
     Router::new()
@@ -79,6 +192,14 @@ fn origin_matches(headers: &HeaderMap) -> bool {
         .is_some_and(|o| o.eq_ignore_ascii_case(host))
 }
 
+/// A browser request made by another site's page; agents' own clients don't send this header.
+fn from_another_site(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("cross-site") || v.eq_ignore_ascii_case("same-site"))
+}
+
 async fn identify(
     State((hub, listener)): State<(Arc<Hub>, Listener)>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -90,8 +211,16 @@ async fn identify(
     if !host_allowed(host, hub.cfg.public_url.as_deref()) {
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
-    if req.method() != axum::http::Method::GET && !origin_matches(headers) {
+    let path = req.uri().path();
+    let agent_api = matches!(path, "/mcp" | "/api/watch" | "/api/heartbeat");
+    if (req.method() != axum::http::Method::GET || agent_api) && !origin_matches(headers) {
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
+    if agent_api && from_another_site(headers) {
+        return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
+    }
+    if path == "/api/watch" && !headers.contains_key("x-amx-client") && !headers.contains_key("x-amx-agent") {
+        return (StatusCode::FORBIDDEN, "send an X-Amx-Client header (amx watch does)").into_response();
     }
     let who = match listener {
         Listener::Local if addr.ip().is_loopback() => hub.owner.lock().unwrap().clone(),
@@ -336,6 +465,25 @@ mod tests {
         assert!(!origin_matches(&h));
         h.insert(header::ORIGIN, HeaderValue::from_static("null"));
         assert!(!origin_matches(&h));
+    }
+
+    #[test]
+    fn connections_are_capped_per_address_except_loopback_and_in_total() {
+        let conns = Arc::new(Conns::default());
+        let limits = ConnLimits {
+            max: 5,
+            per_ip: 2,
+            header_timeout: Duration::from_secs(1),
+        };
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let a = conns.admit(ip("100.64.0.1"), &limits).unwrap();
+        let _a2 = conns.admit(ip("100.64.0.1"), &limits).unwrap();
+        assert!(conns.admit(ip("100.64.0.1"), &limits).is_none(), "per address");
+        let local = [conns.admit(ip("127.0.0.1"), &limits), conns.admit(ip("::1"), &limits), conns.admit(ip("127.0.0.1"), &limits)];
+        assert!(local.iter().all(Option::is_some), "loopback isn't capped per address");
+        assert!(conns.admit(ip("100.64.0.2"), &limits).is_none(), "in total");
+        drop(a);
+        assert!(conns.admit(ip("100.64.0.1"), &limits).is_some(), "a closed connection frees its slot");
     }
 
     #[test]

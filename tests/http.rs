@@ -317,15 +317,8 @@ async fn watch_heartbeat_and_obligation() {
     assert_eq!(ob["role"], "reviewer");
 
     let watch = tokio::spawn({
-        let base = base.clone();
-        async move {
-            reqwest::get(format!("{base}/api/watch?agent=rev&after=0&timeout=10"))
-                .await
-                .unwrap()
-                .json::<Value>()
-                .await
-                .unwrap()
-        }
+        let client = amx::client::Client::new(&base, Some("rev".into()), None);
+        async move { client.watch(0, 10).await.unwrap() }
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
     ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": 1})).await;
@@ -577,4 +570,95 @@ async fn requests_without_a_method_are_invalid() {
     let (status, _) = rpc(&relay.local, "someone", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await;
     assert_eq!(status, 202);
     relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_sites_cannot_register_or_keep_agents_alive() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    let http = reqwest::Client::new();
+    let url = format!("{base}/api/watch?agent=csrf-ghost&role=reviewer&timeout=1");
+    let tries = [
+        http.get(&url),
+        http.get(&url).header("Origin", "http://evil.example.com").header("X-Amx-Client", "x"),
+        http.get(&url).header("Sec-Fetch-Site", "cross-site").header("X-Amx-Client", "x"),
+        http.post(format!("{base}/api/heartbeat?agent=csrf-ghost&role=reviewer")).header("Sec-Fetch-Site", "cross-site"),
+        http.post(format!("{base}/mcp?agent=csrf-ghost"))
+            .header("Sec-Fetch-Site", "same-site")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})),
+    ];
+    for req in tries {
+        assert_eq!(req.send().await.unwrap().status(), 403);
+    }
+    assert!(relay.running.hub.read(|s, _| s.agents.get("csrf-ghost").is_none()));
+    let link = http.get(format!("{base}/")).header("Sec-Fetch-Site", "cross-site").send().await.unwrap();
+    assert_eq!(link.status(), 200, "links from elsewhere still open the page");
+
+    let watcher = amx::client::Client::new(&base, Some("cli-watch".into()), Some("reviewer".into()));
+    let w = watcher.watch(0, 1).await.unwrap();
+    assert_eq!(w["agent"], "cli-watch");
+    let same = http.get(format!("{base}/api/watch?agent=page&timeout=1")).header("Sec-Fetch-Site", "same-origin").header("X-Amx-Client", "x");
+    assert_eq!(same.send().await.unwrap().status(), 200);
+    relay.running.stop().await;
+}
+
+/// Whether the relay closes the connection within `within` without being sent anything more.
+async fn closed(conn: &mut tokio::net::TcpStream, within: Duration) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 256];
+    matches!(tokio::time::timeout(within, conn.read(&mut buf)).await, Ok(Ok(0) | Err(_)))
+}
+
+async fn get_on(conn: &mut tokio::net::TcpStream, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    conn.write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf)).await.unwrap().unwrap();
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_and_excess_connections_are_cut_off_before_identification() {
+    let mut cfg = Config {
+        port: 0,
+        tailnet: false,
+        ..Config::default()
+    };
+    cfg.conn_limits = amx::server::ConnLimits {
+        max: 5,
+        per_ip: 3,
+        header_timeout: Duration::from_secs(2),
+    };
+    let running = amx::start(cfg).await.unwrap();
+    let addr = running.local_addr;
+
+    let mut idle = Vec::new();
+    for _ in 0..5 {
+        idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+    }
+    let mut over_all = tokio::net::TcpStream::connect(addr).await.unwrap();
+    assert!(closed(&mut over_all, Duration::from_secs(1)).await, "6th connection overall");
+    for (i, c) in idle.iter_mut().enumerate() {
+        assert!(!closed(c, Duration::from_millis(20)).await, "connection {i} admitted (127.0.0.1 has no per-address cap)");
+    }
+
+    assert!(get_on(&mut idle[0], "/api/reviews").await.starts_with("HTTP/1.1 200"), "admitted connections work");
+    let mut slow = idle.pop().unwrap();
+    use tokio::io::AsyncWriteExt;
+    slow.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n").await.unwrap();
+    for (i, c) in idle.iter_mut().enumerate() {
+        assert!(closed(c, Duration::from_secs(5)).await, "idle connection {i} (keep-alive after a request included)");
+    }
+    assert!(closed(&mut slow, Duration::from_secs(5)).await, "headers never finished");
+
+    let mut fresh = None;
+    for _ in 0..50 {
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        if !closed(&mut c, Duration::from_millis(50)).await {
+            fresh = Some(c);
+            break;
+        }
+    }
+    assert!(get_on(fresh.as_mut().expect("slots freed"), "/api/reviews").await.starts_with("HTTP/1.1 200"));
+    running.stop().await;
 }

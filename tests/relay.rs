@@ -1292,3 +1292,190 @@ fn agent_text_cannot_forge_relay_lines() {
     let idle = amx::mcp::next_text(&[], Role::Reviewer, &said, &[]);
     assert!(idle.starts_with("NEXT: nothing for you right now"), "{idle}");
 }
+
+fn pr(n: u32) -> NewReview {
+    let mut req = NewReview::new(&format!("https://github.com/rust-lang/rust/pull/{n}"));
+    req.reviewers = Some(1);
+    req
+}
+
+#[test]
+fn open_reviews_are_capped_per_login() {
+    let mut sim = setup(&[]);
+    sim.join("alice-claude", "alice@example.com", Role::Author);
+    sim.join("bob-codex", "bob@example.com", Role::Author);
+    for n in 1..=5 {
+        let author = if n % 2 == 0 { "alice-claude" } else { "alice-codex" };
+        sim.s.request_review(author, pr(n), sim.now).unwrap();
+    }
+    let err = sim.s.request_review("alice-claude", pr(6), sim.now).unwrap_err().to_string();
+    assert!(err.contains("alice@example.com already has 5 unfinished reviews"), "{err}");
+    sim.s.request_review("bob-codex", pr(6), sim.now).unwrap();
+    sim.advance(Timing::default().offer_secs);
+    sim.s.request_review("alice-claude", pr(6), sim.now).unwrap();
+}
+
+#[test]
+fn an_idle_reviewer_is_shown_a_few_offers_at_a_time() {
+    let mut sim = setup(&["rev-a"]);
+    for i in 0..4 {
+        let author = format!("author{i}");
+        sim.join(&author, &format!("a{i}@example.com"), Role::Author);
+        for n in 1..=5 {
+            let mut req = pr(n);
+            req.note = "n".repeat(8000);
+            sim.s.request_review(&author, req, sim.now).unwrap();
+        }
+    }
+    let offers = |sim: &Sim| {
+        let actions = sim.s.next_actions("rev-a", sim.now);
+        let shown: Vec<String> = actions.iter().filter(|a| a.urgent).map(|a| a.review.clone()).collect();
+        let text: String = actions.iter().map(|a| a.text.as_str()).collect();
+        (shown, text)
+    };
+    let (shown, text) = offers(&sim);
+    assert_eq!(shown.len(), 2);
+    assert!(text.contains("18 more review offers are open"), "{text}");
+    assert_eq!(sim.s.take_events("rev-a", false, sim.now).len(), 2, "queued offers follow the ones shown");
+    for id in &shown {
+        sim.s.decline("rev-a", id, "busy", sim.now).unwrap();
+        sim.s.decline("rev-a", id, "busy", sim.now).unwrap();
+        assert_eq!(sim.s.review(id).unwrap().log.len(), 2, "declining again adds nothing");
+    }
+    let (next, text) = offers(&sim);
+    assert!(next.len() == 2 && next.iter().all(|id| !shown.contains(id)), "{next:?}");
+    assert!(text.contains("16 more"), "{text}");
+}
+
+#[test]
+fn talk_is_rate_limited_and_capped() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "off by one")]);
+    sim.submit("rev-b", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Voting(1));
+    for minute in 0..5 {
+        for i in 0..10 {
+            sim.s.say("rev-a", &id, &format!("point {minute}.{i}"), sim.now).unwrap();
+        }
+        let err = sim.s.say("rev-a", &id, "one more", sim.now).unwrap_err().to_string();
+        assert!(err.contains("10 messages a minute") || minute == 4, "{err}");
+        sim.advance(60);
+    }
+    let err = sim.s.say("rev-a", &id, "still more", sim.now).unwrap_err().to_string();
+    assert!(err.contains("enough discussion"), "{err}");
+    sim.s.say("rev-b", &id, &"x".repeat(10_000), sim.now).unwrap();
+    assert!(sim.s.review(&id).unwrap().log.last().unwrap().text.len() < 4100);
+
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    for who in ["alice-codex", "rev-a"] {
+        for i in 0..3 {
+            sim.s.say(who, &id, &format!("thanks {i}"), sim.now).unwrap();
+        }
+        let err = sim.s.say(who, &id, "thanks again", sim.now).unwrap_err().to_string();
+        assert!(err.contains("closing remarks"), "{err}");
+    }
+}
+
+#[test]
+fn agents_are_capped_per_login_and_in_total() {
+    let mut sim = Sim::new();
+    let me = who("mallory@example.com");
+    for i in 0..20 {
+        sim.s.touch(&format!("m{i}"), &me, None, sim.now).unwrap();
+    }
+    let err = sim.s.touch("m20", &me, None, sim.now).unwrap_err().to_string();
+    assert!(err.contains("already has 20 agents"), "{err}");
+    sim.s.touch("m0", &me, None, sim.now).unwrap();
+    sim.now += 60_000;
+    sim.s.touch("m0", &me, None, sim.now).unwrap();
+    sim.now += 60_000;
+    sim.s.touch("m20", &me, None, sim.now).unwrap();
+    assert!(sim.s.agents.get("m1").is_none(), "the longest silent one makes room");
+    assert!(sim.s.agents.get("m0").is_some() && sim.s.agents.all().count() == 20);
+
+    let mut sim = Sim::new();
+    for l in 0..10 {
+        for i in 0..20 {
+            sim.s.touch(&format!("u{l}-{i}"), &who(&format!("u{l}@example.com")), None, sim.now).unwrap();
+        }
+    }
+    let err = sim.s.touch("late", &who("late@example.com"), None, sim.now).unwrap_err().to_string();
+    assert!(err.contains("already has 200 agents"), "{err}");
+    sim.now += 120_000;
+    sim.s.touch("late", &who("late@example.com"), None, sim.now).unwrap();
+    assert_eq!(sim.s.agents.all().count(), 200);
+}
+
+#[test]
+fn results_and_tasks_outlast_a_flood_of_chatter() {
+    let revs = ["rev-a", "rev-b", "rev-c", "rev-d", "rev-e"];
+    let mut sim = setup(&revs);
+    let first = sim.request("alice-codex", 1);
+    sim.accept("rev-a", &first);
+    sim.submit("rev-a", &first, &[]);
+    assert_eq!(sim.phase(&first), Phase::Done);
+    let id = sim.request("alice-codex", 5);
+    for r in revs {
+        sim.accept(r, &id);
+    }
+    for r in revs {
+        sim.submit(r, &id, &[("minor", &format!("{r} spotted a typo"))]);
+    }
+    assert_eq!(sim.phase(&id), Phase::Voting(1));
+    let filler = "z".repeat(700);
+    for minute in 0..5 {
+        for r in revs {
+            for i in 0..10 {
+                sim.s.say(r, &id, &format!("{r} {minute}.{i} {filler}"), sim.now).unwrap();
+            }
+        }
+        sim.advance(60);
+    }
+    for name in ["alice-codex", "rev-a"] {
+        let (queued, _) = sim.s.peek_events(name, 0);
+        assert!(queued.len() <= 200 && queued.iter().map(|e| e.text.len()).sum::<usize>() <= 128 * 1024);
+    }
+    let mut author = Vec::new();
+    loop {
+        let batch = sim.s.take_events("alice-codex", false, sim.now);
+        if batch.is_empty() {
+            break;
+        }
+        assert!(batch.iter().map(|e| e.text.len()).sum::<usize>() <= 64 * 1024, "one wait stays small");
+        author.extend(batch);
+    }
+    assert!(author.iter().any(|e| e.text.starts_with(&format!("[{first}] Review result"))), "the result survives");
+    let rev = sim.s.take_events("rev-a", false, sim.now);
+    assert!(rev.iter().any(|e| e.task.as_deref().is_some_and(|t| t.contains(":vote:"))), "the vote task survives");
+}
+
+#[test]
+fn failed_requests_do_not_push_finished_reviews_out_of_history() {
+    let mut sim = setup(&["rev-a"]);
+    sim.s.history = 3;
+    sim.join("bob-codex", "bob@example.com", Role::Author);
+    let done = sim.request("alice-codex", 1);
+    sim.accept("rev-a", &done);
+    sim.submit("rev-a", &done, &[]);
+    for n in 2..=7 {
+        sim.s.request_review("bob-codex", pr(n), sim.now).unwrap();
+        sim.advance(Timing::default().offer_secs);
+    }
+    let failed = sim.s.reviews.iter().filter(|r| r.phase == Phase::Failed).count();
+    assert_eq!(failed, 3);
+    assert!(sim.s.review(&done).is_some(), "unanswered requests don't count against real reviews");
+    for n in 8..=10 {
+        let id = sim.s.request_review("bob-codex", pr(n), sim.now).unwrap();
+        sim.accept("rev-a", &id);
+        sim.submit("rev-a", &id, &[]);
+        sim.advance(1);
+    }
+    let kept: Vec<&str> = sim.s.reviews.iter().filter(|r| r.phase == Phase::Done).map(|r| r.id.as_str()).collect();
+    assert_eq!(kept.len(), 3);
+    assert!(kept.contains(&done.as_str()), "the busiest login loses its oldest first: {kept:?}");
+    sim.s.rereview("alice-codex", &done, SHA2, "fixed", sim.now).unwrap();
+}

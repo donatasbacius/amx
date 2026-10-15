@@ -16,7 +16,23 @@ pub fn now_ms() -> Ms {
 }
 
 const MAX_EVENTS: usize = 200;
+const MAX_EVENT_BYTES: usize = 128 * 1024;
+/// Event text one `wait` returns; the rest stays queued for the next call.
+const MAX_WAIT_BYTES: usize = 64 * 1024;
 const MAX_TEXT: usize = 8000;
+const MAX_SAY: usize = 4000;
+const SAYS_PER_REVIEW: usize = 50;
+const SAYS_PER_MINUTE: usize = 10;
+const CLOSING_REMARKS: usize = 3;
+const MAX_TALK_BYTES: usize = 200 * 1024;
+/// Offers listed in full in an idle reviewer's next actions.
+const OFFERS_SHOWN: usize = 2;
+/// Reviews that failed before anyone took them, kept on top of `history`.
+const FAILED_KEPT: usize = 10;
+/// Unfinished reviews one Tailscale login may have requested at a time.
+const REVIEWS_PER_LOGIN: usize = 5;
+const AGENTS_PER_LOGIN: usize = 20;
+const MAX_AGENTS: usize = 200;
 const MAX_FINDINGS: usize = 60;
 const FORGET_AGENT_MS: Ms = 24 * 3600 * 1000;
 
@@ -205,13 +221,27 @@ impl Agents {
         self.push(name, AgentEvent { result: true, ..AgentEvent::new(review, text, now) });
     }
 
+    /// Queues `ev`; when the queue is full, delivered events go first, then progress, chatter
+    /// and the newest offers (`next_actions` lists offers oldest first), and other tasks and
+    /// results only as a last resort.
     fn push(&mut self, name: &str, mut ev: AgentEvent) {
-        if let Some(a) = self.map.get_mut(name) {
-            a.next_seq += 1;
-            ev.seq = a.next_seq;
-            a.events.push_back(ev);
-            while a.events.len() > MAX_EVENTS {
-                a.events.pop_front();
+        let Some(a) = self.map.get_mut(name) else { return };
+        a.next_seq += 1;
+        ev.seq = a.next_seq;
+        a.events.push_back(ev);
+        let mut bytes: usize = a.events.iter().map(|e| e.text.len()).sum();
+        while a.events.len() > MAX_EVENTS || (bytes > MAX_EVENT_BYTES && a.events.len() > 1) {
+            let delivered = a.delivered;
+            let q = &a.events;
+            let i = q
+                .iter()
+                .position(|e| e.seq <= delivered)
+                .or_else(|| q.iter().position(|e| e.progress))
+                .or_else(|| q.iter().position(|e| e.task.is_none() && !e.result))
+                .or_else(|| q.iter().rposition(|e| e.task.as_deref().is_some_and(|t| t.ends_with(":offer"))))
+                .unwrap_or(0);
+            if let Some(e) = a.events.remove(i) {
+                bytes -= e.text.len();
             }
         }
     }
@@ -851,6 +881,9 @@ impl State {
         if self.agents.get(name).is_some_and(|a| !a.login.eq_ignore_ascii_case(&who.login)) {
             self.agents.map.remove(name);
         }
+        if self.agents.get(name).is_none() {
+            self.make_room(&who.login, now)?;
+        }
         let a = self.agents.map.entry(name.to_string()).or_insert_with(|| Agent {
             name: name.to_string(),
             login: who.login.clone(),
@@ -870,6 +903,30 @@ impl State {
         a.last_seen = now;
         a.node = who.node.clone();
         Ok(())
+    }
+
+    /// Forgets an offline, unengaged agent if a new one for `login` would exceed the caps.
+    fn make_room(&mut self, login: &str, now: Ms) -> Result<()> {
+        let mine = |a: &Agent| a.login.eq_ignore_ascii_case(login);
+        let per_login = self.agents.all().filter(|a| mine(a)).count() >= AGENTS_PER_LOGIN;
+        let total = self.agents.map.len() >= MAX_AGENTS;
+        if !per_login && !total {
+            return Ok(());
+        }
+        let victim = self
+            .agents
+            .all()
+            .filter(|a| (!per_login || mine(a)) && a.waiting == 0 && !self.agents.online(&a.name, now) && !self.engaged(&a.name))
+            .min_by_key(|a| (self.has_undelivered(&a.name), a.last_seen))
+            .map(|a| a.name.clone());
+        match victim {
+            Some(v) => {
+                self.agents.map.remove(&v);
+                Ok(())
+            }
+            None if per_login => bail!("{login} already has {AGENTS_PER_LOGIN} agents on the relay; reuse one of their names"),
+            None => bail!("the relay already has {MAX_AGENTS} agents; try again later"),
+        }
     }
 
     /// Refuses `name`, in any letter case, while another login holds it and is online or in an
@@ -941,14 +998,20 @@ impl State {
         let Some(a) = self.agents.map.get_mut(name) else {
             return Vec::new();
         };
-        let fresh: Vec<AgentEvent> = a
-            .events
-            .iter()
-            .filter(|e| e.seq > a.delivered && (progress || !e.progress))
-            .filter(|e| e.task.as_ref().is_none_or(|t| open.contains(t)))
-            .map(|e| e.clone().rendered(now))
-            .collect();
-        a.delivered = a.next_seq;
+        let mut fresh = Vec::new();
+        let mut bytes = 0;
+        let mut delivered = a.next_seq;
+        for e in a.events.iter().filter(|e| e.seq > a.delivered) {
+            if (progress || !e.progress) && e.task.as_ref().is_none_or(|t| open.contains(t)) {
+                if !fresh.is_empty() && bytes + e.text.len() > MAX_WAIT_BYTES {
+                    delivered = e.seq - 1;
+                    break;
+                }
+                bytes += e.text.len();
+                fresh.push(e.clone().rendered(now));
+            }
+        }
+        a.delivered = delivered;
         fresh
     }
 
@@ -1034,6 +1097,7 @@ impl State {
         let mut out = Vec::new();
         let idle = self.busy_with(name).is_none();
         let reviewer = self.agents.get(name).is_some_and(|a| a.role == Role::Reviewer);
+        let mut offers = 0;
         for r in self.reviews.iter().filter(|r| r.phase.active()) {
             let left = text::dur(r.deadline_left(now));
             let id = &r.id;
@@ -1108,17 +1172,20 @@ impl State {
                 && reviewer
                 && idle
             {
-                out.push(Action {
-                    review: id.clone(),
-                    urgent: true,
-                    text: format!(
-                        "{id}: review offer for {} from {}. Call `accept_review` (review_id \"{id}\") to take it or `decline_review` if you can't. Offer closes in {left}.",
-                        r.pr.url(),
-                        r.author
-                    ),
-                    task: Some(offer_task(id)),
-                    short: Some(format!("{id}: accept or decline the offer above.")),
-                });
+                offers += 1;
+                if offers <= OFFERS_SHOWN {
+                    out.push(Action {
+                        review: id.clone(),
+                        urgent: true,
+                        text: format!(
+                            "{id}: review offer for {} from {}. Call `accept_review` (review_id \"{id}\") to take it or `decline_review` if you can't. Offer closes in {left}.",
+                            r.pr.url(),
+                            r.author
+                        ),
+                        task: Some(offer_task(id)),
+                        short: Some(format!("{id}: accept or decline the offer above.")),
+                    });
+                }
             }
             if r.author == name {
                 out.push(Action::info(
@@ -1130,6 +1197,12 @@ impl State {
                     ),
                 ));
             }
+        }
+        if offers > OFFERS_SHOWN {
+            out.push(Action::info(
+                "",
+                format!("{} more review offers are open; they are shown once you have answered the ones above.", offers - OFFERS_SHOWN),
+            ));
         }
         out.sort_by_key(|a| !a.urgent);
         out
@@ -1153,6 +1226,14 @@ impl State {
             .find(|r| r.phase.active() && r.author == author && r.pr == pr)
         {
             bail!("you already have review {} of this PR in progress; call `wait` for its result", r.id);
+        }
+        let open = self
+            .reviews
+            .iter()
+            .filter(|r| r.phase.active() && r.author_login.eq_ignore_ascii_case(&login))
+            .count();
+        if open >= REVIEWS_PER_LOGIN {
+            bail!("{login} already has {open} unfinished reviews on the relay; call `wait` until one finishes");
         }
         if let Some(sha) = &req.head_sha
             && !valid_sha(sha)
@@ -1299,7 +1380,9 @@ impl State {
         if r.phase != Phase::Offering || r.slot(agent).is_some() {
             bail!("{} has no open offer for you", r.id);
         }
-        r.declined.insert(agent.to_string());
+        if !r.declined.insert(agent.to_string()) {
+            return Ok(());
+        }
         let reason = clip(reason, 500);
         r.log(now, agent, "decline", if reason.is_empty() { "declined".to_string() } else { format!("declined: {reason}") });
         self.advance(now);
@@ -1471,7 +1554,7 @@ impl State {
     }
 
     pub fn say(&mut self, agent: &str, id: &str, msg: &str, now: Ms) -> Result<()> {
-        let msg = need_text(msg, "message")?;
+        let msg = clip(&need_text(msg, "message")?, MAX_SAY);
         let login = self.login_of(agent);
         let r = self.review_mut(id)?;
         r.check_login(agent, &login)?;
@@ -1481,6 +1564,17 @@ impl State {
         }
         if reviewer && matches!(r.phase, Phase::Offering | Phase::Reviewing) {
             bail!("reviewers can discuss once findings are revealed (cross-examination); work independently until then");
+        }
+        let said: Vec<&LogEntry> = r.log.iter().filter(|e| e.kind == "say" && e.who == agent).collect();
+        let talk: usize = r.log.iter().filter(|e| e.kind == "say").map(|e| e.text.len()).sum();
+        if let Some(ended) = r.ended {
+            if said.iter().filter(|e| e.at >= ended).count() >= CLOSING_REMARKS {
+                bail!("you have made your {CLOSING_REMARKS} closing remarks on {}", r.id);
+            }
+        } else if said.len() >= SAYS_PER_REVIEW || talk + msg.len() > MAX_TALK_BYTES {
+            bail!("{} has had enough discussion; vote, or call `wait`", r.id);
+        } else if said.iter().filter(|e| now.saturating_sub(e.at) < 60_000).count() >= SAYS_PER_MINUTE {
+            bail!("at most {SAYS_PER_MINUTE} messages a minute; call `wait` and let the others answer");
         }
         r.log(now, agent, "say", msg.clone());
         if r.replying {
@@ -1685,21 +1779,7 @@ impl State {
     pub fn tick(&mut self, now: Ms) -> bool {
         let before = self.fingerprint(now);
         let stepped = self.advance(now);
-        let finished: Vec<usize> = self
-            .reviews
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| !r.phase.active())
-            .map(|(i, _)| i)
-            .collect();
-        if finished.len() > self.history {
-            let drop: HashSet<usize> = finished[..finished.len() - self.history].iter().copied().collect();
-            let mut i = 0;
-            self.reviews.retain(|_| {
-                i += 1;
-                !drop.contains(&(i - 1))
-            });
-        }
+        self.trim_history();
         let engaged: HashSet<String> = self
             .reviews
             .iter()
@@ -1710,6 +1790,34 @@ impl State {
             engaged.contains(name) || a.waiting > 0 || now.saturating_sub(a.last_seen) < FORGET_AGENT_MS
         });
         stepped || before != self.fingerprint(now)
+    }
+
+    /// Keeps `history` finished reviews that someone took part in and `FAILED_KEPT` that nobody
+    /// did, dropping the oldest of whichever login has the most, so one caller's requests can't
+    /// push out everyone else's.
+    fn trim_history(&mut self) {
+        let unattended = |r: &Review| r.phase == Phase::Failed && r.slots.is_empty();
+        for (kind, cap) in [(false, self.history), (true, FAILED_KEPT.min(self.history))] {
+            let of_kind = |r: &Review| !r.phase.active() && unattended(r) == kind;
+            loop {
+                let mut per_login: BTreeMap<String, usize> = BTreeMap::new();
+                for r in self.reviews.iter().filter(|r| of_kind(r)) {
+                    *per_login.entry(r.author_login.to_ascii_lowercase()).or_default() += 1;
+                }
+                if per_login.values().sum::<usize>() <= cap {
+                    break;
+                }
+                let most = per_login.values().copied().max().unwrap_or(0);
+                let oldest = self
+                    .reviews
+                    .iter()
+                    .position(|r| of_kind(r) && per_login[&r.author_login.to_ascii_lowercase()] == most);
+                match oldest {
+                    Some(i) => self.reviews.remove(i),
+                    None => break,
+                };
+            }
+        }
     }
 
     fn fingerprint(&self, now: Ms) -> Fingerprint {
