@@ -128,6 +128,26 @@ impl Config {
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
+
+    /// Refuses values the relay can't run with, so it never starts with them.
+    pub fn validate(&self) -> Result<()> {
+        let c = &self.consensus;
+        if !(1..=5).contains(&c.reviewers) {
+            anyhow::bail!("consensus.reviewers must be between 1 and 5, got {}", c.reviewers);
+        }
+        if !(0.0..1.0).contains(&c.confirm_fraction) {
+            anyhow::bail!("consensus.confirm_fraction must be at least 0 and below 1, got {}", c.confirm_fraction);
+        }
+        if !(1..=3).contains(&c.vote_rounds) {
+            anyhow::bail!("consensus.vote_rounds must be between 1 and 3, got {}", c.vote_rounds);
+        }
+        if let Some(u) = &self.public_url
+            && crate::server::url_host(u).is_none()
+        {
+            anyhow::bail!("public_url must be an http:// or https:// URL, got {u}");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -28,11 +28,15 @@ impl fmt::Display for PrRef {
 }
 
 fn valid_name(s: &str) -> bool {
-    !s.is_empty()
-        && s != "."
-        && s != ".."
+    s.len() <= 100
+        && s.chars().any(|c| c != '.')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A PR number as GitHub writes it: digits only, no leading zero.
+fn pr_number(s: &str) -> Option<u64> {
+    (s.len() <= 10 && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok())?
 }
 
 /// Accepts PR links in their usual variants (`/files`, `/commits/<sha>`, query, fragment,
@@ -44,7 +48,7 @@ pub fn parse(input: &str) -> Option<PrRef> {
         && !repo_part.contains("github.com")
     {
         let (owner, repo) = repo_part.split_once('/')?;
-        let number = num.parse().ok()?;
+        let number = pr_number(num)?;
         return build(owner, repo, number);
     }
     let s = s
@@ -62,13 +66,13 @@ pub fn parse(input: &str) -> Option<PrRef> {
     if parts.next()? != "pull" {
         return None;
     }
-    let number = parts.next()?.parse().ok()?;
+    let number = pr_number(parts.next()?)?;
     build(owner, repo, number)
 }
 
 fn build(owner: &str, repo: &str, number: u64) -> Option<PrRef> {
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    if !valid_name(owner) || !valid_name(repo) || number == 0 {
+    if !valid_name(owner) || !valid_name(repo) {
         return None;
     }
     Some(PrRef {
@@ -112,6 +116,7 @@ mod tests {
 
     #[test]
     fn rejects_non_prs() {
+        let long_repo = format!("a/{}#1", "r".repeat(101));
         for v in [
             "",
             "https://github.com/rust-lang/rust",
@@ -124,6 +129,11 @@ mod tests {
             "https://github.com/../c/pull/1",
             "javascript:alert(1)//github.com/a/b/pull/1",
             "a/b#x",
+            "a/b#+8",
+            "a/b#007",
+            "a/b#18446744073709551615",
+            ".../b#1",
+            &long_repo,
         ] {
             assert_eq!(canonical(v), None, "{v}");
         }

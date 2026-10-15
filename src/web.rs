@@ -73,29 +73,15 @@ fn safe_url(u: &str) -> Option<&str> {
     u.starts_with("https://github.com/").then_some(u)
 }
 
-/// Like the page script's relative times, so the first paint matches what it shows later.
-fn ago(ms: Ms, now: Ms) -> String {
-    let s = now.saturating_sub(ms).div_ceil(1000);
-    let round = |n: Ms, d: Ms| (n + d / 2) / d;
-    let m = round(s, 60);
-    let h = round(m, 60);
-    let d = round(h, 24);
-    match () {
-        _ if s < 45 => "just now".into(),
-        _ if m < 60 => format!("{m} min ago"),
-        _ if h < 24 => format!("{h} h ago"),
-        _ if d < 14 => format!("{d} d ago"),
-        _ => iso(ms)[..10].to_string(),
-    }
-}
-
-fn time_tag(ms: Ms, now: Ms) -> String {
+/// Times and countdowns are rendered as timestamps and made relative by the page script, so the
+/// page only changes when the review does.
+fn time_tag(ms: Ms) -> String {
     let iso = iso(ms);
-    format!("<time datetime=\"{}\" title=\"{iso}\">{}</time>", iso.replace(' ', "T"), ago(ms, now))
+    format!("<time datetime=\"{}\">{iso}</time>", iso.replace(' ', "T"))
 }
 
-fn countdown(deadline: Ms, now: Ms) -> String {
-    format!("<span class=\"left\"><span data-deadline=\"{deadline}\">{}</span> left</span>", dur(deadline.saturating_sub(now)))
+fn countdown(deadline: Ms) -> String {
+    format!("<span class=\"left\" data-deadline=\"{deadline}\">until {}</span>", iso(deadline))
 }
 
 /// The review's state as a pill class and label.
@@ -130,10 +116,11 @@ fn page(title: &str, main: &str) -> String {
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="top"><a class="brand" href="/">amx</a><span id="live" class="live" role="status" aria-live="polite"></span></header>
-<main id="main">{main}</main>
+<main id="main" data-etag='{tag}'>{main}</main>
 </body>
 </html>"##,
         title = esc(title),
+        tag = etag(main),
     )
 }
 
@@ -265,14 +252,14 @@ fn step_name(name: &str) -> String {
     }
 }
 
-fn render_timeline(out: &mut String, r: &Review, now: Ms) {
+fn render_timeline(out: &mut String, r: &Review) {
     out.push_str("<h2 id=\"progress\">Progress</h2><ol class=\"steps\">");
     for s in timeline(r) {
         let info = match (s.state, s.start, s.end, s.deadline) {
-            (_, _, _, Some(d)) => countdown(d, now),
+            (_, _, _, Some(d)) => countdown(d),
             ("skipped", ..) => "skipped".into(),
             (_, Some(a), Some(b), _) if s.name != "Consensus result" && s.name != "Failed" => dur(b.saturating_sub(a)),
-            (_, Some(a), None, _) if !r.phase.active() => time_tag(a, now),
+            (_, Some(a), None, _) if !r.phase.active() => time_tag(a),
             _ => String::new(),
         };
         let title = s.start.map(|a| format!(" title=\"started {}\"", iso(a))).unwrap_or_default();
@@ -294,7 +281,7 @@ fn confirmed(r: &Review) -> usize {
         .count()
 }
 
-fn review_row(out: &mut String, r: &Review, now: Ms) {
+fn review_row(out: &mut String, r: &Review) {
     let n = visible(r).count();
     let what = match r.phase {
         Phase::Offering => format!("offered to {}", r.offered.len()),
@@ -312,7 +299,7 @@ fn review_row(out: &mut String, r: &Review, now: Ms) {
         },
     };
     let parent = r.parent.as_deref().map(|p| format!(" · re-review of {}", esc(p))).unwrap_or_default();
-    let when = if r.phase.active() { countdown(r.deadline, now) } else { time_tag(r.ended.unwrap_or(r.created), now) };
+    let when = if r.phase.active() { countdown(r.deadline) } else { time_tag(r.ended.unwrap_or(r.created)) };
     let _ = write!(
         out,
         "<li><a class=\"rv\" href=\"/r/{id}\">{pill}<span class=\"rv-pr\">{pr}</span>\
@@ -339,7 +326,7 @@ pub fn render_index(st: &State, now: Ms) -> String {
         }
         let _ = write!(out, "<h2>{label} <span class=\"count\">{}</span></h2><ul class=\"reviews\">", list.len());
         for r in list {
-            review_row(&mut out, r, now);
+            review_row(&mut out, r);
         }
         out.push_str("</ul>");
     }
@@ -538,7 +525,7 @@ fn render_findings(out: &mut String, r: &Review) {
     }
 }
 
-fn render_verdict(out: &mut String, r: &Review, now: Ms) {
+fn render_verdict(out: &mut String, r: &Review) {
     let (cls, label) = status(r);
     let detail = match r.phase {
         Phase::Done => {
@@ -595,9 +582,9 @@ fn render_verdict(out: &mut String, r: &Review, now: Ms) {
         }
     };
     let when = match (&r.result, r.phase.active()) {
-        (_, true) => countdown(r.deadline, now),
-        (Some(res), _) => time_tag(res.at, now),
-        (None, _) => r.ended.map(|e| time_tag(e, now)).unwrap_or_default(),
+        (_, true) => countdown(r.deadline),
+        (Some(res), _) => time_tag(res.at),
+        (None, _) => r.ended.map(time_tag).unwrap_or_default(),
     };
     let _ = write!(
         out,
@@ -643,12 +630,12 @@ fn render_reviewers(out: &mut String, r: &Review) {
     out.push_str("</ul>");
 }
 
-pub fn render_review(r: &Review, now: Ms) -> String {
-    render_review_page(r, &[], now)
+pub fn render_review(r: &Review) -> String {
+    render_review_page(r, &[])
 }
 
 /// `rereviews` are the ids of later reviews of the same PR started from this one.
-pub fn render_review_page(r: &Review, rereviews: &[String], now: Ms) -> String {
+pub fn render_review_page(r: &Review, rereviews: &[String]) -> String {
     let mut meta = vec![format!("{} by <b>{}</b>", esc(&r.id), esc(&r.author))];
     if let Some(h) = &r.head_sha {
         meta.push(format!("<code>{}</code>", esc(short_sha(h))));
@@ -660,7 +647,7 @@ pub fn render_review_page(r: &Review, rereviews: &[String], now: Ms) -> String {
         let links: Vec<String> = rereviews.iter().map(|c| format!("<a href=\"/r/{0}\">{0}</a>", esc(c))).collect();
         meta.push(format!("re-reviewed in {}", links.join(", ")));
     }
-    meta.push(format!("requested {}", time_tag(r.created, now)));
+    meta.push(format!("requested {}", time_tag(r.created)));
     let mut out = format!(
         "<h1><a href=\"{url}\" rel=\"noopener noreferrer\" target=\"_blank\">{short}<span class=\"ext\" aria-hidden=\"true\"> ↗</span></a></h1>\
          <p class=\"meta\">{meta}</p>",
@@ -668,9 +655,9 @@ pub fn render_review_page(r: &Review, rereviews: &[String], now: Ms) -> String {
         short = esc(&r.pr.short()),
         meta = meta.join(" · "),
     );
-    render_verdict(&mut out, r, now);
+    render_verdict(&mut out, r);
     render_findings(&mut out, r);
-    render_timeline(&mut out, r, now);
+    render_timeline(&mut out, r);
     if !r.note.is_empty() {
         let _ = write!(out, "<h2>Author's note</h2><div class=\"md prose note\">{}</div>", markdown(&r.note));
     }
@@ -696,7 +683,7 @@ pub fn render_review_page(r: &Review, rereviews: &[String], now: Ms) -> String {
         let _ = write!(
             out,
             "<li class=\"k-{kind}\"><div class=\"lh\"><b>{who}</b> <span class=\"kind\">{kind}</span> <span class=\"when\">{time}</span></div><div class=\"md prose\">{text}</div></li>",
-            time = time_tag(e.at, now),
+            time = time_tag(e.at),
             who = esc(&e.who),
             kind = esc(&e.kind),
             text = markdown(&e.text),
@@ -800,12 +787,16 @@ fn partial(headers: &HeaderMap) -> bool {
     headers.contains_key("x-amx-partial")
 }
 
-/// A page's main part for the page script, which polls it; 304 if it hasn't changed.
-fn fragment(headers: &HeaderMap, main: String) -> Response {
+fn etag(main: &str) -> String {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut h = DefaultHasher::new();
     main.hash(&mut h);
-    let tag = format!("\"{:x}\"", h.finish());
+    format!("\"{:x}\"", h.finish())
+}
+
+/// A page's main part for the page script, which polls it; 304 if it hasn't changed.
+fn fragment(headers: &HeaderMap, main: String) -> Response {
+    let tag = etag(&main);
     let mut r = if headers.get(header::IF_NONE_MATCH).is_some_and(|v| v.as_bytes() == tag.as_bytes()) {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
@@ -833,14 +824,14 @@ pub async fn review_page(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let Some((r, children, now)) = snapshot(&hub, &id) else {
+    let Some((r, children, _)) = snapshot(&hub, &id) else {
         let main = format!(
             "<h1>No review {}</h1><p class=\"empty\">The relay may have restarted. <a href=\"/\">All reviews</a></p>",
             esc(&id)
         );
         return (StatusCode::NOT_FOUND, Html(page("amx", &main))).into_response();
     };
-    let main = render_review_page(&r, &children, now);
+    let main = render_review_page(&r, &children);
     if partial(&headers) {
         return fragment(&headers, main);
     }
