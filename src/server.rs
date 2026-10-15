@@ -40,18 +40,30 @@ pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
         .with_state(hub)
 }
 
-/// Names a browser may legitimately use for the relay; anything else is treated as DNS rebinding.
-fn host_allowed(host: &str) -> bool {
+fn host_name(host: &str) -> String {
     let name = if let Some(rest) = host.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
     } else {
         host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
     };
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The host name in an http(s) URL.
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let name = host_name(rest.split(['/', '?', '#']).next().unwrap_or(""));
+    (!name.is_empty()).then_some(name)
+}
+
+/// Names a browser may legitimately use for the relay; anything else is treated as DNS rebinding.
+fn host_allowed(host: &str, public_url: Option<&str>) -> bool {
+    let name = host_name(host);
     name.parse::<IpAddr>().is_ok()
         || name == "localhost"
         || name.ends_with(".ts.net")
         || (!name.is_empty() && !name.contains('.'))
+        || public_url.and_then(url_host).is_some_and(|h| h == name)
 }
 
 fn origin_matches(headers: &HeaderMap) -> bool {
@@ -73,7 +85,7 @@ async fn identify(
 ) -> Response {
     let headers = req.headers();
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if !host_allowed(host) {
+    if !host_allowed(host, hub.cfg.public_url.as_deref()) {
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
     if req.method() != axum::http::Method::GET && !origin_matches(headers) {
@@ -298,11 +310,17 @@ mod tests {
             "alpha.example.ts.net:7341",
             "alpha.example.ts.net.",
         ] {
-            assert!(host_allowed(ok), "{ok}");
+            assert!(host_allowed(ok, None), "{ok}");
         }
         for bad in ["evil.com", "evil.com:7341", "", "127.0.0.1.evil.com"] {
-            assert!(!host_allowed(bad), "{bad}");
+            assert!(!host_allowed(bad, None), "{bad}");
         }
+        let public = Some("https://amx.example.com/");
+        assert!(host_allowed("amx.example.com", public));
+        assert!(host_allowed("AMX.example.com:443", public));
+        assert!(!host_allowed("evil.com", public));
+        assert_eq!(url_host("http://[fd7a::1]:7341/r/r1").as_deref(), Some("fd7a::1"));
+        assert_eq!(url_host("amx.example.com"), None);
     }
 
     #[test]

@@ -67,6 +67,9 @@ enum Cmd {
         no_tailnet: bool,
         #[arg(long)]
         tailscale_bin: Option<PathBuf>,
+        /// Base URL for transcript links (default: the MagicDNS name, else the Tailscale IP)
+        #[arg(long)]
+        public_url: Option<String>,
         /// Keep reviews in this JSON file across restarts (default: memory only)
         #[arg(long)]
         state: Option<PathBuf>,
@@ -112,6 +115,7 @@ async fn run() -> Result<()> {
             port,
             no_tailnet,
             tailscale_bin,
+            public_url,
             state,
             tailnet_listen,
         } => {
@@ -131,6 +135,7 @@ async fn run() -> Result<()> {
             }
             cfg.tailnet_listen = tailnet_listen.or(cfg.tailnet_listen);
             cfg.tailscale_bin = tailscale_bin.or(cfg.tailscale_bin);
+            cfg.public_url = public_url.or(cfg.public_url);
             cfg.state = state.or(cfg.state);
             let running = amx::start(cfg).await?;
             shutdown_signal().await;

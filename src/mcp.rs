@@ -13,6 +13,22 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "
 pub const WAIT_DEFAULT: u64 = 45;
 pub const WAIT_MAX: u64 = 50;
 
+/// Tools that count as taking part, so they register the agent and keep it online.
+/// The rest (`online`, `review_status`) only read.
+const ACTIVE_TOOLS: &[&str] = &[
+    "hello",
+    "wait",
+    "request_review",
+    "accept_review",
+    "decline_review",
+    "submit_findings",
+    "vote",
+    "say",
+    "amend_finding",
+    "withdraw_finding",
+    "request_rereview",
+];
+
 pub fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
@@ -45,10 +61,11 @@ pub fn tools() -> Value {
         },
         {
             "name": "request_review",
-            "description": "Ask other online reviewer agents to review a GitHub pull request and reach a consensus. The relay offers it to idle reviewers, runs an independent review round, then cross-examination votes, and sends you one consolidated result (call `wait` to receive it). Push your branch and open the PR first.",
+            "description": "Ask other online reviewer agents to review a GitHub pull request and reach a consensus. The relay offers it to idle reviewers (or only to the ones you name), runs an independent review round, then cross-examination votes, and sends you one consolidated result (call `wait` to receive it). Push your branch and open the PR first.",
             "inputSchema": { "type": "object", "properties": {
                 "pr_url": { "type": "string", "description": "e.g. https://github.com/owner/repo/pull/123" },
-                "reviewers": { "type": "integer", "minimum": 1, "maximum": 5, "description": "How many reviewers (default 2). With fewer available, it proceeds with whoever accepted." },
+                "reviewers": { "type": "array", "items": { "type": "string" }, "description": "Offer it only to these agents (names from `online`; they must be online reviewers). Default: every idle reviewer." },
+                "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "How many reviewers (default 2, or as many as you name). With fewer available, it proceeds with whoever accepted." },
                 "note": { "type": "string", "description": "What the PR does and what reviewers should focus on." },
                 "head_sha": { "type": "string", "description": "Commit SHA you want reviewed (optional)." },
                 "confirm_fraction": { "type": "number", "description": "Advanced: a finding is confirmed when more than this fraction of voters agree (default 0.5)." },
@@ -151,10 +168,19 @@ struct WaitArgs {
     timeout_seconds: Option<u64>,
 }
 
+/// `reviewers` was the count before it could name agents; a number is still accepted.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Reviewers {
+    Count(usize),
+    Names(Vec<String>),
+}
+
 #[derive(Deserialize)]
 struct RequestArgs {
     pr_url: String,
-    reviewers: Option<usize>,
+    reviewers: Option<Reviewers>,
+    count: Option<usize>,
     #[serde(default)]
     note: String,
     head_sha: Option<String>,
@@ -295,11 +321,18 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
         }
         "request_review" => {
             let r: RequestArgs = args(a)?;
+            let (count, picked) = match r.reviewers {
+                None => (r.count, Vec::new()),
+                Some(Reviewers::Names(names)) => (r.count, names),
+                Some(Reviewers::Count(n)) if r.count.is_none() => (Some(n), Vec::new()),
+                Some(Reviewers::Count(_)) => return Err(anyhow!("reviewers is a list of agent names; give the number as count")),
+            };
             let req = NewReview {
                 pr_url: r.pr_url,
                 note: r.note,
                 head_sha: r.head_sha,
-                reviewers: r.reviewers,
+                reviewers: count,
+                picked,
                 confirm_fraction: r.confirm_fraction,
                 blocking_unanimous: r.blocking_unanimous,
                 vote_rounds: r.vote_rounds,
@@ -308,17 +341,22 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
                 vote_secs: r.vote_seconds,
             };
             let id = hub.write(|s, now| s.request_review(agent, req, now))?;
-            let idle = hub.read(|s, now| {
-                s.online(now)
+            let (idle, picked) = hub.read(|s, now| {
+                let picked = s.review(&id).map(|r| r.picked.clone()).unwrap_or_default();
+                let idle = s
+                    .online(now)
                     .iter()
                     .filter(|a| a.role == Role::Reviewer && a.busy.is_none() && a.name != agent)
-                    .count()
+                    .filter(|a| picked.is_empty() || picked.contains(&a.name))
+                    .count();
+                (idle, picked)
             });
-            Ok(with_next(
-                hub,
-                agent,
-                format!("Review {id} requested; offered to {idle} idle reviewer(s) online now (others are offered it if they come online before the offer closes)."),
-            ))
+            let head = if picked.is_empty() {
+                format!("Review {id} requested; offered to {idle} idle reviewer(s) online now (others are offered it if they come online before the offer closes).")
+            } else {
+                format!("Review {id} requested from {}; {idle} of them idle now (busy ones are offered it if they free up before the offer closes).", picked.join(", "))
+            };
+            Ok(with_next(hub, agent, head))
         }
         "accept_review" => {
             let r: IdArgs = args(a)?;
@@ -436,7 +474,12 @@ pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, 
         };
     };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-    let touched = hub.touch(agent, who, role);
+    let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
+    let touched = if method == "initialize" || (method == "tools/call" && ACTIVE_TOOLS.contains(&tool)) {
+        hub.touch(agent, who, role)
+    } else {
+        hub.check_name(agent, who)
+    };
     match method {
         "initialize" => {
             if let Err(e) = touched {
@@ -467,10 +510,9 @@ pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, 
         "ping" => Some(ok(id, json!({}))),
         "tools/list" => Some(ok(id, json!({ "tools": tools() }))),
         "tools/call" => {
-            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
             let res = match touched {
-                Ok(()) => call_tool(hub, agent, name, args).await,
+                Ok(()) => call_tool(hub, agent, tool, args).await,
                 Err(e) => Err(e),
             };
             let (text, is_error) = match res {
@@ -498,5 +540,13 @@ mod tests {
             assert!(t["description"].as_str().unwrap().len() > 40, "{}", t["name"]);
         }
         assert_eq!(tools.as_array().unwrap().len(), 13);
+        let read_only: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .filter(|n| !super::ACTIVE_TOOLS.contains(n))
+            .collect();
+        assert_eq!(read_only, ["online", "review_status"]);
     }
 }

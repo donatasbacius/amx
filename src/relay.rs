@@ -305,6 +305,9 @@ pub struct Review {
     pub deadline: Ms,
     pub offered: BTreeSet<String>,
     pub declined: BTreeSet<String>,
+    /// The reviewers the author asked for; empty offers it to every idle reviewer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub picked: Vec<String>,
     pub slots: Vec<Slot>,
     pub findings: Vec<Finding>,
     pub log: Vec<LogEntry>,
@@ -495,6 +498,8 @@ pub struct NewReview {
     pub note: String,
     pub head_sha: Option<String>,
     pub reviewers: Option<usize>,
+    /// Offer only to these agents; `reviewers` then defaults to how many there are.
+    pub picked: Vec<String>,
     pub confirm_fraction: Option<f64>,
     pub blocking_unanimous: Option<bool>,
     pub vote_rounds: Option<u8>,
@@ -510,6 +515,7 @@ impl NewReview {
             note: String::new(),
             head_sha: None,
             reviewers: None,
+            picked: Vec::new(),
             confirm_fraction: None,
             blocking_unanimous: None,
             vote_rounds: None,
@@ -690,17 +696,9 @@ impl State {
     /// Records that `name` is alive and binds the name to the caller's Tailscale login.
     /// The supplied role is an initial default; only `set_role` changes an existing agent's role.
     pub fn touch(&mut self, name: &str, who: &Identity, role: Option<Role>, now: Ms) -> Result<()> {
-        let online = self.agents.online(name, now);
-        let engaged = self.engaged(name);
+        self.check_name(name, who, now)?;
         let timing = self.timing;
-        if let Some(holder) = self.agents.get(name).map(|a| a.login.clone())
-            && !holder.eq_ignore_ascii_case(&who.login)
-        {
-            if online || engaged {
-                bail!(
-                    "agent name `{name}` is in use by another tailnet user ({holder}); pick a different name, e.g. one prefixed with your own user name"
-                );
-            }
+        if self.agents.get(name).is_some_and(|a| !a.login.eq_ignore_ascii_case(&who.login)) {
             self.agents.map.remove(name);
         }
         let a = self.agents.map.entry(name.to_string()).or_insert_with(|| Agent {
@@ -720,6 +718,19 @@ impl State {
         }
         a.last_seen = now;
         a.node = who.node.clone();
+        Ok(())
+    }
+
+    /// Refuses `name` while another login holds it and is online or in an unfinished review.
+    pub fn check_name(&self, name: &str, who: &Identity, now: Ms) -> Result<()> {
+        if let Some(holder) = self.agents.get(name).map(|a| &a.login)
+            && !holder.eq_ignore_ascii_case(&who.login)
+            && (self.agents.online(name, now) || self.engaged(name))
+        {
+            bail!(
+                "agent name `{name}` is in use by another tailnet user ({holder}); pick a different name, e.g. one prefixed with your own user name"
+            );
+        }
         Ok(())
     }
 
@@ -903,9 +914,17 @@ impl State {
         if let Some(v) = req.vote_rounds {
             c.vote_rounds = v.clamp(1, 3);
         }
-        let reviewers = req.reviewers.unwrap_or(c.reviewers);
+        let picked = self.check_picked(author, &req.picked, now)?;
+        let reviewers = match req.reviewers {
+            Some(n) if !picked.is_empty() && n > picked.len() => {
+                bail!("asked for {n} reviewers but named only {}", picked.len())
+            }
+            Some(n) => n,
+            None if picked.is_empty() => c.reviewers,
+            None => picked.len(),
+        };
         if !(1..=5).contains(&reviewers) {
-            bail!("reviewers must be between 1 and 5");
+            bail!("the number of reviewers must be between 1 and 5");
         }
         let t = self.timing;
         let params = ReviewParams {
@@ -929,6 +948,7 @@ impl State {
             deadline: now + params.offer_secs * 1000,
             offered: BTreeSet::new(),
             declined: BTreeSet::new(),
+            picked,
             slots: Vec::new(),
             findings: Vec::new(),
             log: Vec::new(),
@@ -940,8 +960,32 @@ impl State {
             head_sha: req.head_sha,
             next_finding: 0,
         };
-        r.log(now, author, "request", format!("requested {reviewers} reviewer(s). {}", r.note));
+        let from = if r.picked.is_empty() { String::new() } else { format!(" from {}", r.picked.join(", ")) };
+        r.log(now, author, "request", format!("requested {reviewers} reviewer(s){from}. {}", r.note));
         Ok(r)
+    }
+
+    /// The named reviewers, deduplicated, if all of them are online reviewers.
+    fn check_picked(&self, author: &str, names: &[String], now: Ms) -> Result<Vec<String>> {
+        let mut picked: Vec<String> = Vec::new();
+        let mut bad = Vec::new();
+        for name in names.iter().map(|n| n.trim()) {
+            if picked.iter().any(|p| p == name) {
+                continue;
+            }
+            match self.agents.get(name) {
+                _ if name == author => bad.push(format!("{name} (that's you)")),
+                None => bad.push(format!("{name} (unknown agent)")),
+                Some(_) if !self.agents.online(name, now) => bad.push(format!("{name} (not online)")),
+                Some(a) if a.role != Role::Reviewer => bad.push(format!("{name} (not a reviewer)")),
+                Some(_) => {}
+            }
+            picked.push(name.to_string());
+        }
+        if !bad.is_empty() {
+            bail!("can't offer the review to {}; call `online` to see who is available", bad.join(", "));
+        }
+        Ok(picked)
     }
 
     pub fn accept(&mut self, agent: &str, id: &str, now: Ms) -> Result<()> {
@@ -957,6 +1001,9 @@ impl State {
         }
         if r.author == agent {
             bail!("you can't review your own request");
+        }
+        if !r.picked.is_empty() && !r.picked.iter().any(|p| p == agent) {
+            bail!("{} was offered only to the reviewers its author picked", r.id);
         }
         if role != Some(Role::Reviewer) {
             bail!("only agents with role reviewer can accept reviews; call `hello` with role \"reviewer\" first");
@@ -1416,6 +1463,7 @@ impl State {
                             && !busy.contains(&a.name)
                             && !r.offered.contains(&a.name)
                             && r.slot(&a.name).is_none()
+                            && (r.picked.is_empty() || r.picked.contains(&a.name))
                     })
                     .map(|a| a.name.clone())
                     .collect();

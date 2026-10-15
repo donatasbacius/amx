@@ -432,6 +432,54 @@ fn offers_respect_roles_and_busy_reviewers() {
     assert!(sim.events("rev-a").contains(&format!("[{other}] Review offer")), "offered once free");
 }
 
+fn pick(names: &[&str], count: Option<usize>) -> NewReview {
+    let mut req = NewReview::new(PR);
+    req.picked = names.iter().map(|n| n.to_string()).collect();
+    req.reviewers = count;
+    req
+}
+
+#[test]
+fn authors_can_pick_reviewers() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.s.request_review("alice-codex", pick(&["rev-b", "rev-c", "rev-b"], None), sim.now).unwrap();
+    let r = sim.s.review(&id).unwrap();
+    assert_eq!(r.picked, ["rev-b", "rev-c"]);
+    assert_eq!(r.params.reviewers, 2, "count defaults to the names given");
+    assert!(sim.events("rev-a").is_empty(), "not offered to others");
+    assert!(sim.events("rev-b").contains("Review offer"));
+    let err = sim.s.accept("rev-a", &id, sim.now).unwrap_err();
+    assert!(err.to_string().contains("only to the reviewers its author picked"), "{err}");
+    sim.accept("rev-b", &id);
+    sim.accept("rev-c", &id);
+    assert_eq!(sim.phase(&id), Phase::Reviewing);
+}
+
+#[test]
+fn picked_reviewers_must_be_online_reviewers() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    sim.join("bob-codex", "friend1@example.com", Role::Author);
+    sim.join("rev-gone", "friend2@example.com", Role::Reviewer);
+    sim.leave("rev-gone");
+    sim.advance(100);
+    let err = sim
+        .s
+        .request_review("alice-codex", pick(&["rev-a", "bob-codex", "rev-gone", "nobody", "alice-codex"], None), sim.now)
+        .unwrap_err()
+        .to_string();
+    for want in ["bob-codex (not a reviewer)", "rev-gone (not online)", "nobody (unknown agent)", "alice-codex (that's you)"] {
+        assert!(err.contains(want), "{err}");
+    }
+    assert!(!err.contains("rev-a"), "{err}");
+    let err = sim.s.request_review("alice-codex", pick(&["rev-a"], Some(2)), sim.now).unwrap_err();
+    assert!(err.to_string().contains("asked for 2 reviewers but named only 1"), "{err}");
+    assert!(sim.s.reviews.is_empty());
+
+    let id = sim.s.request_review("alice-codex", pick(&["rev-a", "rev-b"], Some(1)), sim.now).unwrap();
+    sim.accept("rev-b", &id);
+    assert_eq!(sim.phase(&id), Phase::Reviewing, "first of the named to accept");
+}
+
 #[test]
 fn rereview_rechecks_previous_findings() {
     let mut sim = setup(&["rev-a", "rev-b"]);
@@ -495,6 +543,9 @@ fn agent_names_are_bound_to_logins() {
     let err = sim.s.touch("shared-name", &who("mallory@example.com"), None, sim.now).unwrap_err();
     assert!(err.to_string().contains("in use by another tailnet user"), "{err}");
     sim.s.touch("shared-name", &who("alice@example.com"), None, sim.now).unwrap();
+    assert!(sim.s.check_name("shared-name", &who("mallory@example.com"), sim.now).is_err());
+    assert!(sim.s.check_name("new-name", &who("mallory@example.com"), sim.now).is_ok());
+    assert!(sim.s.agents.get("new-name").is_none(), "checking a name doesn't register it");
     sim.leave("shared-name");
     sim.advance(91);
     sim.s.touch("shared-name", &who("mallory@example.com"), None, sim.now).unwrap();

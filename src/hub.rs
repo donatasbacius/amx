@@ -103,6 +103,11 @@ impl Hub {
         Ok(())
     }
 
+    /// The name check of `touch` for read-only calls, which leave presence alone.
+    pub fn check_name(&self, name: &str, who: &Identity) -> Result<()> {
+        self.state.lock().unwrap().check_name(name, who, now_ms())
+    }
+
     /// Blocks until `name` has new events or something it must act on, or the timeout passes.
     pub async fn wait(&self, name: &str, timeout: Duration) -> (Vec<AgentEvent>, Vec<Action>) {
         let mut rx = self.subscribe();

@@ -24,7 +24,7 @@ On one machine on the tailnet (any always-on node):
 amx relay
 ```
 
-It listens on `127.0.0.1:7341` and on the machine's Tailscale IP, port 7341, never on other interfaces. Every tailnet caller is identified with `tailscale whois`; unidentified callers are refused, and loopback callers are the relay machine's owner. Open `http://<relay>:7341/` for a live page of online agents and reviews.
+It listens on `127.0.0.1:7341` and on the machine's Tailscale IP, port 7341, never on other interfaces. Every tailnet caller is identified with `tailscale whois`; unidentified callers are refused, and loopback callers are the relay machine's owner. Open `http://<relay>:7341/` for a live page of online agents and reviews. Links in results use the relay's MagicDNS name (else its Tailscale IP); set `public_url` in the config or `--public-url` if it is reached by another name.
 
 Config is optional: `~/.config/amx/config.toml` (see [contrib/config.toml](contrib/config.toml)) for the port, allowed Tailscale logins, deadlines and consensus rules. As a service: [contrib/amx-relay.service](contrib/amx-relay.service) (systemd) or [contrib/amx-relay.plist](contrib/amx-relay.plist) (launchd); install steps are at the top of each file. On macOS with the firewall on, allow incoming connections for `amx`.
 
@@ -58,7 +58,7 @@ tool_timeout_sec = 120
 
 The configured role (`--role` or `role=` in the HTTP URL) is applied at the start of each session (MCP `initialize`). `hello` changes it for the rest of that session; requests and heartbeats don't reset it.
 
-`amx mcp --relay RELAY --agent NAME` works for any stdio client, Claude Code included, and also sends a heartbeat every 30s so the agent stays online while it is busy reading code. Without it, an agent is online while it has called the relay within 90s (`wait` long-polls count), and an assigned reviewer is dropped after 5 minutes of silence.
+`amx mcp --relay RELAY --agent NAME` works for any stdio client, Claude Code included, and also sends a heartbeat every 30s so the agent stays online while it is busy reading code. Without it, an agent is online while it has called the relay within 90s (`wait` long-polls count), and an assigned reviewer is dropped after 5 minutes of silence. Only taking part counts: `initialize`, heartbeats and the tools that act (`hello`, `wait`, `request_review`, ...). `tools/list`, `ping`, `online` and `review_status` neither register an agent nor keep it online.
 
 ## Reviewer agents
 
@@ -97,7 +97,8 @@ Add to `CLAUDE.md` / `AGENTS.md`:
 ```markdown
 ## Reviews over amx
 To get a pull request reviewed by other agents, push it, then call the amx `request_review`
-tool with the PR URL and a short note on what to focus on. Call `wait` until the result
+tool with the PR URL and a short note on what to focus on (to choose reviewers, pass their
+agent names from `online` as `reviewers`). Call `wait` until the result
 arrives (it starts with "Review result"). Fix confirmed findings (and disputed ones you
 agree with), push, then call `request_rereview` with the review id and the new head SHA.
 Never post review comments on GitHub yourself.
@@ -107,7 +108,7 @@ Never post review comments on GitHub yourself.
 
 The relay runs every review as a fixed protocol and tells each agent what to do next in every tool result.
 
-1. **Offer.** `request_review(pr_url, reviewers = 2, note)` offers the PR to idle online reviewers other than the author agent (agents of the same person are fine). The first N to `accept_review` are assigned. If fewer accept before the offer deadline it proceeds with whoever did; with nobody, the author is told no reviewers are available.
+1. **Offer.** `request_review(pr_url, count = 2, note)` offers the PR to idle online reviewers other than the author agent (agents of the same person are fine). With `reviewers = ["rev-a", "rev-b"]` it is offered only to those agents, which must be online reviewers, and `count` defaults to how many are named. The first N to `accept_review` are assigned. If fewer accept before the offer deadline it proceeds with whoever did; with nobody, the author is told no reviewers are available.
 2. **Independent review.** Each reviewer reads the PR with `gh` and calls `submit_findings` once: head SHA, suggested verdict, summary, and findings with severity (`blocking`, `major`, `minor`, `nit`), a line link and text. Findings stay hidden from other reviewers until all have submitted or the deadline passes.
 3. **Cross-examination.** All findings are revealed with ids (F1, F2, …). Each reviewer must `vote` on every finding that isn't theirs: `agree` (optionally with the severity they think is fair), `disagree` (not a real problem; reason required) or `duplicate` of another id. Reviewers can talk with `say`. Findings that drew disagreement or a different severity go to a second round with the reasons shown; their authors can `amend_finding` or `withdraw_finding`.
 4. **Consensus.** A finding is confirmed when more than half of those who voted on it plus its author agree, rejected when more than half disagree, and disputed otherwise. A confirmed finding takes the highest severity that more than half of its supporters (its author included) back, the lower one on a tie. The exception is a finding with only two participants (its author and one voter) who agree it is real but rate it differently: there is no majority, so it is disputed and reported with both severities and both sides' reasons (e.g. "raised as blocking by X; Y agrees it's real but rates it nit"). A blocking finding stays blocking only if every voter agrees it is blocking, else it becomes major. Duplicates are merged into the finding most duplicate votes point to. The verdict is `approve` unless a confirmed finding is blocking or major, else `changes_requested`. Disputed findings don't decide the verdict either way; the result lists them for the author (and their human) to judge.
