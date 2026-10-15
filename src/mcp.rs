@@ -269,9 +269,10 @@ struct StatusArgs {
 /// The NEXT lines for `actions`. A task whose full text is in one of `events` or in `seen` gets
 /// a one-line pointer, and the idle line is left out when an event already says what to do.
 pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], seen: &[String]) -> String {
+    let has_next = |t: &str| t.lines().any(|l| l.starts_with("NEXT:"));
     if actions.is_empty() {
         return match role {
-            _ if events.iter().any(|e| e.text.contains("NEXT:")) => String::new(),
+            _ if events.iter().any(|e| has_next(&e.text)) => String::new(),
             Role::Reviewer => "NEXT: nothing for you right now. Call `wait` again (keep looping).".into(),
             Role::Author if !events.is_empty() => "NEXT: nothing pending on the relay.".into(),
             Role::Author => "NEXT: nothing pending. Use `request_review` to get a PR reviewed.".into(),
@@ -283,7 +284,7 @@ pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], seen: &[
             (Some(t), Some(short)) if seen.contains(t) || events.iter().any(|e| e.task.as_ref() == Some(t)) => {
                 format!("NEXT: {short}")
             }
-            _ if a.text.contains("NEXT:") => format!("[{}] {}", a.review, a.text),
+            _ if has_next(&a.text) => format!("[{}] {}", a.review, a.text),
             _ => format!("NEXT: {}", a.text),
         })
         .collect();
@@ -333,8 +334,14 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
         "wait" => {
             let w: WaitArgs = args(a)?;
             let secs = w.timeout_seconds.unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX);
-            let (events, _) = hub.wait(agent, Duration::from_secs(secs), w.progress).await;
+            let events = hub.wait(agent, Duration::from_secs(secs), w.progress).await;
             let (actions, seen) = owed(hub, agent, &events);
+            if !events.is_empty() || actions.iter().any(|a| a.task.as_ref().is_some_and(|t| !seen.contains(t))) {
+                // Saved before replying, so a crash doesn't hand the same events or tasks out again.
+                if let Err(e) = hub.save() {
+                    tracing::error!("{e:#}");
+                }
+            }
             let role = role_of(hub, agent);
             let next = next_text(&actions, role, &events, &seen);
             Ok(match (events.is_empty(), next.is_empty()) {
@@ -493,14 +500,18 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
 
 /// Handles one JSON-RPC message for `agent`. Returns `None` for notifications and responses.
 pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, msg: Value) -> Option<Value> {
-    let id = msg.get("id").cloned();
-    let method = msg.get("method").and_then(Value::as_str);
-    let (Some(id), Some(method)) = (id, method) else {
-        return if msg.is_array() {
-            Some(error_response(Value::Null, -32600, "batches are not supported"))
-        } else {
-            None
-        };
+    if msg.is_array() {
+        return Some(error_response(Value::Null, -32600, "batches are not supported"));
+    }
+    if !msg.is_object() {
+        return Some(error_response(Value::Null, -32600, "invalid request: not a JSON-RPC message"));
+    }
+    let is_response = msg.get("result").is_some() || msg.get("error").is_some();
+    let (Some(id), false) = (msg.get("id").cloned(), is_response) else {
+        return None;
+    };
+    let Some(method) = msg.get("method").and_then(Value::as_str) else {
+        return Some(error_response(id, -32600, "invalid request: method must be a string"));
     };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let tool = params.get("name").and_then(Value::as_str).unwrap_or("");

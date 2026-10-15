@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::relay::{Action, AgentEvent, Ms, Role, State, now_ms};
+use crate::relay::{AgentEvent, Ms, Role, State, now_ms};
 use crate::tailscale::{Identity, Tailscale};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,7 @@ pub struct Hub {
     pub owner: Mutex<Identity>,
     pub listening: Mutex<Vec<String>>,
     pub shutdown: watch::Sender<bool>,
+    saving: Mutex<()>,
 }
 
 struct Waiting<'a> {
@@ -44,6 +45,7 @@ impl Hub {
             }),
             listening: Mutex::new(Vec::new()),
             shutdown: watch::Sender::new(false),
+            saving: Mutex::new(()),
         })
     }
 
@@ -68,7 +70,10 @@ impl Hub {
     /// Writes the `--state` file, if there is one.
     pub fn save(&self) -> Result<()> {
         match &self.cfg.state {
-            Some(path) => crate::persist::save(path, &self.read(|st, now| st.snapshot(now))),
+            Some(path) => {
+                let _one = self.saving.lock().unwrap();
+                crate::persist::save(path, &self.read(|st, now| st.snapshot(now)))
+            }
             None => Ok(()),
         }
     }
@@ -110,7 +115,7 @@ impl Hub {
 
     /// Blocks until `name` has new events or something it must act on, or the timeout passes.
     /// Progress events are dropped unless `progress` is set.
-    pub async fn wait(&self, name: &str, timeout: Duration, progress: bool) -> (Vec<AgentEvent>, Vec<Action>) {
+    pub async fn wait(&self, name: &str, timeout: Duration, progress: bool) -> Vec<AgentEvent> {
         let mut rx = self.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         self.state.lock().unwrap().set_waiting(name, 1, now_ms());
@@ -120,21 +125,20 @@ impl Hub {
         };
         loop {
             rx.borrow_and_update();
-            let (events, actions) = {
+            let (events, urgent) = {
                 let mut st = self.state.lock().unwrap();
                 let now = now_ms();
-                let ev = st.take_events(name, progress);
-                (ev, st.next_actions(name, now))
+                let ev = st.take_events(name, progress, now);
+                (ev, st.next_actions(name, now).iter().any(|a| a.urgent))
             };
-            let urgent = actions.iter().any(|a| a.urgent);
             if !events.is_empty() || urgent {
-                return (events, actions);
+                return events;
             }
             let mut down = self.shutdown.subscribe();
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => return (events, actions),
-                r = rx.changed() => if r.is_err() { return (events, actions) },
-                _ = down.wait_for(|d| *d) => return (events, actions),
+                _ = tokio::time::sleep_until(deadline) => return events,
+                r = rx.changed() => if r.is_err() { return events },
+                _ = down.wait_for(|d| *d) => return events,
             }
         }
     }
@@ -150,8 +154,9 @@ impl Hub {
         };
         loop {
             rx.borrow_and_update();
-            let (mut events, last) = self.state.lock().unwrap().peek_events(name, after);
-            events.retain(|e| !e.progress);
+            let (events, last) = self.state.lock().unwrap().peek_events(name, after);
+            let now = now_ms();
+            let events: Vec<AgentEvent> = events.into_iter().filter(|e| !e.progress).map(|e| e.rendered(now)).collect();
             if !events.is_empty() || last < after {
                 return (events, last);
             }

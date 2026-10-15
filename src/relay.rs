@@ -113,6 +113,9 @@ pub struct AgentEvent {
     /// A review's result or failure notice for its author.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub result: bool,
+    /// The deadline `text::LEFT` in `text` stands for; rendered as the time left at delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<Ms>,
 }
 
 impl AgentEvent {
@@ -125,7 +128,15 @@ impl AgentEvent {
             task: None,
             progress: false,
             result: false,
+            due: None,
         }
+    }
+
+    pub fn rendered(mut self, now: Ms) -> AgentEvent {
+        if let Some(due) = self.due {
+            self.text = self.text.replace(text::LEFT, &text::dur(due.saturating_sub(now)));
+        }
+        self
     }
 }
 
@@ -144,7 +155,7 @@ pub struct Agent {
     next_seq: u64,
     delivered: u64,
     /// Task parts (see `task_parts`) given in full to the current session.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     shown: HashSet<String>,
 }
 
@@ -178,12 +189,16 @@ impl Agents {
         self.push(name, AgentEvent::new(review, text, now));
     }
 
-    fn notify_task(&mut self, name: &str, review: &str, task: String, text: String, now: Ms) {
-        self.push(name, AgentEvent { task: Some(task), ..AgentEvent::new(review, text, now) });
+    fn notify_task(&mut self, name: &str, review: &str, task: String, text: String, due: Option<Ms>, now: Ms) {
+        self.push(name, AgentEvent { task: Some(task), due, ..AgentEvent::new(review, text, now) });
     }
 
     fn progress(&mut self, name: &str, review: &str, text: String, now: Ms) {
         self.push(name, AgentEvent { progress: true, ..AgentEvent::new(review, text, now) });
+    }
+
+    fn progress_due(&mut self, name: &str, review: &str, text: String, due: Ms, now: Ms) {
+        self.push(name, AgentEvent { progress: true, due: Some(due), ..AgentEvent::new(review, text, now) });
     }
 
     fn outcome(&mut self, name: &str, review: &str, text: String, now: Ms) {
@@ -442,6 +457,19 @@ impl Review {
 
     pub fn deadline_left(&self, now: Ms) -> Ms {
         self.deadline.saturating_sub(now)
+    }
+
+    /// Refuses `agent` if its name now belongs to a different login than the one that took part.
+    fn check_login(&self, agent: &str, login: &str) -> Result<()> {
+        let bound = if self.author == agent {
+            Some(&self.author_login)
+        } else {
+            self.slot(agent).map(|s| &s.login)
+        };
+        if bound.is_some_and(|l| !l.eq_ignore_ascii_case(login)) {
+            bail!("`{agent}` on {} was another tailnet user's agent; use your own agent name", self.id);
+        }
+        Ok(())
     }
 
     fn log(&mut self, at: Ms, who: &str, kind: &'static str, text: impl Into<String>) {
@@ -844,17 +872,24 @@ impl State {
         Ok(())
     }
 
-    /// Refuses `name` while another login holds it and is online or in an unfinished review.
+    /// Refuses `name`, in any letter case, while another login holds it and is online or in an
+    /// unfinished review.
     pub fn check_name(&self, name: &str, who: &Identity, now: Ms) -> Result<()> {
-        if let Some(holder) = self.agents.get(name).map(|a| &a.login)
-            && !holder.eq_ignore_ascii_case(&who.login)
-            && (self.agents.online(name, now) || self.engaged(name))
-        {
+        if let Some(holder) = self.agents.all().find(|a| {
+            a.name.eq_ignore_ascii_case(name)
+                && !a.login.eq_ignore_ascii_case(&who.login)
+                && (self.agents.online(&a.name, now) || self.engaged(&a.name))
+        }) {
             bail!(
-                "agent name `{name}` is in use by another tailnet user ({holder}); pick a different name, e.g. one prefixed with your own user name"
+                "agent name `{name}` is in use by another tailnet user ({}); pick a different name, e.g. one prefixed with your own user name",
+                holder.login
             );
         }
         Ok(())
+    }
+
+    fn login_of(&self, name: &str) -> String {
+        self.agents.get(name).map(|a| a.login.clone()).unwrap_or_default()
     }
 
     pub fn set_waiting(&mut self, name: &str, delta: i32, now: Ms) {
@@ -901,7 +936,7 @@ impl State {
     }
 
     /// New events for `name`, minus tasks it has already done and, unless asked for, progress.
-    pub fn take_events(&mut self, name: &str, progress: bool) -> Vec<AgentEvent> {
+    pub fn take_events(&mut self, name: &str, progress: bool, now: Ms) -> Vec<AgentEvent> {
         let open = self.open_tasks(name);
         let Some(a) = self.agents.map.get_mut(name) else {
             return Vec::new();
@@ -911,7 +946,7 @@ impl State {
             .iter()
             .filter(|e| e.seq > a.delivered && (progress || !e.progress))
             .filter(|e| e.task.as_ref().is_none_or(|t| open.contains(t)))
-            .cloned()
+            .map(|e| e.clone().rendered(now))
             .collect();
         a.delivered = a.next_seq;
         fresh
@@ -1217,8 +1252,9 @@ impl State {
     pub fn accept(&mut self, agent: &str, id: &str, now: Ms) -> Result<()> {
         let busy = self.busy_with(agent).map(|r| r.id.clone());
         let role = self.agents.get(agent).map(|a| a.role);
-        let login = self.agents.get(agent).map(|a| a.login.clone()).unwrap_or_default();
+        let login = self.login_of(agent);
         let r = self.review_mut(id)?;
+        r.check_login(agent, &login)?;
         if r.slot(agent).is_some_and(Slot::active) {
             return Ok(());
         }
@@ -1257,7 +1293,9 @@ impl State {
     }
 
     pub fn decline(&mut self, agent: &str, id: &str, reason: &str, now: Ms) -> Result<()> {
+        let login = self.login_of(agent);
         let r = self.review_mut(id)?;
+        r.check_login(agent, &login)?;
         if r.phase != Phase::Offering || r.slot(agent).is_some() {
             bail!("{} has no open offer for you", r.id);
         }
@@ -1275,7 +1313,9 @@ impl State {
             summary,
             findings,
         } = sub;
+        let login = self.login_of(agent);
         let r = self.review_mut(id)?;
+        r.check_login(agent, &login)?;
         let slot = r
             .slot(agent)
             .filter(|s| s.active())
@@ -1336,7 +1376,9 @@ impl State {
     }
 
     pub fn vote(&mut self, agent: &str, id: &str, votes: Vec<VoteIn>, now: Ms) -> Result<Voted> {
+        let login = self.login_of(agent);
         let r = self.review_mut(id)?;
+        r.check_login(agent, &login)?;
         let Phase::Voting(round) = r.phase else {
             bail!("{} is not in cross-examination ({}); call `wait`", r.id, r.phase.label());
         };
@@ -1430,8 +1472,10 @@ impl State {
 
     pub fn say(&mut self, agent: &str, id: &str, msg: &str, now: Ms) -> Result<()> {
         let msg = need_text(msg, "message")?;
+        let login = self.login_of(agent);
         let r = self.review_mut(id)?;
-        let reviewer = r.slot(agent).is_some_and(Slot::active);
+        r.check_login(agent, &login)?;
+        let reviewer = r.slot(agent).is_some_and(|s| s.active() || !r.phase.active());
         if !reviewer && r.author != agent {
             bail!("only the author and active reviewers of {} can talk in it", r.id);
         }
@@ -1444,8 +1488,9 @@ impl State {
         }
         let to = r.others(agent);
         let rid = r.id.clone();
+        let quoted = text::quote(&msg);
         for a in to {
-            self.agents.notify(&a, &rid, format!("[{rid}] {agent} says:\n{msg}"), now);
+            self.agents.notify(&a, &rid, format!("[{rid}] {agent} says:\n{}", quoted.trim_end()), now);
         }
         self.advance(now);
         Ok(())
@@ -1474,7 +1519,9 @@ impl State {
         let severity = change.severity.as_deref();
         let url = change.url.as_deref();
         let new_text = change.text.as_deref();
+        let login = self.login_of(agent);
         let r = self.review_mut(id)?;
+        r.check_login(agent, &login)?;
         let pr = r.pr.clone();
         let round = r.round();
         let severity = severity
@@ -1520,7 +1567,9 @@ impl State {
     }
 
     pub fn withdraw(&mut self, agent: &str, id: &str, fid: &str, reason: &str, now: Ms) -> Result<()> {
+        let login = self.login_of(agent);
         let r = self.review_mut(id)?;
+        r.check_login(agent, &login)?;
         let f = Self::own_finding(r, agent, fid)?;
         let reason = clip(reason, 1000);
         f.withdrawn = Some(reason.clone());
@@ -1547,6 +1596,7 @@ impl State {
         if prev.author != author {
             bail!("only {} (the author of {}) can request a re-review", prev.author, prev.id);
         }
+        prev.check_login(author, &self.login_of(author))?;
         if prev.phase != Phase::Done {
             bail!("{} has not finished ({})", prev.id, prev.phase.label());
         }
@@ -1623,7 +1673,7 @@ impl State {
         let left = format!("at least {}", text::dur(r.params.review_secs * 1000));
         for s in &r.slots {
             let text = format!("[{}] You are assigned again (you reviewed {}).\n{}", r.id, prev.id, text::review_task(&r, &left));
-            self.agents.notify_task(&s.agent, &r.id, review_task(&r.id), text, now);
+            self.agents.notify_task(&s.agent, &r.id, review_task(&r.id), text, None, now);
         }
         let new_id = r.id.clone();
         self.reviews.push(r);
@@ -1634,7 +1684,7 @@ impl State {
     /// Applies deadlines and presence; call about once a second. Returns true if anything changed.
     pub fn tick(&mut self, now: Ms) -> bool {
         let before = self.fingerprint(now);
-        self.advance(now);
+        let stepped = self.advance(now);
         let finished: Vec<usize> = self
             .reviews
             .iter()
@@ -1659,7 +1709,7 @@ impl State {
         self.agents.map.retain(|name, a| {
             engaged.contains(name) || a.waiting > 0 || now.saturating_sub(a.last_seen) < FORGET_AGENT_MS
         });
-        before != self.fingerprint(now)
+        stepped || before != self.fingerprint(now)
     }
 
     fn fingerprint(&self, now: Ms) -> Fingerprint {
@@ -1676,14 +1726,17 @@ impl State {
         )
     }
 
-    fn advance(&mut self, now: Ms) {
+    fn advance(&mut self, now: Ms) -> bool {
+        let mut changed = false;
         for i in 0..self.reviews.len() {
             for _ in 0..8 {
                 if !self.step(i, now) {
                     break;
                 }
+                changed = true;
             }
         }
+        changed
     }
 
     /// One transition of review `i`, if due. Returns whether anything changed.
@@ -1716,7 +1769,7 @@ impl State {
                     .collect();
                 for a in eligible {
                     r.offered.insert(a.clone());
-                    agents.notify_task(&a, &r.id, offer_task(&r.id), text::offer(r, now), now);
+                    agents.notify_task(&a, &r.id, offer_task(&r.id), text::offer(r, text::LEFT), Some(r.deadline), now);
                     changed = true;
                 }
                 let n = r.active_slots().count();
@@ -1842,16 +1895,17 @@ fn start_reviewing(r: &mut Review, agents: &mut Agents, now: Ms) {
             agents.progress(&a, &r.id, format!("[{}] Offer closed: the review has its reviewers. Call `wait`.", r.id), now);
         }
     }
-    let left = text::dur(r.deadline_left(now));
-    agents.progress(
+    agents.progress_due(
         &r.author,
         &r.id,
         format!(
-            "[{}] Reviewers assigned: {} (of {} requested). Independent review phase, up to {left}. Call `wait` for the result.",
+            "[{}] Reviewers assigned: {} (of {} requested). Independent review phase, up to {}. Call `wait` for the result.",
             r.id,
             names.join(", "),
-            r.params.reviewers
+            r.params.reviewers,
+            text::LEFT
         ),
+        r.deadline,
         now,
     );
 }
@@ -1873,10 +1927,9 @@ fn start_voting(r: &mut Review, agents: &mut Agents, round: u8, web: &str, now: 
     }
     r.replying = true;
     r.deadline = now + r.params.reply_secs * 1000;
-    let left = text::dur(r.deadline_left(now));
     for a in &authors {
-        let text = format!("[{}] {}", r.id, text::reply_task(r, a, &left));
-        agents.notify_task(a, &r.id, reply_task(r), text, now);
+        let text = format!("[{}] {}", r.id, text::reply_task(r, a, text::LEFT));
+        agents.notify_task(a, &r.id, reply_task(r), text, Some(r.deadline), now);
     }
     open_votes(r, agents, true, now);
 }
@@ -1899,12 +1952,11 @@ fn open_votes(r: &mut Review, agents: &mut Agents, replying: bool, now: Ms) {
     if names.iter().all(|a| r.owed_votes(a).is_empty()) {
         return;
     }
-    let left = text::dur(r.deadline_left(now));
     for a in &names {
         let owed = r.owed_votes(a);
         if !owed.is_empty() {
-            let text = format!("[{}] {}", r.id, text::vote_task(r, &owed, &left));
-            agents.notify_task(a, &r.id, vote_task(r, &owed), text, now);
+            let text = format!("[{}] {}", r.id, text::vote_task(r, &owed, text::LEFT));
+            agents.notify_task(a, &r.id, vote_task(r, &owed), text, Some(r.deadline), now);
         } else if round == 1 {
             let text = format!(
                 "[{}] Round 1 started; nothing for you to vote on (your own findings are being discussed: you may `amend_finding` or `withdraw_finding`, or `say` something). Call `wait`.\n\n{}",
