@@ -635,6 +635,7 @@ impl State {
     }
 
     /// Records that `name` is alive and binds the name to the caller's Tailscale login.
+    /// The supplied role is an initial default; only `set_role` changes an existing agent's role.
     pub fn touch(&mut self, name: &str, who: &Identity, role: Option<Role>, now: Ms) -> Result<()> {
         let online = self.agents.online(name, now);
         let engaged = self.engaged(name);
@@ -666,9 +667,6 @@ impl State {
         }
         a.last_seen = now;
         a.node = who.node.clone();
-        if let Some(r) = role {
-            a.role = r;
-        }
         Ok(())
     }
 
