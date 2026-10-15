@@ -1,11 +1,10 @@
 use crate::hub::Hub;
-use crate::relay::{Choice, Finding, Ms, Phase, Review, State, Status, Verdict};
-use crate::tailscale::Identity;
-use crate::text::{dur, iso, phase_badge, severity_split, short_sha, split_note, split_range, vote_label};
+use crate::relay::{Choice, Finding, Ms, Phase, Review, Severity, State, Status, Verdict};
+use crate::text::{dur, iso, phase_badge, severity_split, short_sha, split_note, split_range};
 use axum::extract::{Path, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::{Extension, Json};
+use axum::Json;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fmt::Write;
@@ -49,32 +48,49 @@ fn safe_url(u: &str) -> Option<&str> {
     u.starts_with("https://github.com/").then_some(u)
 }
 
-fn time_tag(ms: Ms) -> String {
-    let iso = iso(ms);
-    format!("<time datetime=\"{}\" title=\"{iso}\">{iso}</time>", iso.replace(' ', "T"))
-}
-
-fn deadline_tag(r: &Review, now: Ms) -> String {
-    if !r.phase.active() {
-        return String::new();
+/// Like the page script's relative times, so the first paint matches what it shows later.
+fn ago(ms: Ms, now: Ms) -> String {
+    let s = now.saturating_sub(ms).div_ceil(1000);
+    let round = |n: Ms, d: Ms| (n + d / 2) / d;
+    let m = round(s, 60);
+    let h = round(m, 60);
+    let d = round(h, 24);
+    match () {
+        _ if s < 45 => "just now".into(),
+        _ if m < 60 => format!("{m} min ago"),
+        _ if h < 24 => format!("{h} h ago"),
+        _ if d < 14 => format!("{d} d ago"),
+        _ => iso(ms)[..10].to_string(),
     }
-    format!(
-        "<span class=\"deadline\">ends in <span data-deadline=\"{}\">{}</span></span>",
-        r.deadline,
-        dur(r.deadline_left(now))
-    )
 }
 
-fn phase_tag(r: &Review) -> String {
-    let (cls, label) = match (r.phase, r.result.as_ref().map(|x| x.verdict)) {
-        (Phase::Done, Some(Verdict::Approve)) => ("approved", "approved".to_string()),
-        (Phase::Done, _) => ("changes", "changes requested".to_string()),
-        (p, _) => (phase_badge(p), r.phase.label()),
-    };
-    format!("<span class=\"badge s-{cls}\">{}</span>", esc(&label))
+fn time_tag(ms: Ms, now: Ms) -> String {
+    let iso = iso(ms);
+    format!("<time datetime=\"{}\" title=\"{iso}\">{}</time>", iso.replace(' ', "T"), ago(ms, now))
 }
 
-fn page(title: &str, who: &Identity, main: &str) -> String {
+fn countdown(deadline: Ms, now: Ms) -> String {
+    format!("<span class=\"left\"><span data-deadline=\"{deadline}\">{}</span> left</span>", dur(deadline.saturating_sub(now)))
+}
+
+/// The review's state as a pill class and label.
+fn status(r: &Review) -> (&'static str, String) {
+    match r.phase {
+        Phase::Offering => ("waiting", "Finding reviewers".into()),
+        Phase::Reviewing => ("inreview", "Reviewing".into()),
+        Phase::Voting(n) => ("voting", format!("Voting, round {n} of {}", r.params.consensus.vote_rounds.max(n))),
+        Phase::Done if r.result.as_ref().is_some_and(|x| x.verdict == Verdict::Approve) => ("approved", "Approved".into()),
+        Phase::Done => ("changes", "Changes requested".into()),
+        Phase::Failed => ("failed", "Failed".into()),
+    }
+}
+
+fn pill(r: &Review) -> String {
+    let (cls, label) = status(r);
+    format!("<span class=\"pill s-{cls}\">{label}</span>")
+}
+
+fn page(title: &str, main: &str) -> String {
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -88,12 +104,11 @@ fn page(title: &str, who: &Identity, main: &str) -> String {
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<header class="top"><a class="brand" href="/">amx</a><span class="where">review relay · you are <b>{who}</b></span><span id="live" class="live" role="status"><span class="dot" aria-hidden="true">●</span> <span class="lt">static</span></span></header>
+<header class="top"><a class="brand" href="/">amx</a><span id="live" class="live" role="status" aria-live="polite"></span></header>
 <main id="main">{main}</main>
 </body>
 </html>"##,
         title = esc(title),
-        who = esc(&who.login),
     )
 }
 
@@ -216,260 +231,392 @@ pub fn timeline(r: &Review) -> Vec<Stage> {
     out
 }
 
+fn step_name(name: &str) -> String {
+    match name {
+        "Independent review" => "Review".into(),
+        "Cross-examination" => "Voting".into(),
+        "Consensus result" => "Result".into(),
+        n => n.strip_prefix("Cross-examination round ").map_or_else(|| n.to_string(), |k| format!("Voting round {k}")),
+    }
+}
+
 fn render_timeline(out: &mut String, r: &Review, now: Ms) {
-    out.push_str("<h2 id=\"timeline\">Timeline</h2><ol class=\"timeline\">");
+    out.push_str("<h2 id=\"progress\">Progress</h2><ol class=\"steps\">");
     for s in timeline(r) {
-        let mut info = String::new();
-        if let Some(at) = s.start {
-            info.push_str(&time_tag(at));
-        }
-        if let (Some(a), Some(b)) = (s.start, s.end)
-            && s.name != "Consensus result"
-            && s.name != "Failed"
-        {
-            let _ = write!(info, " · took {}", dur(b.saturating_sub(a)));
-        }
-        if let Some(d) = s.deadline {
-            let _ = write!(
-                info,
-                " · <span class=\"deadline\">ends in <span data-deadline=\"{d}\">{}</span></span>",
-                dur(d.saturating_sub(now))
-            );
-        }
-        if s.state == "skipped" {
-            info.push_str("skipped");
-        }
-        let notes: String = s.notes.iter().map(|n| format!("<div class=\"note\">{}</div>", esc(n))).collect();
+        let info = match (s.state, s.start, s.end, s.deadline) {
+            (_, _, _, Some(d)) => countdown(d, now),
+            ("skipped", ..) => "skipped".into(),
+            (_, Some(a), Some(b), _) if s.name != "Consensus result" && s.name != "Failed" => dur(b.saturating_sub(a)),
+            (_, Some(a), None, _) if !r.phase.active() => time_tag(a, now),
+            _ => String::new(),
+        };
+        let title = s.start.map(|a| format!(" title=\"started {}\"", iso(a))).unwrap_or_default();
         let current = if s.state == "active" { " aria-current=\"step\"" } else { "" };
+        let notes: String = s.notes.iter().map(|n| format!("<span class=\"note\">{}</span>", esc(n))).collect();
         let _ = write!(
             out,
-            "<li class=\"st-{state}\"{current}><span class=\"name\">{name}</span><span class=\"info\">{info}</span>{notes}</li>",
-            state = s.state,
-            name = esc(&s.name),
+            "<li class=\"st-{state}\"{current}{title}><span class=\"name\">{name}</span><span class=\"info\">{info}</span>{notes}</li>",
+            state = if s.name == "Failed" { "failed" } else { s.state },
+            name = esc(&step_name(&s.name)),
         );
     }
     out.push_str("</ol>");
 }
 
-fn review_row(out: &mut String, r: &Review, now: Ms) {
-    let reviewers: Vec<String> = r
-        .slots
-        .iter()
-        .map(|s| {
-            if s.dropped.is_some() {
-                format!("<s>{}</s>", esc(&s.agent))
-            } else {
-                esc(&s.agent)
-            }
-        })
-        .collect();
-    let n = r.findings.len();
-    let confirmed = visible(r)
+fn confirmed(r: &Review) -> usize {
+    visible(r)
         .filter(|f| f.outcome.as_ref().is_some_and(|o| o.status == Status::Confirmed))
-        .count();
+        .count()
+}
+
+fn review_row(out: &mut String, r: &Review, now: Ms) {
+    let n = visible(r).count();
+    let what = match r.phase {
+        Phase::Offering => format!("offered to {}", r.offered.len()),
+        Phase::Reviewing => format!(
+            "{} of {} submitted",
+            r.active_slots().filter(|s| s.submission.is_some()).count(),
+            r.active_slots().count()
+        ),
+        Phase::Failed => r.failure.as_deref().map(|f| f.split(':').next().unwrap_or(f).to_string()).unwrap_or_default(),
+        _ if n == 0 => "no findings".into(),
+        Phase::Voting(_) => format!("{n} finding{}", if n == 1 { "" } else { "s" }),
+        Phase::Done => match confirmed(r) {
+            0 => "none confirmed".into(),
+            c => format!("{c} of {n} confirmed"),
+        },
+    };
+    let parent = r.parent.as_deref().map(|p| format!(" · re-review of {}", esc(p))).unwrap_or_default();
+    let when = if r.phase.active() { countdown(r.deadline, now) } else { time_tag(r.ended.unwrap_or(r.created), now) };
     let _ = write!(
         out,
-        "<li class=\"thread\"><div class=\"row1\">{phase}{deadline}<a class=\"ref\" href=\"/r/{id}\">{id}</a>\
-         <a class=\"gh\" href=\"{url}\" rel=\"noopener noreferrer\" target=\"_blank\">{short} ↗</a></div>\
-         <div class=\"meta\">by <b>{author}</b>{reviewers} · {n} finding{s}{confirmed} · {time}</div></li>",
-        phase = phase_tag(r),
-        deadline = deadline_tag(r, now),
+        "<li><a class=\"rv\" href=\"/r/{id}\">{pill}<span class=\"rv-pr\">{pr}</span>\
+         <span class=\"rv-meta\">{id} · {author} · {what}{parent}</span><span class=\"rv-when\">{when}</span></a></li>",
         id = esc(&r.id),
-        url = esc(&r.pr.url()),
-        short = esc(&r.pr.short()),
+        pill = pill(r),
+        pr = esc(&r.pr.short()),
         author = esc(&r.author),
-        reviewers = if reviewers.is_empty() { String::new() } else { format!(" · reviewers {}", reviewers.join(", ")) },
-        s = if n == 1 { "" } else { "s" },
-        confirmed = if confirmed > 0 { format!(", {confirmed} confirmed") } else { String::new() },
-        time = time_tag(r.created),
+        what = esc(&what),
     );
 }
 
 pub fn render_index(st: &State, now: Ms) -> String {
-    let mut out = String::from("<h1>Review relay</h1>");
-    let online = st.online(now);
-    let _ = write!(out, "<h2>Online agents <span class=\"count\">{}</span></h2>", online.len());
-    if online.is_empty() {
-        out.push_str("<p class=\"empty\">No agents online. Agents appear here while they call the relay.</p>");
-    } else {
-        out.push_str("<div class=\"tablewrap\"><table class=\"grid agents\"><thead><tr><th scope=\"col\">Agent</th><th scope=\"col\">Role</th><th scope=\"col\">Owner</th><th scope=\"col\">State</th></tr></thead><tbody>");
-        for a in &online {
-            let state = match &a.busy {
-                Some(id) => format!("busy with <a href=\"/r/{0}\">{0}</a>", esc(id)),
-                None => "idle".into(),
-            };
-            let _ = write!(
-                out,
-                "<tr><th scope=\"row\">{}</th><td><span class=\"role r-{role}\">{role}</span></td><td>{}<span class=\"muted\"> on {}</span></td><td>{state}</td></tr>",
-                esc(&a.name),
-                esc(&a.login),
-                esc(&a.node),
-                role = a.role.as_str(),
-            );
-        }
-        out.push_str("</tbody></table></div>");
-    }
+    let mut out = String::from("<h1>Reviews</h1>");
     let mut reviews: Vec<&Review> = st.reviews.iter().collect();
     reviews.sort_by_key(|r| std::cmp::Reverse(r.created));
     let (active, done): (Vec<&Review>, Vec<&Review>) = reviews.into_iter().partition(|r| r.phase.active());
-    for (label, list, empty) in [
-        ("Active reviews", active, "No reviews in progress."),
-        ("Finished reviews", done, "Nothing finished yet."),
-    ] {
-        let _ = write!(out, "<h2>{label} <span class=\"count\">{}</span></h2>", list.len());
+    if active.is_empty() && done.is_empty() {
+        out.push_str("<p class=\"empty\">No reviews yet.</p>");
+    }
+    for (label, list) in [("In progress", active), ("Finished", done)] {
         if list.is_empty() {
-            let _ = write!(out, "<p class=\"empty\">{empty}</p>");
             continue;
         }
-        out.push_str("<ul class=\"threads\">");
+        let _ = write!(out, "<h2>{label} <span class=\"count\">{}</span></h2><ul class=\"reviews\">", list.len());
         for r in list {
             review_row(&mut out, r, now);
+        }
+        out.push_str("</ul>");
+    }
+    let online = st.online(now);
+    let _ = write!(out, "<h2>Online agents <span class=\"count\">{}</span></h2>", online.len());
+    if online.is_empty() {
+        out.push_str("<p class=\"empty\">Nobody online.</p>");
+    } else {
+        out.push_str("<ul class=\"agents\">");
+        for a in &online {
+            let owner = if a.login == "local" { String::new() } else { format!(" <span class=\"muted\">{}</span>", esc(&a.login)) };
+            let busy = a
+                .busy
+                .as_deref()
+                .map(|id| format!(" <a href=\"/r/{0}\">on {0}</a>", esc(id)))
+                .unwrap_or_default();
+            let _ = write!(
+                out,
+                "<li title=\"{login} on {node}\"><b>{name}</b> <span class=\"role\">{role}</span>{owner}{busy}</li>",
+                login = esc(&a.login),
+                node = esc(&a.node),
+                name = esc(&a.name),
+                role = a.role.as_str(),
+            );
         }
         out.push_str("</ul>");
     }
     out
 }
 
-fn status_badge(f: &Finding) -> String {
-    let Some((cls, label)) = outcome(f) else {
-        return String::new();
-    };
-    let mut s = format!("<span class=\"badge s-{cls}\">{}</span>", esc(&label));
-    if let Some(o) = &f.outcome {
-        if let Some(range) = split_range(f) {
-            let _ = write!(s, "<span class=\"badge s-stale\">severity split {range}: the lower stands</span>");
-        } else if o.downgraded {
-            s.push_str("<span class=\"badge s-stale\">blocking → major (not unanimous)</span>");
-        } else if o.severity != f.severity {
-            let _ = write!(s, "<span class=\"badge s-stale\">{} → {} (by vote)</span>", f.severity.as_str(), o.severity.as_str());
-        }
-    }
-    s
-}
-
-fn raised_by(f: &Finding) -> String {
-    match (&f.by, &f.origin) {
-        (Some(b), _) => esc(b),
-        (None, Some(o)) => format!("carried from {}", esc(o)),
-        _ => String::new(),
+/// Sort and group order: what needs attention first, dismissed findings last.
+fn rank(f: &Finding) -> u8 {
+    match f.outcome.as_ref().map(|o| &o.status) {
+        Some(Status::Confirmed) => 0,
+        Some(Status::Disputed) => 1,
+        None if f.withdrawn.is_none() => 2,
+        Some(Status::Rejected) => 3,
+        Some(Status::Duplicate(_)) => 4,
+        _ => 5,
     }
 }
 
-fn render_summary(out: &mut String, r: &Review, findings: &[&Finding]) {
-    out.push_str(
-        "<div class=\"tablewrap\"><table class=\"grid summary-table\"><thead><tr><th scope=\"col\">ID</th><th scope=\"col\">Finding</th>\
-         <th scope=\"col\">Severity</th><th scope=\"col\">Raised by</th><th scope=\"col\">Outcome</th><th scope=\"col\">Votes</th></tr></thead><tbody>",
-    );
-    for f in findings {
-        let sev = f.outcome.as_ref().map(|o| o.severity).unwrap_or(f.severity);
-        let status = match outcome(f) {
-            Some((cls, label)) => format!("<span class=\"badge s-{cls}\">{}</span>", esc(&label)),
-            None if r.phase.active() => "<span class=\"muted\">open</span>".into(),
-            None => "<span class=\"muted\">undecided</span>".into(),
-        };
-        let (agree, disagree) = votes(f);
-        let _ = write!(
-            out,
-            "<tr><th scope=\"row\"><a class=\"fid\" href=\"#{id}\">{id}</a></th><td class=\"ftitle\">{title}</td>\
-             <td><span class=\"sev sev-{sev}\">{sev}</span>{split}</td><td>{by}</td><td>{status}</td>\
-             <td class=\"num\"><span title=\"agree (counting who raised it)\">{agree} ✓</span> <span title=\"disagree\">{disagree} ✗</span></td></tr>",
-            id = esc(&f.id),
-            title = esc(&title(&f.text)),
-            sev = sev.as_str(),
-            split = split_range(f).map(|x| format!(" <span class=\"muted\">(split: {x})</span>")).unwrap_or_default(),
-            by = raised_by(f),
-        );
-    }
-    out.push_str("</tbody></table></div>");
+fn severity(f: &Finding) -> Severity {
+    f.outcome.as_ref().map(|o| o.severity).unwrap_or(f.severity)
 }
 
-fn render_finding(out: &mut String, f: &Finding) {
-    let sev = f.outcome.as_ref().map(|o| o.severity).unwrap_or(f.severity);
-    let by = match &f.by {
-        Some(_) => format!("by <b>{}</b>", raised_by(f)),
-        None => raised_by(f),
-    };
-    let link = f
-        .url
-        .as_deref()
-        .and_then(safe_url)
-        .map(|u| {
-            let label = u.rsplit('/').next().unwrap_or(u);
-            format!(" · <a href=\"{}\" rel=\"noopener noreferrer\" target=\"_blank\"><code>{}</code></a>", esc(u), esc(label))
-        })
-        .unwrap_or_default();
-    let _ = write!(
-        out,
-        "<details class=\"finding{w}\" id=\"{id}\" open><summary class=\"mhead\"><span class=\"fid\">{id}</span><span class=\"sev sev-{sev}\">{sev}</span>{badge}<span class=\"by\">{by}{amended}</span>{link}</summary>\
-         <div class=\"body md\">{text}</div>",
-        w = if f.withdrawn.is_some() { " withdrawn" } else { "" },
-        id = esc(&f.id),
-        sev = sev.as_str(),
-        badge = status_badge(f),
-        amended = if f.revision > 0 { " · amended" } else { "" },
-        text = markdown(&f.text),
-    );
-    if let Some(w) = &f.withdrawn {
-        let _ = write!(out, "<div class=\"facts\">withdrawn: {}</div>", esc(w));
+fn severity_note(f: &Finding) -> Option<String> {
+    let o = f.outcome.as_ref()?;
+    let rater = f.votes.iter().find(|(_, v)| v.choice == Choice::Agree && v.severity.is_some_and(|s| s != f.severity));
+    if let (Some(_), Some((who, v)), true) = (&f.by, rater, split_range(f).is_some()) {
+        let rated = v.severity.unwrap_or(f.severity).as_str();
+        return Some(format!("Raised as {}; {who} rated it {rated}, so the lower ({}) stands.", f.severity.as_str(), o.severity.as_str()));
     }
     if let Some(split) = split_note(f) {
-        let _ = write!(out, "<div class=\"facts\">severity {}</div>", esc(&split));
-    } else if let Some(split) = severity_split(f) {
-        let _ = write!(out, "<div class=\"facts\">disputed: {}</div>", esc(&split));
+        return Some(format!("Severity {split}; the lower stands."));
+    }
+    if let Some(split) = severity_split(f) {
+        return Some(format!("Severity disputed: {split}."));
+    }
+    let raised = f.severity.as_str();
+    if o.downgraded {
+        Some(format!("Raised as {raised}; not unanimous, so {}.", o.severity.as_str()))
+    } else if o.severity != f.severity {
+        Some(format!("Raised as {raised}; voters rated it {}.", o.severity.as_str()))
+    } else {
+        None
+    }
+}
+
+/// The finding's heading and what is left to show under it: a short first line set apart by a blank
+/// line, else the first sentence, which is not repeated below unless it had to be shortened.
+fn heading(text: &str) -> (String, &str) {
+    let text = text.trim();
+    if let Some((first, rest)) = text.split_once("\n\n").or_else(|| text.split_once("\r\n\r\n"))
+        && !first.contains('\n')
+        && first.chars().count() <= 100
+    {
+        return (title(first), rest.trim());
+    }
+    let para = text.split("\n\n").next().unwrap_or(text);
+    let end = para
+        .match_indices(['.', '?', '!'])
+        .map(|(i, _)| i + 1)
+        .find(|&i| para[i..].starts_with([' ', '\n']) && para[..i].matches('`').count().is_multiple_of(2))
+        .unwrap_or(para.len());
+    let sentence = &text[..end];
+    if sentence.contains('\n') || sentence.chars().count() > 100 {
+        return (title(text), text);
+    }
+    (title(sentence), text[end..].trim())
+}
+
+fn render_finding(out: &mut String, r: &Review, f: &Finding, open: bool) {
+    let sev = severity(f).as_str();
+    let badge = match outcome(f) {
+        Some((cls, label)) => {
+            let cls = if cls == "changes" { "confirmed" } else { cls };
+            format!("<span class=\"badge s-{cls}\">{}</span>", esc(&label))
+        }
+        None if r.phase.active() => String::new(),
+        None => "<span class=\"badge s-closed\">undecided</span>".into(),
+    };
+    let (agree, disagree) = votes(f);
+    let tally = if agree + disagree == 0 {
+        String::new()
+    } else {
+        format!(
+            "<span class=\"tally\" title=\"{agree} agree, {disagree} disagree\"><span class=\"sr\">{agree} agree, {disagree} disagree</span>\
+             <span aria-hidden=\"true\">✓{agree} ✗{disagree}</span></span>"
+        )
+    };
+    let (head, body) = heading(&f.text);
+    let _ = write!(
+        out,
+        "<details class=\"f\" id=\"{id}\"{open}><summary><span class=\"sev sev-{sev}\">{sev}</span>\
+         <span class=\"ft\">{head}</span><span class=\"fx\">{badge}{tally}<span class=\"fid\">{id}</span></span></summary><div class=\"fb\">",
+        id = esc(&f.id),
+        open = if open { " open" } else { "" },
+        head = esc(&head),
+    );
+    if !body.is_empty() {
+        let _ = write!(out, "<div class=\"md prose\">{}</div>", markdown(body));
+    }
+    let mut facts = vec![match (&f.by, &f.origin) {
+        (Some(b), _) => format!("Raised by <b>{}</b>", esc(b)),
+        (None, Some(o)) => {
+            let href = o.replacen('/', "#", 1);
+            format!("Carried over from <a href=\"/r/{}\">{}</a>", esc(&href), esc(o))
+        }
+        _ => "Carried over".into(),
+    }];
+    if let Some(u) = f.url.as_deref().and_then(safe_url) {
+        let label = u.rsplit('/').next().unwrap_or(u);
+        facts.push(format!("<a href=\"{}\" rel=\"noopener noreferrer\" target=\"_blank\"><code>{}</code></a>", esc(u), esc(label)));
+    }
+    if f.revision > 0 {
+        facts.push("amended".into());
+    }
+    let _ = write!(out, "<p class=\"facts\">{}</p>", facts.join(" · "));
+    if let Some(note) = severity_note(f) {
+        let _ = write!(out, "<p class=\"facts\">{}</p>", esc(&note));
+    }
+    if let Some(w) = &f.withdrawn {
+        let _ = write!(out, "<p class=\"facts\">Withdrawn: {}</p>", esc(w));
     }
     if !f.votes.is_empty() {
+        let rounds = f.votes.values().any(|v| v.round > 1);
         out.push_str("<ul class=\"votes\">");
         for (who, v) in &f.votes {
-            let cls = match &v.choice {
-                Choice::Agree => "agree",
-                Choice::Disagree => "disagree",
-                Choice::Duplicate(_) => "dup",
+            let (cls, what) = match &v.choice {
+                Choice::Agree => match v.severity.filter(|&s| s != f.severity) {
+                    Some(s) => ("agree", format!("agrees, as {}", s.as_str())),
+                    None => ("agree", "agrees".to_string()),
+                },
+                Choice::Disagree => ("disagree", "disagrees".to_string()),
+                Choice::Duplicate(t) => ("dup", format!("duplicate of {t}")),
             };
-            let what = vote_label(f, v);
-            let _ = write!(
-                out,
-                "<li class=\"v-{cls}\"><b>{}</b> {}<span class=\"muted\"> · round {}</span>{}</li>",
-                esc(who),
-                esc(&what),
-                v.round,
-                v.reason.as_deref().map(|r| format!("<div class=\"md\">{}</div>", markdown(r))).unwrap_or_default()
-            );
+            let round = if rounds { format!(" <span class=\"muted\">· round {}</span>", v.round) } else { String::new() };
+            let reason = v.reason.as_deref().map(|r| format!("<div class=\"md prose\">{}</div>", markdown(r))).unwrap_or_default();
+            let _ = write!(out, "<li class=\"v-{cls}\"><b>{}</b> {}{round}{reason}</li>", esc(who), esc(&what));
         }
         out.push_str("</ul>");
     }
-    out.push_str("</details>");
+    out.push_str("</div></details>");
 }
 
-fn render_verdict(out: &mut String, r: &Review) {
-    if let Some(res) = &r.result {
-        let mut counts: Vec<(String, usize)> = Vec::new();
-        for f in &r.findings {
-            if let Some((_, label)) = outcome(f) {
-                match counts.iter_mut().find(|(l, _)| *l == label) {
-                    Some((_, n)) => *n += 1,
-                    None => counts.push((label, 1)),
+fn render_findings(out: &mut String, r: &Review) {
+    let mut shown: Vec<(usize, &Finding)> = visible(r).enumerate().collect();
+    shown.sort_by_key(|(i, f)| (rank(f), severity(f), *i));
+    let hidden = r.findings.len() - shown.len();
+    if r.findings.is_empty() && matches!(r.phase, Phase::Done | Phase::Failed) {
+        return;
+    }
+    let _ = write!(out, "<h2 id=\"findings\">Findings <span class=\"count\">{}</span></h2>", r.findings.len());
+    if hidden > 0 {
+        let _ = write!(out, "<p class=\"empty\">{hidden} hidden until every reviewer has submitted.</p>");
+    } else if shown.is_empty() {
+        out.push_str("<p class=\"empty\">None yet.</p>");
+    }
+    let (main, closed): (Vec<&Finding>, Vec<&Finding>) = shown.into_iter().map(|(_, f)| f).partition(|f| rank(f) < 3);
+    let open = main.len() <= 4;
+    if !main.is_empty() {
+        out.push_str("<div class=\"findings\">");
+        for f in &main {
+            render_finding(out, r, f, open);
+        }
+        out.push_str("</div>");
+    }
+    if !closed.is_empty() {
+        if !main.is_empty() {
+            let _ = write!(out, "<h3 class=\"sub\">Closed <span class=\"count\">{}</span></h3>", closed.len());
+        }
+        out.push_str("<div class=\"findings dim\">");
+        for f in &closed {
+            render_finding(out, r, f, false);
+        }
+        out.push_str("</div>");
+    }
+}
+
+fn render_verdict(out: &mut String, r: &Review, now: Ms) {
+    let (cls, label) = status(r);
+    let detail = match r.phase {
+        Phase::Done => {
+            let mut sorted: Vec<&Finding> = r.findings.iter().collect();
+            sorted.sort_by_key(|f| (rank(f), severity(f)));
+            let mut counts: Vec<(String, Vec<Severity>)> = Vec::new();
+            for f in sorted {
+                if let Some((_, l)) = outcome(f) {
+                    match counts.iter_mut().find(|(x, _)| *x == l) {
+                        Some((_, v)) => v.push(severity(f)),
+                        None => counts.push((l, vec![severity(f)])),
+                    }
                 }
             }
+            if counts.is_empty() {
+                "No findings".to_string()
+            } else {
+                let parts: Vec<String> = counts
+                    .iter()
+                    .map(|(l, sevs)| {
+                        let mut s = format!("{} {l}", sevs.len());
+                        if l == "confirmed" || l == "still present" {
+                            let mut by: Vec<(Severity, usize)> = Vec::new();
+                            for &x in sevs {
+                                match by.iter_mut().find(|(y, _)| *y == x) {
+                                    Some((_, n)) => *n += 1,
+                                    None => by.push((x, 1)),
+                                }
+                            }
+                            let by: Vec<String> = by.iter().map(|(x, n)| format!("{n} {}", x.as_str())).collect();
+                            let _ = write!(s, " ({})", by.join(", "));
+                        }
+                        s
+                    })
+                    .collect();
+                parts.join(" · ")
+            }
         }
-        let counts = if counts.is_empty() {
-            "no findings".to_string()
-        } else {
-            counts.iter().map(|(l, n)| format!("{n} {l}")).collect::<Vec<_>>().join(" · ")
+        Phase::Failed => {
+            let f = r.failure.as_deref().unwrap_or("");
+            let mut c = f.chars();
+            c.next().map(|x| x.to_uppercase().chain(c).collect()).unwrap_or_default()
+        }
+        Phase::Offering => format!("Offered to {}", r.offered.len()),
+        Phase::Reviewing => format!(
+            "{} of {} reviewers submitted",
+            r.active_slots().filter(|s| s.submission.is_some()).count(),
+            r.active_slots().count()
+        ),
+        Phase::Voting(_) if r.replying => "Waiting for replies on contested findings".into(),
+        Phase::Voting(_) => {
+            let owing = r.active_slots().filter(|s| !r.owed_votes(&s.agent).is_empty()).count();
+            format!("{owing} of {} reviewers still to vote", r.active_slots().count())
+        }
+    };
+    let when = match (&r.result, r.phase.active()) {
+        (_, true) => countdown(r.deadline, now),
+        (Some(res), _) => time_tag(res.at, now),
+        (None, _) => r.ended.map(|e| time_tag(e, now)).unwrap_or_default(),
+    };
+    let _ = write!(
+        out,
+        "<section class=\"verdict v-{cls}\" aria-label=\"Status\"><p class=\"vt\">{label}</p><p class=\"vd\">{detail}</p><p class=\"vw\">{when}</p></section>",
+        detail = esc(&detail),
+    );
+}
+
+fn render_reviewers(out: &mut String, r: &Review) {
+    let _ = write!(out, "<h2>Reviewers <span class=\"count\">{}</span></h2><ul class=\"reviewers\">", r.active_slots().count());
+    if r.slots.is_empty() {
+        let declined = if r.declined.is_empty() { String::new() } else { format!("; {} declined", r.declined.len()) };
+        let n = r.offered.len();
+        let _ = write!(out, "<li class=\"muted\">Offered to {n} agent{}{declined}.</li>", if n == 1 { "" } else { "s" });
+    }
+    for s in &r.slots {
+        let state = match (&s.dropped, &s.submission) {
+            (Some(d), _) => format!("<span class=\"badge s-closed\">dropped</span> <span class=\"muted\">{}</span>", esc(d)),
+            (None, Some(x)) => {
+                let (cls, label) = match x.verdict {
+                    Verdict::Approve => ("approved", "approves"),
+                    Verdict::ChangesRequested => ("changes", "requests changes"),
+                };
+                let sha = if r.head_sha.as_deref().map(short_sha) == Some(short_sha(&x.head_sha)) {
+                    String::new()
+                } else {
+                    format!(" <span class=\"muted\">at</span> <code>{}</code>", esc(short_sha(&x.head_sha)))
+                };
+                format!("<span class=\"badge s-{cls}\">{label}</span>{sha}")
+            }
+            (None, None) => "<span class=\"badge s-waiting\">reviewing</span>".into(),
         };
-        let ok = res.verdict == Verdict::Approve;
-        let _ = write!(
-            out,
-            "<section class=\"verdict {cls}\" aria-label=\"Result\"><strong>{label}</strong><span>{counts}</span><span class=\"muted\">sent to {author} {time}</span></section>",
-            cls = if ok { "ok" } else { "bad" },
-            label = if ok { "Approved" } else { "Changes requested" },
-            counts = esc(&counts),
-            author = esc(&r.author),
-            time = time_tag(res.at),
-        );
+        let login = if s.login == "local" { String::new() } else { format!(" <span class=\"muted\">{}</span>", esc(&s.login)) };
+        let summary = s
+            .submission
+            .as_ref()
+            .filter(|x| !x.summary.is_empty() && r.revealed())
+            .map(|x| format!("<div class=\"md prose\">{}</div>", markdown(&x.summary)))
+            .unwrap_or_default();
+        let _ = write!(out, "<li><div class=\"who\"><b>{}</b>{login} {state}</div>{summary}</li>", esc(&s.agent));
     }
-    if let Some(f) = &r.failure {
-        let _ = write!(out, "<section class=\"verdict bad\" aria-label=\"Result\"><strong>Failed</strong><span>{}</span></section>", esc(f));
-    }
+    out.push_str("</ul>");
 }
 
 pub fn render_review(r: &Review, now: Ms) -> String {
@@ -478,109 +625,54 @@ pub fn render_review(r: &Review, now: Ms) -> String {
 
 /// `rereviews` are the ids of later reviews of the same PR started from this one.
 pub fn render_review_page(r: &Review, rereviews: &[String], now: Ms) -> String {
-    let mut out = String::new();
-    let _ = write!(
-        out,
-        "<nav class=\"crumbs\" aria-label=\"Breadcrumb\"><a href=\"/\">← relay</a></nav><h1>{id} · {short}</h1>\
-         <div class=\"prline\">{phase}{deadline}<a class=\"ref\" href=\"{url}\" rel=\"noopener noreferrer\" target=\"_blank\">{url_text} ↗</a>\
-         <span>by <b>{author}</b></span>{parent}{children}{head}</div>",
-        id = esc(&r.id),
-        short = esc(&r.pr.short()),
-        phase = phase_tag(r),
-        deadline = deadline_tag(r, now),
+    let mut meta = vec![format!("{} by <b>{}</b>", esc(&r.id), esc(&r.author))];
+    if let Some(h) = &r.head_sha {
+        meta.push(format!("<code>{}</code>", esc(short_sha(h))));
+    }
+    if let Some(p) = &r.parent {
+        meta.push(format!("re-review of <a href=\"/r/{0}\">{0}</a>", esc(p)));
+    }
+    if !rereviews.is_empty() {
+        let links: Vec<String> = rereviews.iter().map(|c| format!("<a href=\"/r/{0}\">{0}</a>", esc(c))).collect();
+        meta.push(format!("re-reviewed in {}", links.join(", ")));
+    }
+    meta.push(format!("requested {}", time_tag(r.created, now)));
+    let mut out = format!(
+        "<h1><a href=\"{url}\" rel=\"noopener noreferrer\" target=\"_blank\">{short}<span class=\"ext\" aria-hidden=\"true\"> ↗</span></a></h1>\
+         <p class=\"meta\">{meta}</p>",
         url = esc(&r.pr.url()),
-        url_text = esc(&r.pr.short()),
-        author = esc(&r.author),
-        parent = r
-            .parent
-            .as_deref()
-            .map(|p| format!("<span>re-review of <a href=\"/r/{0}\">{0}</a></span>", esc(p)))
-            .unwrap_or_default(),
-        children = if rereviews.is_empty() {
-            String::new()
-        } else {
-            let links: Vec<String> = rereviews.iter().map(|c| format!("<a href=\"/r/{0}\">{0}</a>", esc(c))).collect();
-            format!("<span>re-reviewed in {}</span>", links.join(", "))
-        },
-        head = r
-            .head_sha
-            .as_deref()
-            .map(|h| format!("<span>head <code>{}</code></span>", esc(short_sha(h))))
-            .unwrap_or_default(),
+        short = esc(&r.pr.short()),
+        meta = meta.join(" · "),
     );
-    render_verdict(&mut out, r);
-
-    let shown: Vec<&Finding> = visible(r).collect();
-    let hidden = r.findings.len() - shown.len();
-    let _ = write!(out, "<h2 id=\"findings\">Findings <span class=\"count\">{}</span></h2>", r.findings.len());
-    if hidden > 0 {
-        let _ = write!(
-            out,
-            "<p class=\"empty\">{hidden} finding(s) submitted so far; hidden until every reviewer has submitted.</p>"
-        );
-    } else if shown.is_empty() {
-        out.push_str("<p class=\"empty\">No findings.</p>");
-    }
-    if !shown.is_empty() {
-        render_summary(&mut out, r, &shown);
-    }
-
+    render_verdict(&mut out, r, now);
+    render_findings(&mut out, r);
     render_timeline(&mut out, r, now);
-
     if !r.note.is_empty() {
-        let _ = write!(out, "<section class=\"card\"><h2 class=\"label\">Author's note</h2><div class=\"md\">{}</div></section>", markdown(&r.note));
+        let _ = write!(out, "<h2>Author's note</h2><div class=\"md prose note\">{}</div>", markdown(&r.note));
     }
+    render_reviewers(&mut out, r);
+
     let c = r.params.consensus;
     let _ = write!(
         out,
-        "<h2>Reviewers <span class=\"count\">{}/{}</span></h2><div class=\"facts\">confirm when more than {:.0}% agree · blocking needs unanimity: {} · up to {} voting round(s)</div><ul class=\"reviewers\">",
-        r.active_slots().count(),
-        r.params.reviewers,
+        "<details class=\"more\" id=\"rules\"><summary><h2>Consensus rules</h2></summary><p class=\"prose\">A finding is confirmed when more than {:.0}% of its voters agree, \
+         rejected when more than {:.0}% disagree, and disputed otherwise. {} Up to {} voting round{}.</p></details>",
         c.confirm_fraction * 100.0,
-        if c.blocking_unanimous { "yes" } else { "no" },
-        c.vote_rounds
+        c.confirm_fraction * 100.0,
+        if c.blocking_unanimous { "A blocking finding stays blocking only if nobody disagrees." } else { "" },
+        c.vote_rounds,
+        if c.vote_rounds == 1 { "" } else { "s" },
     );
-    if r.slots.is_empty() {
-        let _ = write!(out, "<li class=\"muted\">offered to {} agent(s), {} declined</li>", r.offered.len(), r.declined.len());
-    }
-    for s in &r.slots {
-        let state = match (&s.dropped, &s.submission) {
-            (Some(d), _) => format!("<span class=\"badge s-closed\">dropped: {}</span>", esc(d)),
-            (None, Some(x)) => format!(
-                "<span class=\"badge s-inreview\">submitted</span> suggests <b>{}</b> at <code>{}</code>",
-                x.verdict.as_str(),
-                esc(short_sha(&x.head_sha))
-            ),
-            (None, None) => "<span class=\"badge s-waiting\">reviewing</span>".into(),
-        };
-        let summary = s
-            .submission
-            .as_ref()
-            .filter(|x| !x.summary.is_empty() && r.revealed())
-            .map(|x| format!("<div class=\"md summary\">{}</div>", markdown(&x.summary)))
-            .unwrap_or_default();
-        let _ = write!(out, "<li><b>{}</b> <span class=\"muted\">{}</span> {state}{summary}</li>", esc(&s.agent), esc(&s.login));
-    }
-    out.push_str("</ul>");
-
-    if !shown.is_empty() {
-        out.push_str("<h2>Finding details</h2><div class=\"findings-list\">");
-        for f in &shown {
-            render_finding(&mut out, f);
-        }
-        out.push_str("</div>");
-    }
-
     let _ = write!(
         out,
-        "<details class=\"transcript\" id=\"transcript\"><summary><h2>Transcript <span class=\"count\">{}</span></h2></summary><ol class=\"log\">",
+        "<details class=\"more\" id=\"transcript\"><summary><h2>Transcript <span class=\"count\">{}</span></h2></summary><ol class=\"log\">",
         r.log.len()
     );
     for e in &r.log {
         let _ = write!(
             out,
-            "<li class=\"k-{kind}\"><span class=\"when\">{time}</span> <b>{who}</b> <span class=\"kind\">{kind}</span> <div class=\"md\">{text}</div></li>",
-            time = time_tag(e.at),
+            "<li class=\"k-{kind}\"><div class=\"lh\"><b>{who}</b> <span class=\"kind\">{kind}</span> <span class=\"when\">{time}</span></div><div class=\"md prose\">{text}</div></li>",
+            time = time_tag(e.at, now),
             who = esc(&e.who),
             kind = esc(&e.kind),
             text = markdown(&e.text),
@@ -688,32 +780,31 @@ fn no_store(mut r: Response) -> Response {
     r
 }
 
-pub async fn index(AxState(hub): AxState<Arc<Hub>>, Extension(who): Extension<Identity>, headers: HeaderMap) -> Response {
+pub async fn index(AxState(hub): AxState<Arc<Hub>>, headers: HeaderMap) -> Response {
     let main = hub.read(render_index);
     if partial(&headers) {
         return no_store(Html(main).into_response());
     }
-    Html(page("amx relay", &who, &main)).into_response()
+    Html(page("amx", &main)).into_response()
 }
 
 pub async fn review_page(
     AxState(hub): AxState<Arc<Hub>>,
-    Extension(who): Extension<Identity>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     let Some((r, children, now)) = snapshot(&hub, &id) else {
         let main = format!(
-            "<nav class=\"crumbs\" aria-label=\"Breadcrumb\"><a href=\"/\">← relay</a></nav><h1>No review {}</h1><p class=\"empty\">The relay may have restarted.</p>",
+            "<h1>No review {}</h1><p class=\"empty\">The relay may have restarted. <a href=\"/\">All reviews</a></p>",
             esc(&id)
         );
-        return (StatusCode::NOT_FOUND, Html(page("amx relay", &who, &main))).into_response();
+        return (StatusCode::NOT_FOUND, Html(page("amx", &main))).into_response();
     };
     let main = render_review_page(&r, &children, now);
     if partial(&headers) {
         return no_store(Html(main).into_response());
     }
-    Html(page(&format!("{} · {}", r.id, r.pr.short()), &who, &main)).into_response()
+    Html(page(&format!("{} · {}", r.pr.short(), r.id), &main)).into_response()
 }
 
 pub async fn api_reviews(AxState(hub): AxState<Arc<Hub>>) -> Response {
@@ -758,5 +849,14 @@ mod tests {
         assert_eq!(title("\n## **Off by one** in `len`\nmore"), "Off by one in len");
         let long = "x".repeat(150);
         assert_eq!(title(&long).chars().count(), 101);
+    }
+
+    #[test]
+    fn headings_take_a_set_apart_line_or_the_first_sentence() {
+        assert_eq!(heading("Off by one\n\nThe loop ends early."), ("Off by one".into(), "The loop ends early."));
+        assert_eq!(heading("Uses `a.b()` twice. Cache it."), ("Uses a.b() twice.".into(), "Cache it."));
+        assert_eq!(heading("Only one sentence here."), ("Only one sentence here.".into(), ""));
+        let long = format!("{} end. More.", "word ".repeat(30));
+        assert_eq!(heading(&long).1, long, "a shortened heading keeps the full text below");
     }
 }

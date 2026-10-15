@@ -81,10 +81,9 @@
   function live() {
     var el = document.getElementById("live");
     if (!window.EventSource || !el) return;
-    var label = el.querySelector(".lt");
     function set(on) {
       el.classList.toggle("on", on);
-      if (label) label.textContent = on ? "live" : "offline";
+      el.textContent = on ? "Live" : "Reconnecting…";
     }
     var es = new EventSource("/api/events");
     es.addEventListener("open", function () { set(true); refresh(); });

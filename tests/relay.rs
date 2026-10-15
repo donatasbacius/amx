@@ -675,6 +675,36 @@ fn two_reviewers_split_on_severity_confirm_the_lower() {
     let result = sim.events("alice-codex");
     assert!(result.contains("- F1 [major, split: blocking/major (rev-a: blocking, rev-b: major)]"), "{result}");
     assert!(result.contains("rev-b: agree, as major — real, but overstated") && !result.contains("Disputed"), "{result}");
+    let page = amx::web::render_review(sim.s.review(&id).unwrap(), sim.now);
+    assert!(page.contains("Raised as blocking; rev-b rated it major, so the lower (major) stands."), "{page}");
+}
+
+#[test]
+fn review_page_puts_confirmed_findings_first_and_closes_the_rest() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("nit", "should use a BTreeMap"), ("blocking", "Lock held across await\n\nThe guard lives until the end of `drain()`.")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.submit("rev-c", &id, &[]);
+    for r in ["rev-b", "rev-c"] {
+        sim.vote(r, &id, &[("F1", "disagree"), ("F2", "agree")]);
+    }
+    sim.skip_replies();
+    for r in ["rev-b", "rev-c"] {
+        sim.vote(r, &id, &[("F1", "disagree")]);
+    }
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
+    let page = amx::web::render_review(sim.s.review(&id).unwrap(), sim.now);
+    let (f1, f2, closed) = (page.find("id=\"F1\"").unwrap(), page.find("id=\"F2\"").unwrap(), page.find(">Closed <").unwrap());
+    assert!(f2 < closed && closed < f1, "{page}");
+    assert!(page.contains("Changes requested") && page.contains("1 confirmed (1 blocking) · 1 rejected"), "{page}");
+    assert!(page.contains("<span class=\"ft\">Lock held across await</span>") && !page.contains("<p>Lock held across await</p>"), "the headline is not repeated: {page}");
+    assert!(page.contains("<span class=\"ft\">should use a BTreeMap</span>") && !page.contains("<p>should use a BTreeMap</p>"), "{page}");
+    assert!(page.contains("rev-c</b> agrees") && !page.contains("agrees, as blocking"), "{page}");
+    assert!(!page.contains("summary-table") && !page.contains("local"), "{page}");
 }
 
 #[test]
