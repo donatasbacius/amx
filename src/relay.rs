@@ -340,8 +340,7 @@ pub enum Status {
     Disputed,
     Duplicate(String),
     Withdrawn,
-    /// Nobody else voted on its current revision, and its author's word alone doesn't count: the
-    /// author was dropped, or the others voted on an earlier revision.
+    /// Nobody else voted on its current revision; its author's word alone counts only for the sole reviewer.
     Unverified,
 }
 
@@ -473,10 +472,7 @@ impl Review {
         self.findings
             .iter()
             .filter(|f| f.withdrawn.is_none() && f.by.as_deref() != Some(agent) && f.open_round == round)
-            .filter(|f| match f.votes.get(agent) {
-                None => true,
-                Some(v) => v.round < round || v.revision < f.revision,
-            })
+            .filter(|f| f.votes.get(agent).is_none_or(|v| v.round < round))
             .collect()
     }
 
@@ -529,9 +525,9 @@ impl Review {
     }
 }
 
-/// Merges duplicates, then applies the voting rule to every finding. `active` are the reviewers still in the review:
-/// only they stand by their own findings when nobody voted on any revision of them.
-pub fn decide(findings: &mut [Finding], c: &Consensus, active: &HashSet<String>) {
+/// Merges duplicates, then applies the voting rule to every finding. Only a finding someone other than its author
+/// backs as it stands can be confirmed, unless its author is the `sole` reviewer who submitted.
+pub fn decide(findings: &mut [Finding], c: &Consensus, sole: bool) {
     let ids: Vec<String> = findings.iter().map(|f| f.id.clone()).collect();
     let rating: BTreeMap<String, Severity> = findings.iter().map(|f| (f.id.clone(), f.severity)).collect();
     let mut merged: BTreeMap<String, String> = BTreeMap::new();
@@ -586,7 +582,7 @@ pub fn decide(findings: &mut [Finding], c: &Consensus, active: &HashSet<String>)
             }
         }
         let agree = rated.len();
-        let examined = f.current_votes().next().is_some() || (f.votes.is_empty() && f.by.as_ref().is_some_and(|b| active.contains(b)));
+        let backed = (sole && f.by.is_some()) || f.current_votes().any(|(_, v)| v.choice != Choice::Disagree);
         let total = (agree + disagree) as f64;
         let mut severity = f.severity;
         let mut downgraded = false;
@@ -594,9 +590,7 @@ pub fn decide(findings: &mut [Finding], c: &Consensus, active: &HashSet<String>)
         let severity_split = disagree == 0 && agree == 2 && rated[0] != rated[1];
         let status = if let Some(t) = merged.get(&f.id) {
             Status::Duplicate(t.clone())
-        } else if !examined {
-            Status::Unverified
-        } else if total > 0.0 && agree as f64 > c.confirm_fraction * total {
+        } else if backed && agree as f64 > c.confirm_fraction * total {
             severity = rated[agree / 2];
             let unanimous = disagree == 0 && rated.iter().all(|s| *s == Severity::Blocking);
             if severity == Severity::Blocking && c.blocking_unanimous && !unanimous {
@@ -604,8 +598,10 @@ pub fn decide(findings: &mut [Finding], c: &Consensus, active: &HashSet<String>)
                 downgraded = true;
             }
             Status::Confirmed
-        } else if total > 0.0 && disagree as f64 > c.confirm_fraction * total {
+        } else if disagree as f64 > c.confirm_fraction * total {
             Status::Rejected
+        } else if disagree == 0 {
+            Status::Unverified
         } else {
             Status::Disputed
         };
@@ -1692,6 +1688,7 @@ impl State {
         r.check_login(agent, &login)?;
         let pr = r.pr.clone();
         let round = r.round();
+        let replying = r.replying;
         let severity = severity
             .map(|s| Severity::parse(s).ok_or_else(|| anyhow!("severity must be blocking, major, minor or nit")))
             .transpose()?;
@@ -1708,6 +1705,9 @@ impl State {
         }
         let after = finding_size(new_text.as_deref().unwrap_or(&f.text), url.as_deref().or(f.url.as_deref()));
         check_reviewer_text(total - finding_size(&f.text, f.url.as_deref()) + after)?;
+        if !replying {
+            bail!("findings can be amended only in the reply window before a later round's votes open; `say` why it stands or `withdraw_finding`");
+        }
         if let Some(s) = severity {
             f.severity = s;
         }
@@ -1724,15 +1724,8 @@ impl State {
         r.log(now, agent, "amend", line);
         r.replied.insert(agent.to_string());
         let rid = r.id.clone();
-        let author = r.author.clone();
-        let replying = r.replying;
         for a in r.others(agent) {
-            let text = format!("[{rid}] {agent} amended {fid}; votes on it are reopened.");
-            if a == author || replying {
-                self.agents.progress(&a, &rid, text, now);
-            } else {
-                self.agents.notify(&a, &rid, text, now);
-            }
+            self.agents.progress(&a, &rid, format!("[{rid}] {agent} amended {fid}; votes on it are reopened."), now);
         }
         self.advance(now);
         Ok(())
@@ -1978,14 +1971,8 @@ impl State {
                     }
                     changed = true;
                 }
-                let submitted = r.slots.iter().filter(|s| s.submission.is_some()).count();
-                let pending = r.active_slots().filter(|s| s.submission.is_none()).count();
-                if pending == 0 {
-                    if submitted == 0 {
-                        fail(r, agents, "all reviewers dropped out before submitting findings", now);
-                    } else {
-                        start_voting(r, agents, 1, &web, now);
-                    }
+                if r.active_slots().all(|s| s.submission.is_some()) {
+                    start_voting(r, agents, 1, &web, now);
                     return true;
                 }
                 changed
@@ -2003,25 +1990,15 @@ impl State {
                     open_votes(r, agents, false, now);
                     return true;
                 }
-                // Not voting again on a finding amended since one's vote is no reason to drop a reviewer.
-                let owing = |r: &Review, amended_too: bool| -> Vec<String> {
-                    r.active_slots()
-                        .filter(|s| {
-                            r.owed_votes(&s.agent)
-                                .iter()
-                                .any(|f| amended_too || f.votes.get(&s.agent).is_none_or(|v| v.revision == f.revision))
-                        })
-                        .map(|s| s.agent.clone())
-                        .collect()
-                };
+                let owing: Vec<String> = r.active_slots().filter(|s| !r.owed_votes(&s.agent).is_empty()).map(|s| s.agent.clone()).collect();
                 let late = now >= r.deadline;
                 if late {
-                    for a in owing(r, false) {
-                        drop_slot(r, agents, &a, &format!("missed the round {round} voting deadline"), now);
+                    for a in &owing {
+                        drop_slot(r, agents, a, &format!("missed the round {round} voting deadline"), now);
                     }
                     changed = true;
                 }
-                if late || owing(r, true).is_empty() {
+                if late || owing.is_empty() {
                     let contested: Vec<usize> = r
                         .findings
                         .iter()
@@ -2034,8 +2011,7 @@ impl State {
                         })
                         .map(|(i, _)| i)
                         .collect();
-                    let voters = r.active_slots().count();
-                    if round < r.params.consensus.vote_rounds && !contested.is_empty() && voters > 0 {
+                    if round < r.params.consensus.vote_rounds && !contested.is_empty() {
                         for i in contested {
                             r.findings[i].open_round = round + 1;
                         }
@@ -2147,7 +2123,7 @@ fn open_votes(r: &mut Review, agents: &mut Agents, replying: bool, now: Ms) {
             agents.notify_task(a, &r.id, vote_task(r, &owed), text, Some(r.deadline), now);
         } else if round == 1 {
             let text = format!(
-                "[{}] Round 1 started; nothing for you to vote on (your own findings are being discussed: you may `amend_finding` or `withdraw_finding`, or `say` something). Call `wait`.\n\n{}",
+                "[{}] Round 1 started; nothing for you to vote on (your own findings are being discussed: you may `withdraw_finding` or `say` something). Call `wait`.\n\n{}",
                 r.id,
                 text::round_findings(r, &[])
             );
@@ -2157,9 +2133,13 @@ fn open_votes(r: &mut Review, agents: &mut Agents, replying: bool, now: Ms) {
 }
 
 fn finish(r: &mut Review, agents: &mut Agents, web: &str, now: Ms) {
+    if r.active_slots().next().is_none() {
+        fail(r, agents, "all reviewers dropped out", now);
+        return;
+    }
     let c = r.params.consensus;
-    let active: HashSet<String> = r.active_slots().map(|s| s.agent.clone()).collect();
-    decide(&mut r.findings, &c, &active);
+    let sole = r.slots.iter().filter(|s| s.submission.is_some()).count() == 1;
+    decide(&mut r.findings, &c, sole);
     let verdict = verdict_of(&r.findings);
     r.phase = Phase::Done;
     r.ended = Some(now);

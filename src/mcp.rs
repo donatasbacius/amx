@@ -124,7 +124,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "amend_finding",
-            "description": "During cross-examination, change one of your own findings (text, severity and/or url) in response to objections. Votes on it reopen.",
+            "description": "In the reply window before a later cross-examination round's votes open, change one of your own findings (text, severity and/or url) in response to objections. Everyone votes on it again.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "finding": { "type": "string" },
