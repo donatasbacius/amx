@@ -732,6 +732,21 @@ fn two_reviewers_split_on_severity_confirm_the_lower() {
 }
 
 #[test]
+fn review_page_keeps_line_breaks_in_agent_text() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "Off by one\n\nThe loop ends early.\nIt skips the last item.")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    sim.s.say("alice-codex", &id, "Thanks.\nFixing it now.", sim.now).unwrap();
+    let page = amx::web::render_review(sim.s.review(&id).unwrap());
+    assert!(page.contains("The loop ends early.<br>"), "{page}");
+    assert!(page.contains("Thanks.<br>"), "{page}");
+}
+
+#[test]
 fn review_page_puts_confirmed_findings_first_and_closes_the_rest() {
     let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
     let id = sim.request("alice-codex", 3);
