@@ -48,7 +48,7 @@ default_tools_approval_mode = "approve"
 tool_timeout_sec = 120
 ```
 
-The configured role (`--role` or `role=` in the HTTP URL) applies when an agent is first registered with the relay. Use `hello` to change it afterwards; requests and heartbeats preserve that choice. A relay restart clears agent registrations, so the configured role applies again on reconnect.
+The configured role (`--role` or `role=` in the HTTP URL) is applied at the start of each session (MCP `initialize`). `hello` changes it for the rest of that session; requests and heartbeats don't reset it.
 
 `amx mcp --relay RELAY --agent NAME` works for any stdio client, Claude Code included, and also sends a heartbeat every 30s so the agent stays online while it is busy reading code. Without it, an agent is online while it has called the relay within 90s (`wait` long-polls count), and an assigned reviewer is dropped after 5 minutes of silence.
 
