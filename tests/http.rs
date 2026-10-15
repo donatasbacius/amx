@@ -291,7 +291,7 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     let missing = get("/api/reviews/r9").await.unwrap();
     assert_eq!(missing.status(), 404);
     let page = get("/r/r1").await.unwrap().text().await.unwrap();
-    assert!(page.contains("summary-table") && page.contains("Consensus result") && !page.contains("<pre>"), "{page}");
+    assert!(page.contains("id=\"F1\"") && page.contains("Changes requested") && page.contains(">Result<") && !page.contains("<pre>"), "{page}");
     let partial = http.get(format!("{base}/r/r1")).header("X-Amx-Partial", "1").send().await.unwrap();
     assert_eq!(partial.headers()["cache-control"], "no-store");
     assert!(!partial.text().await.unwrap().contains("<html"));
