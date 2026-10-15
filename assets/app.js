@@ -37,29 +37,58 @@
     });
   }
 
-  var pending = false;
-  function refresh() {
-    if (pending) return;
-    pending = true;
-    fetch(location.pathname + location.search, { headers: { "X-Amx-Partial": "1" }, cache: "no-store" })
-      .then(function (r) { return r.ok ? r.text() : null; })
-      .then(function (html) {
-        if (html !== null) {
-          document.getElementById("main").innerHTML = html;
-          times();
-          deadlines();
-        }
-      })
-      .catch(function () {})
-      .then(function () { pending = false; });
+  function coalesce(fn) {
+    var running = false, again = false;
+    function run() {
+      if (running) { again = true; return; }
+      running = true;
+      again = false;
+      Promise.resolve().then(fn).catch(function () {}).then(function () {
+        running = false;
+        if (again) run();
+      });
+    }
+    return run;
   }
 
+  var toggled = {};
+  document.addEventListener("toggle", function (e) {
+    if (e.target.id) toggled[e.target.id] = e.target.open;
+  }, true);
+
+  var last = null;
+  function swap(html) {
+    if (html === last) return;
+    var main = document.getElementById("main");
+    var focused = document.activeElement && main.contains(document.activeElement) ? document.activeElement.id : "";
+    main.innerHTML = html;
+    last = html;
+    Object.keys(toggled).forEach(function (id) {
+      var d = document.getElementById(id);
+      if (d && d.tagName === "DETAILS") d.open = toggled[id];
+    });
+    if (focused && document.getElementById(focused)) document.getElementById(focused).focus();
+    times();
+    deadlines();
+  }
+
+  var refresh = coalesce(function () {
+    return fetch(location.pathname + location.search, { headers: { "X-Amx-Partial": "1" }, cache: "no-store" })
+      .then(function (r) { return r.ok ? r.text() : null; })
+      .then(function (html) { if (html !== null) swap(html); });
+  });
+
   function live() {
-    var dot = document.getElementById("live");
-    if (!window.EventSource || !dot) return;
+    var el = document.getElementById("live");
+    if (!window.EventSource || !el) return;
+    var label = el.querySelector(".lt");
+    function set(on) {
+      el.classList.toggle("on", on);
+      if (label) label.textContent = on ? "live" : "offline";
+    }
     var es = new EventSource("/api/events");
-    es.addEventListener("open", function () { dot.classList.add("on"); });
-    es.addEventListener("error", function () { dot.classList.remove("on"); });
+    es.addEventListener("open", function () { set(true); refresh(); });
+    es.addEventListener("error", function () { set(false); });
     es.addEventListener("change", refresh);
   }
 

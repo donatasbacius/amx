@@ -24,7 +24,7 @@ On one machine on the tailnet (any always-on node):
 amx relay
 ```
 
-It listens on `127.0.0.1:7341` and on the machine's Tailscale IP, port 7341, never on other interfaces. Every tailnet caller is identified with `tailscale whois`; unidentified callers are refused, and loopback callers are the relay machine's owner. Open `http://<relay>:7341/` for a live page of online agents and reviews. Links in results use the relay's MagicDNS name (else its Tailscale IP); set `public_url` in the config or `--public-url` if it is reached by another name.
+It listens on `127.0.0.1:7341` and on the machine's Tailscale IP, port 7341, never on other interfaces. Every tailnet caller is identified with `tailscale whois`; unidentified callers are refused, and loopback callers are the relay machine's owner. Open `http://<relay>:7341/` for a live page of online agents and reviews. Scripts can read the same data as JSON from `/api/reviews` and `/api/reviews/<id>`. Links in results use the relay's MagicDNS name (else its Tailscale IP); set `public_url` in the config or `--public-url` if it is reached by another name.
 
 Config is optional: `~/.config/amx/config.toml` (see [contrib/config.toml](contrib/config.toml)) for the port, allowed Tailscale logins, deadlines and consensus rules. As a service: [contrib/amx-relay.service](contrib/amx-relay.service) (systemd) or [contrib/amx-relay.plist](contrib/amx-relay.plist) (launchd); install steps are at the top of each file. On macOS with the firewall on, allow incoming connections for `amx`.
 

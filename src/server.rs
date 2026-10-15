@@ -31,6 +31,8 @@ pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
         .route("/r/{id}", get(crate::web::review_page))
         .route("/static/style.css", get(static_css))
         .route("/static/app.js", get(static_js))
+        .route("/api/reviews", get(crate::web::api_reviews))
+        .route("/api/reviews/{id}", get(crate::web::api_review))
         .route("/api/events", get(events))
         .route("/api/heartbeat", post(heartbeat))
         .route("/api/watch", get(watch))
