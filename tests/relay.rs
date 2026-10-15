@@ -216,7 +216,7 @@ fn findings_hidden_until_all_submit() {
     assert!(!b_view.contains("SECRET-FINDING-TEXT"), "{b_view}");
     assert!(b_view.contains("1 finding(s) from other reviewers hidden"));
     assert!(amx::text::status(r, "rev-a", sim.now, "http://x").contains("SECRET-FINDING-TEXT"));
-    assert!(!amx::web::render_review(r, sim.now).contains("SECRET-FINDING-TEXT"));
+    assert!(!amx::web::render_review(r).contains("SECRET-FINDING-TEXT"));
     assert!(!sim.events("rev-b").contains("SECRET-FINDING-TEXT"));
     assert!(sim.s.vote("rev-b", &id, vec![], sim.now).is_err());
     assert!(sim.s.say("rev-a", &id, "psst", sim.now).is_err(), "no talking before reveal");
@@ -726,7 +726,7 @@ fn two_reviewers_split_on_severity_confirm_the_lower() {
     let result = sim.events("alice-codex");
     assert!(result.contains("- F1 [major, split: blocking/major (rev-a: blocking, rev-b: major)]"), "{result}");
     assert!(result.contains("rev-b: agree, as major — real, but overstated") && !result.contains("Disputed"), "{result}");
-    let page = amx::web::render_review(sim.s.review(&id).unwrap(), sim.now);
+    let page = amx::web::render_review(sim.s.review(&id).unwrap());
     assert!(page.contains("Raised as blocking; rev-b rated it major, so the lower (major) stands."), "{page}");
 }
 
@@ -748,7 +748,7 @@ fn review_page_puts_confirmed_findings_first_and_closes_the_rest() {
         sim.vote(r, &id, &[("F1", "disagree")]);
     }
     assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
-    let page = amx::web::render_review(sim.s.review(&id).unwrap(), sim.now);
+    let page = amx::web::render_review(sim.s.review(&id).unwrap());
     let (f1, f2, closed) = (page.find("id=\"F1\"").unwrap(), page.find("id=\"F2\"").unwrap(), page.find(">Closed <").unwrap());
     assert!(f2 < closed && closed < f1, "{page}");
     assert!(page.contains("Changes requested") && page.contains("1 confirmed (1 blocking) · 1 rejected"), "{page}");
@@ -833,7 +833,7 @@ fn closing_remarks_after_the_result_do_not_change_it() {
     let r = sim.s.review(&id).unwrap();
     assert_eq!(r.phase, Phase::Done);
     assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
-    assert!(amx::web::render_review(r, sim.now).contains("fixing the off-by-one"));
+    assert!(amx::web::render_review(r).contains("fixing the off-by-one"));
     assert!(sim.s.next_actions("alice-codex", sim.now).is_empty() && sim.s.busy_with("rev-a").is_none());
 }
 
@@ -1095,7 +1095,7 @@ fn transcript_shows_the_severity_an_agree_vote_backs() {
     let r = sim.s.review(&id).unwrap();
     assert!(r.finding("F1").unwrap().votes["rev-b"].severity.is_none());
     assert!(r.log.iter().any(|e| e.text == "F1: agree (minor) — real, but overstated"), "{:?}", r.log);
-    assert!(amx::web::render_review(r, sim.now).contains("agree (minor)"));
+    assert!(amx::web::render_review(r).contains("agree (minor)"));
 }
 
 fn outcome(sim: &Sim, id: &str, f: &str) -> amx::relay::Outcome {
@@ -1221,7 +1221,7 @@ fn findings_nobody_cross_examined_are_unverified() {
     let result = sim.events("alice-codex");
     assert!(!result.contains("Confirmed findings") && result.contains("Not cross-examined") && result.contains("says blocker"), "{result}");
     assert!(result.contains("F1, F2 were not cross-examined"), "{result}");
-    assert!(amx::web::render_review(sim.s.review(&id).unwrap(), sim.now).contains("unverified"));
+    assert!(amx::web::render_review(sim.s.review(&id).unwrap()).contains("unverified"));
     let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
     assert_eq!(sim.s.review(&id2).unwrap().findings.len(), 2, "unverified findings are re-checked");
 
@@ -1488,8 +1488,7 @@ fn talk_is_rate_limited_and_capped() {
     }
     let err = sim.s.say("rev-a", &id, "still more", sim.now).unwrap_err().to_string();
     assert!(err.contains("enough discussion"), "{err}");
-    sim.s.say("rev-b", &id, &"x".repeat(10_000), sim.now).unwrap();
-    assert!(sim.s.review(&id).unwrap().log.last().unwrap().text.len() < 4100);
+    sim.s.say("rev-b", &id, &"x".repeat(4000), sim.now).unwrap();
 
     sim.vote("rev-b", &id, &[("F1", "agree")]);
     assert_eq!(sim.phase(&id), Phase::Done);
@@ -1656,7 +1655,7 @@ fn one_reviewer_cannot_use_up_the_others_talk() {
     for minute in 0..5 {
         for r in ["rev-b", "rev-c"] {
             for i in 0..10 {
-                sim.s.say(r, &id, &format!("{minute}.{i} {}", "x".repeat(4000)), sim.now).unwrap();
+                sim.s.say(r, &id, &format!("{minute}.{i} {}", "x".repeat(3990)), sim.now).unwrap();
             }
         }
         sim.advance(60);
@@ -1743,4 +1742,60 @@ fn closing_remarks_do_not_wake_anyone() {
     sim.s.say("rev-a", &id, "Thanks all.", sim.now).unwrap();
     assert!(sim.s.take_events("rev-b", false, None, sim.now).0.is_empty());
     assert!(sim.s.take_events("alice-codex", false, None, sim.now).0.is_empty());
+}
+
+fn linked(texts: &[String], url: &str) -> SubmitIn {
+    let mut sub = findings_of(texts);
+    for f in &mut sub.findings {
+        f.url = Some(url.into());
+    }
+    sub
+}
+
+#[test]
+fn finding_urls_are_bounded_checked_and_counted() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    let base = "https://github.com/rust-lang/rust/blob/0123456/";
+    let long = format!("{base}{}", "a".repeat(400));
+    let err = sim.s.submit("rev-a", &id, linked(&["x".into()], &long), sim.now).unwrap_err().to_string();
+    assert!(err.contains("url") && err.contains("400"), "{err}");
+    for bad in ["src/\u{202e}gnp.exe", "src/a\u{1b}[31m", "src/\"onmouseover", "../../evil/repo/x", "src/<b>"] {
+        let err = sim.s.submit("rev-a", &id, linked(&["x".into()], &format!("{base}{bad}")), sim.now);
+        assert!(err.is_err(), "{bad}");
+    }
+    let url = format!("{base}src/{}#L1", "p".repeat(300));
+    let err = sim.s.submit("rev-a", &id, linked(&vec!["z".repeat(1700); 8], &url), sim.now).unwrap_err().to_string();
+    assert!(err.contains("16000"), "urls count towards the total: {err}");
+    sim.s.submit("rev-a", &id, linked(&vec!["z".repeat(1600); 8], &url), sim.now).unwrap();
+    sim.submit("rev-b", &id, &[]);
+
+    let change = AmendIn { url: Some(long), ..AmendIn::default() };
+    assert!(sim.s.amend("rev-a", &id, "F1", change, sim.now).is_err());
+    let change = AmendIn { url: Some(format!("{base}{}", "q".repeat(350))), text: Some("w".repeat(2000)), ..AmendIn::default() };
+    let err = sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap_err().to_string();
+    assert!(err.contains("16000"), "{err}");
+}
+
+#[test]
+fn over_long_free_text_is_refused_not_clipped() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let mut req = NewReview::new(PR);
+    req.note = "n".repeat(8001);
+    let err = sim.s.request_review("alice-codex", req, sim.now).unwrap_err().to_string();
+    assert!(err.contains("note") && err.contains("8000"), "{err}");
+    let id = sim.request("alice-codex", 2);
+    let err = sim.s.decline("rev-b", &id, &"d".repeat(1001), sim.now).unwrap_err().to_string();
+    assert!(err.contains("1000"), "{err}");
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "off by one")]);
+    sim.submit("rev-b", &id, &[]);
+    let err = sim.s.say("rev-b", &id, &"s".repeat(4001), sim.now).unwrap_err().to_string();
+    assert!(err.contains("4000"), "{err}");
+    let err = sim.s.withdraw("rev-a", &id, "F1", &"w".repeat(1001), sim.now).unwrap_err().to_string();
+    assert!(err.contains("1000"), "{err}");
+    assert!(sim.s.review(&id).unwrap().log.iter().all(|e| !e.text.contains('…')));
 }

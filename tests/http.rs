@@ -300,6 +300,16 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     assert!(!partial.text().await.unwrap().contains("<html"));
     let unchanged = http.get(format!("{base}/r/r1")).header("X-Amx-Partial", "1").header("If-None-Match", tag).send().await.unwrap();
     assert_eq!(unchanged.status(), 304, "the page's polls only fetch a changed page");
+
+    for path in ["/", "/r/r2"] {
+        let full = get(path).await.unwrap().text().await.unwrap();
+        let first = http.get(format!("{base}{path}")).header("X-Amx-Partial", "1").send().await.unwrap();
+        let tag = first.headers()["etag"].to_str().unwrap().to_string();
+        assert!(full.contains(&format!("data-etag='{tag}'")), "the page seeds its first poll's tag: {full}");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let again = http.get(format!("{base}{path}")).header("X-Amx-Partial", "1").header("If-None-Match", &tag).send().await.unwrap();
+        assert_eq!(again.status(), 304, "{path}: countdowns tick in the browser, not in the page");
+    }
     relay.running.stop().await;
 }
 
@@ -613,12 +623,14 @@ async fn downtime_after_a_crash_is_counted_from_the_last_heartbeat() {
 #[tokio::test(flavor = "multi_thread")]
 async fn requests_without_a_method_are_invalid() {
     let relay = start(None, vec![]).await;
-    for body in [json!({"jsonrpc":"2.0","id":1}), json!({"jsonrpc":"2.0","id":2,"method":5})] {
+    for body in [json!({"jsonrpc":"2.0","id":1}), json!({"jsonrpc":"2.0","id":2,"method":5}), json!({"jsonrpc":"2.0","id":null,"method":"ping"})] {
         let (status, v) = rpc(&relay.local, "someone", body.clone()).await;
         assert_eq!((status, v["error"]["code"].as_i64()), (200, Some(-32600)), "{body} -> {v}");
     }
     let (status, _) = rpc(&relay.local, "someone", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await;
     assert_eq!(status, 202);
+    let huge = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"say","arguments":{"review_id":"r1","message":"x".repeat(300_000)}}});
+    assert_eq!(rpc(&relay.local, "someone", huge).await.0, 413);
     relay.running.stop().await;
 }
 
@@ -669,7 +681,7 @@ async fn get_on(conn: &mut tokio::net::TcpStream, path: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn idle_connections_are_cut_off_and_loopback_is_never_refused() {
+async fn idle_connections_are_cut_off_and_loopback_has_its_own_cap() {
     let mut cfg = Config {
         port: 0,
         tailnet: false,
@@ -678,6 +690,7 @@ async fn idle_connections_are_cut_off_and_loopback_is_never_refused() {
     cfg.conn_limits = amx::server::ConnLimits {
         max: 3,
         per_ip: 3,
+        own: 5,
         header_timeout: Duration::from_secs(2),
     };
     let running = amx::start(cfg).await.unwrap();
@@ -688,8 +701,11 @@ async fn idle_connections_are_cut_off_and_loopback_is_never_refused() {
         idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
     }
     for (i, c) in idle.iter_mut().enumerate() {
-        assert!(!closed(c, Duration::from_millis(20)).await, "connection {i} admitted (loopback is over no cap)");
+        assert!(!closed(c, Duration::from_millis(20)).await, "connection {i} admitted (loopback is over neither max nor per_ip)");
     }
+    let mut over = tokio::net::TcpStream::connect(addr).await.unwrap();
+    assert!(closed(&mut over, Duration::from_secs(1)).await, "loopback still has a cap");
+    drop(over);
 
     assert!(get_on(&mut idle[0], "/api/reviews").await.starts_with("HTTP/1.1 200"), "admitted connections work");
     let mut slow = idle.pop().unwrap();
@@ -720,6 +736,13 @@ async fn loopback_waits_for_the_owner_then_takes_over_local_names() {
     let (status, v) = rpc(&format!("http://{}", starting.local_addr), "own-au", json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await;
     assert_eq!(status, 503);
     assert!(v.as_str().unwrap().contains("waiting for Tailscale"), "{v}");
+    let early = format!("http://{}", starting.local_addr);
+    let mcp = reqwest::Client::new().post(format!("{early}/mcp?agent=own-au")).json(&json!({})).send().await.unwrap();
+    assert_eq!((mcp.status().as_u16(), mcp.headers().get("retry-after").map(|v| v.to_str().unwrap())), (503, Some("10")));
+    for path in ["/", "/r/r1", "/api/reviews", "/static/app.js"] {
+        assert_eq!(reqwest::get(format!("{early}{path}")).await.unwrap().status(), 200, "{path} is read-only");
+    }
+    assert_eq!(reqwest::get(format!("{early}/api/obligation?agent=own-au")).await.unwrap().status(), 503);
     starting.stop().await;
 
     let up = write_script(
@@ -757,4 +780,19 @@ async fn a_dropped_connection_is_reported_as_such() {
     assert!(err.contains("closed the connection"), "{err}");
     let err = amx::client::Client::new("http://127.0.0.1:1", None, None).heartbeat().await.unwrap_err().to_string();
     assert!(err.contains("cannot reach the amx relay"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_config_is_refused_at_start() {
+    for (toml, key) in [
+        ("[consensus]\nconfirm_fraction = -0.5", "confirm_fraction"),
+        ("[consensus]\nconfirm_fraction = 1.0", "confirm_fraction"),
+        ("[consensus]\nreviewers = 0", "reviewers"),
+        ("[consensus]\nvote_rounds = 9", "vote_rounds"),
+        ("public_url = \"relay.example\"", "public_url"),
+    ] {
+        let cfg = Config { port: 0, tailnet: false, ..toml::from_str(toml).unwrap() };
+        let err = amx::start(cfg).await.err().expect(toml).to_string();
+        assert!(err.contains(key), "{err}");
+    }
 }

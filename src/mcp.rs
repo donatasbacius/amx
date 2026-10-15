@@ -515,6 +515,9 @@ pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, 
     let (Some(id), false) = (msg.get("id").cloned(), is_response) else {
         return None;
     };
+    if !(id.is_string() || id.is_number()) {
+        return Some(error_response(Value::Null, -32600, "invalid request: id must be a string or number"));
+    }
     let Some(method) = msg.get("method").and_then(Value::as_str) else {
         return Some(error_response(id, -32600, "invalid request: method must be a string"));
     };

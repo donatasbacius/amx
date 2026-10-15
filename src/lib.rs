@@ -85,22 +85,25 @@ async fn tailnet_listener(hub: &Hub) -> Result<tokio::net::TcpListener> {
     Ok(l)
 }
 
-/// Retries until Tailscale is up (e.g. at boot); loopback callers wait for the owner until then.
+/// Retries until Tailscale is up (e.g. at boot), warning every 5 minutes; loopback callers wait for
+/// the owner until then, except to read the web page.
 async fn tailnet_listener_loop(hub: Arc<Hub>) {
-    let mut warned = false;
+    let mut warned: Option<tokio::time::Instant> = None;
+    let mut pause = Duration::from_secs(1);
     loop {
         match tailnet_listener(&hub).await {
             Ok(l) => {
                 let _ = spawn_server(&hub, l, Listener::Tailnet).await;
                 return;
             }
-            Err(e) if !warned => {
+            Err(e) if warned.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) => {
                 tracing::warn!("tailnet listener not started: {e:#}; retrying");
-                warned = true;
+                warned = Some(tokio::time::Instant::now());
             }
             Err(_) => {}
         }
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_secs(10));
     }
 }
 
@@ -154,11 +157,7 @@ async fn alive_loop(hub: Arc<Hub>, path: std::path::PathBuf) {
 }
 
 pub async fn start(cfg: Config) -> Result<Running> {
-    if let Some(u) = &cfg.public_url
-        && server::url_host(u).is_none()
-    {
-        anyhow::bail!("public_url must be an http:// or https:// URL, got {u}");
-    }
+    cfg.validate()?;
     let ts = tailscale::Tailscale::new(if cfg.tailnet || cfg.tailnet_listen.is_some() {
         tailscale::find_bin(cfg.tailscale_bin.as_deref())
     } else {

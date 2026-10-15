@@ -11,7 +11,7 @@ use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,10 +26,12 @@ type St = State<Arc<Hub>>;
 /// Connection caps; fixed outside tests.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConnLimits {
-    /// Open connections over all listeners.
+    /// Open connections from other machines, over all listeners.
     pub max: usize,
-    /// Per peer address, except this machine's own.
+    /// Per peer address of another machine.
     pub per_ip: usize,
+    /// From this machine (loopback or its own Tailscale address), counted apart from `max`.
+    pub own: usize,
     /// Time a client gets to send a request's headers; also closes idle keep-alive connections.
     pub header_timeout: Duration,
 }
@@ -39,6 +41,7 @@ impl Default for ConnLimits {
         ConnLimits {
             max: 512,
             per_ip: 64,
+            own: 256,
             header_timeout: Duration::from_secs(15),
         }
     }
@@ -55,16 +58,19 @@ pub struct ConnSlot {
     ip: IpAddr,
 }
 
+/// Where this machine's own connections are counted.
+const OWN: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
 impl Conns {
-    /// This machine's own connections are neither refused nor counted.
-    pub fn admit(self: &Arc<Self>, ip: IpAddr, limits: &ConnLimits) -> Option<ConnSlot> {
+    pub fn admit(self: &Arc<Self>, ip: IpAddr, own: bool, limits: &ConnLimits) -> Option<ConnSlot> {
+        let ip = if own { OWN } else { ip };
         let mut open = self.open.lock().unwrap();
-        if ip != IpAddr::V4(Ipv4Addr::LOCALHOST) && ip != IpAddr::V6(Ipv6Addr::LOCALHOST) {
-            if open.values().sum::<usize>() >= limits.max || open.get(&ip).is_some_and(|n| *n >= limits.per_ip) {
-                return None;
-            }
-            *open.entry(ip).or_default() += 1;
+        let others: usize = open.iter().filter(|(k, _)| **k != OWN).map(|(_, n)| n).sum();
+        let n = open.get(&ip).copied().unwrap_or(0);
+        if (own && n >= limits.own) || (!own && (n >= limits.per_ip || others >= limits.max)) {
+            return None;
         }
+        *open.entry(ip).or_default() += 1;
         Some(ConnSlot { conns: self.clone(), ip })
     }
 }
@@ -89,6 +95,7 @@ pub async fn serve(hub: Arc<Hub>, listener: tokio::net::TcpListener, kind: Liste
     use tower::ServiceExt;
     let app = router(hub.clone(), kind);
     let limits = hub.cfg.conn_limits;
+    let me = listener.local_addr().map(|a| a.ip()).ok();
     let mut down = hub.shutdown.subscribe();
     let mut tasks = tokio::task::JoinSet::new();
     loop {
@@ -105,7 +112,8 @@ pub async fn serve(hub: Arc<Hub>, listener: tokio::net::TcpListener, kind: Liste
                 continue;
             }
         };
-        let Some(slot) = hub.conns.admit(addr.ip(), &limits) else {
+        let own = addr.ip().is_loopback() || Some(addr.ip()) == me;
+        let Some(slot) = hub.conns.admit(addr.ip(), own, &limits) else {
             tracing::debug!("refused a connection from {addr}: too many open");
             continue;
         };
@@ -147,6 +155,7 @@ pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
         .route("/api/watch", get(watch))
         .route("/api/obligation", get(obligation))
         .route("/mcp", post(mcp).get(mcp_get).delete(mcp_get))
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .layer(middleware::from_fn_with_state((hub.clone(), listener), identify))
         .with_state(hub)
 }
@@ -219,10 +228,14 @@ async fn identify(
     if agent_api && from_another_site(headers) {
         return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
     }
+    let read_only = req.method() == axum::http::Method::GET
+        && (path == "/" || ["/r/", "/static/", "/api/reviews"].iter().any(|p| path.starts_with(p)));
+    let owner = hub.owner.lock().unwrap().clone();
     let who = match listener {
-        Listener::Local if addr.ip().is_loopback() => match hub.owner.lock().unwrap().clone() {
+        Listener::Local if addr.ip().is_loopback() => match owner {
             Some(owner) => owner,
-            None => return (StatusCode::SERVICE_UNAVAILABLE, OWNER_UNKNOWN).into_response(),
+            None if read_only => return next.run(req).await,
+            None => return (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "10")], OWNER_UNKNOWN).into_response(),
         },
         Listener::Local => return (StatusCode::FORBIDDEN, "not a local caller").into_response(),
         Listener::Tailnet => match hub.ts.whois(addr.ip()).await {
@@ -456,23 +469,25 @@ mod tests {
     }
 
     #[test]
-    fn connections_are_capped_per_address_and_in_total_except_loopback() {
+    fn connections_are_capped_per_address_and_in_total_and_this_machines_apart() {
         let conns = Arc::new(Conns::default());
         let limits = ConnLimits {
             max: 3,
             per_ip: 2,
+            own: 4,
             header_timeout: Duration::from_secs(1),
         };
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        let a = conns.admit(ip("100.64.0.1"), &limits).unwrap();
-        let _a2 = conns.admit(ip("100.64.0.1"), &limits).unwrap();
-        assert!(conns.admit(ip("100.64.0.1"), &limits).is_none(), "per address");
-        let _b = conns.admit(ip("100.64.0.2"), &limits).unwrap();
-        assert!(conns.admit(ip("100.64.0.3"), &limits).is_none(), "in total");
-        let local = [conns.admit(ip("127.0.0.1"), &limits), conns.admit(ip("::1"), &limits), conns.admit(ip("127.0.0.1"), &limits)];
-        assert!(local.iter().all(Option::is_some), "loopback is never refused");
+        let a = conns.admit(ip("100.64.0.1"), false, &limits).unwrap();
+        let _a2 = conns.admit(ip("100.64.0.1"), false, &limits).unwrap();
+        assert!(conns.admit(ip("100.64.0.1"), false, &limits).is_none(), "per address");
+        let _b = conns.admit(ip("100.64.0.2"), false, &limits).unwrap();
+        assert!(conns.admit(ip("100.64.0.3"), false, &limits).is_none(), "in total");
+        let own: Vec<_> = ["127.0.0.1", "::1", "127.0.0.2", "100.64.0.9"].map(|s| conns.admit(ip(s), true, &limits)).into();
+        assert!(own.iter().all(Option::is_some), "this machine's own are outside the other caps");
+        assert!(conns.admit(ip("127.0.0.3"), true, &limits).is_none(), "but share a cap of their own");
         drop(a);
-        assert!(conns.admit(ip("100.64.0.3"), &limits).is_some(), "a closed connection frees its slot");
+        assert!(conns.admit(ip("100.64.0.3"), false, &limits).is_some(), "a closed connection frees its slot");
     }
 
     #[test]

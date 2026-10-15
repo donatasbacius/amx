@@ -34,3 +34,5 @@ tempfile = "3.27.0"
 lto = "thin"
 codegen-units = 4
 strip = true
+# A panic exits, so the service manager restarts the relay instead of it running on with a poisoned state lock.
+panic = "abort"

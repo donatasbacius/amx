@@ -33,7 +33,7 @@
   function deadlines() {
     document.querySelectorAll("[data-deadline]").forEach(function (d) {
       var at = Number(d.getAttribute("data-deadline"));
-      if (at) d.textContent = dur(at - Date.now());
+      if (at) d.textContent = dur(at - Date.now()) + " left";
     });
   }
 
@@ -73,7 +73,7 @@
   }
 
   // Polls instead of holding a connection open: browsers allow about six per host, for all tabs.
-  var tag = "", timer;
+  var tag, timer;
   var refresh = coalesce(function () {
     clearTimeout(timer);
     if (document.hidden) return;
@@ -96,6 +96,7 @@
   });
 
   document.addEventListener("DOMContentLoaded", function () {
+    tag = document.getElementById("main").getAttribute("data-etag") || "";
     times();
     deadlines();
     setInterval(times, 30000);

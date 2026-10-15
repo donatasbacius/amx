@@ -19,17 +19,19 @@ const MAX_EVENTS: usize = 200;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
 /// Event text one `wait` returns; the rest stays queued for the next call.
 const MAX_WAIT_BYTES: usize = 64 * 1024;
-const MAX_TEXT: usize = 8000;
+/// Characters in each text an agent sends (see `bounded`); longer ones are refused.
+const MAX_NOTE: usize = 8000;
 const MAX_SAY: usize = 4000;
+const MAX_FINDING: usize = 2000;
+const MAX_REASON: usize = 1000;
+const MAX_URL: usize = 400;
+/// Characters in one reviewer's findings, their links and its summary together, or in its vote reasons in a round.
+const MAX_REVIEWER_TEXT: usize = 16_000;
 /// Says, amendments and changed votes, per agent and review.
 const SAYS_PER_REVIEW: usize = 50;
 const SAYS_PER_MINUTE: usize = 10;
 const TALK: &[&str] = &["say", "amend", "revote"];
 const CLOSING_REMARKS: usize = 3;
-/// Characters in a finding or summary, and in all that one reviewer submits, or gives as vote reasons in a round.
-const MAX_FINDING: usize = 2000;
-const MAX_REVIEWER_TEXT: usize = 16_000;
-const MAX_REASON: usize = 1000;
 const AMENDS_PER_FINDING: u32 = 3;
 /// Offers listed in full in an idle reviewer's next actions.
 const OFFERS_SHOWN: usize = 2;
@@ -769,50 +771,48 @@ pub struct State {
     next_review: u64,
 }
 
-fn clip(s: &str, max: usize) -> String {
-    let s = s.trim();
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let cut = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
-    format!("{}…", &s[..cut])
-}
-
 fn valid_sha(s: &str) -> bool {
     (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn check_url(pr: &PrRef, url: &str) -> Result<()> {
+/// A finding's line link: printable ASCII under the PR's repository, nothing an HTML attribute or a terminal would act on.
+fn check_url(pr: &PrRef, url: &str) -> Result<String> {
+    let url = bounded(url, "finding url", MAX_URL)?;
     let prefix = format!("https://github.com/{}/{}/", pr.owner, pr.repo);
-    let lower = url.trim().to_ascii_lowercase();
-    if !lower.starts_with(&prefix) || url.chars().any(char::is_whitespace) {
-        bail!("finding url must be a line link into the PR's repository, e.g. {prefix}blob/<head_sha>/<path>#L<line> (got {url})");
+    let plain = url.chars().all(|c| c.is_ascii_graphic() && !"\"'<>\\^`{|}".contains(c));
+    if !url.to_ascii_lowercase().starts_with(&prefix) || !plain || url.split(['/', '?', '#']).any(|s| s == "..") {
+        bail!("finding url must be a line link into the PR's repository, e.g. {prefix}blob/<head_sha>/<path>#L<line>");
     }
-    Ok(())
+    Ok(url)
 }
 
 fn need_text(s: &str, what: &str) -> Result<String> {
-    let t = s.trim();
+    let t = bounded(s, what, MAX_FINDING)?;
     if t.is_empty() {
         bail!("{what} must not be empty");
     }
-    check_len(t, what, MAX_FINDING)?;
-    Ok(t.to_string())
+    Ok(t)
 }
 
-fn check_len(s: &str, what: &str, max: usize) -> Result<()> {
+/// Every text an agent sends goes through here: trimmed, and refused if longer than `max` characters.
+fn bounded(s: &str, what: &str, max: usize) -> Result<String> {
+    let s = s.trim();
     let n = s.chars().count();
     if n > max {
         bail!("{what} is {n} characters; at most {max} are allowed, so be more concise");
     }
-    Ok(())
+    Ok(s.to_string())
 }
 
-/// What `agent` has put in front of the other reviewers of `r`: its live findings and summary.
+fn finding_size(text: &str, url: Option<&str>) -> usize {
+    text.chars().count() + url.map_or(0, |u| u.chars().count())
+}
+
+/// What `agent` has put in front of the other reviewers of `r`: its live findings with their links, and its summary.
 fn reviewer_text(r: &Review, agent: &str) -> usize {
     let findings = r.findings.iter().filter(|f| f.by.as_deref() == Some(agent) && f.withdrawn.is_none());
     let summary = r.slot(agent).and_then(|s| s.submission.as_ref()).map_or(0, |s| s.summary.chars().count());
-    findings.map(|f| f.text.chars().count()).sum::<usize>() + summary
+    findings.map(|f| finding_size(&f.text, f.url.as_deref())).sum::<usize>() + summary
 }
 
 fn check_reviewer_text(n: usize) -> Result<()> {
@@ -1330,7 +1330,7 @@ impl State {
             pr,
             author: author.to_string(),
             author_login: login,
-            note: clip(&req.note, MAX_TEXT),
+            note: bounded(&req.note, "note", MAX_NOTE)?,
             params,
             created: now,
             ended: None,
@@ -1424,6 +1424,7 @@ impl State {
     }
 
     pub fn decline(&mut self, agent: &str, id: &str, reason: &str, now: Ms) -> Result<()> {
+        let reason = bounded(reason, "reason", MAX_REASON)?;
         let login = self.login_of(agent);
         let r = self.review_mut(id)?;
         r.check_login(agent, &login)?;
@@ -1433,7 +1434,6 @@ impl State {
         if !r.declined.insert(agent.to_string()) {
             return Ok(());
         }
-        let reason = clip(reason, 500);
         r.log(now, agent, "decline", if reason.is_empty() { "declined".to_string() } else { format!("declined: {reason}") });
         self.advance(now);
         Ok(())
@@ -1472,15 +1472,12 @@ impl State {
             let severity = Severity::parse(&f.severity)
                 .ok_or_else(|| anyhow!("finding {}: severity must be blocking, major, minor or nit", i + 1))?;
             let url = f.url.as_deref().map(str::trim).filter(|u| !u.is_empty());
-            if let Some(u) = url {
-                check_url(&r.pr, u).map_err(|e| anyhow!("finding {}: {e}", i + 1))?;
-            }
+            let url = url.map(|u| check_url(&r.pr, u)).transpose().map_err(|e| anyhow!("finding {}: {e}", i + 1))?;
             let text = need_text(&f.text, &format!("finding {}", i + 1))?;
-            parsed.push((severity, url.map(String::from), text));
+            parsed.push((severity, url, text));
         }
-        let summary = summary.trim().to_string();
-        check_len(&summary, "summary", MAX_FINDING)?;
-        check_reviewer_text(parsed.iter().map(|(_, _, t)| t.chars().count()).sum::<usize>() + summary.chars().count())?;
+        let summary = bounded(&summary, "summary", MAX_FINDING)?;
+        check_reviewer_text(parsed.iter().map(|(_, u, t)| finding_size(t, u.as_deref())).sum::<usize>() + summary.chars().count())?;
         for (severity, url, text) in parsed {
             r.next_finding += 1;
             r.findings.push(Finding {
@@ -1555,10 +1552,8 @@ impl State {
             if f.open_round != round {
                 bail!("{} is not open for voting in round {round}; {open}", f.id);
             }
-            let reason = v.reason.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
-            if let Some(why) = &reason {
-                check_len(why, &format!("your reason on {}", f.id), MAX_REASON)?;
-            }
+            let reason = v.reason.as_deref().map(|s| bounded(s, &format!("your reason on {}", f.id), MAX_REASON)).transpose()?;
+            let reason = reason.filter(|s| !s.is_empty());
             let severity = v
                 .severity
                 .as_deref()
@@ -1634,7 +1629,7 @@ impl State {
     }
 
     pub fn say(&mut self, agent: &str, id: &str, msg: &str, now: Ms) -> Result<()> {
-        let msg = clip(msg, MAX_SAY);
+        let msg = bounded(msg, "message", MAX_SAY)?;
         if msg.is_empty() {
             bail!("message must not be empty");
         }
@@ -1700,10 +1695,7 @@ impl State {
         let severity = severity
             .map(|s| Severity::parse(s).ok_or_else(|| anyhow!("severity must be blocking, major, minor or nit")))
             .transpose()?;
-        let url = url.map(str::trim).filter(|u| !u.is_empty());
-        if let Some(u) = url {
-            check_url(&pr, u)?;
-        }
+        let url = url.map(str::trim).filter(|u| !u.is_empty()).map(|u| check_url(&pr, u)).transpose()?;
         let new_text = new_text.map(|t| need_text(t, "text")).transpose()?;
         if severity.is_none() && url.is_none() && new_text.is_none() {
             bail!("nothing to amend: give severity, url and/or text");
@@ -1714,14 +1706,13 @@ impl State {
         if f.revision >= AMENDS_PER_FINDING {
             bail!("you have amended {} {AMENDS_PER_FINDING} times; withdraw it or `say` why it stands", f.id);
         }
-        if let Some(t) = &new_text {
-            check_reviewer_text(total - f.text.chars().count() + t.chars().count())?;
-        }
+        let after = finding_size(new_text.as_deref().unwrap_or(&f.text), url.as_deref().or(f.url.as_deref()));
+        check_reviewer_text(total - finding_size(&f.text, f.url.as_deref()) + after)?;
         if let Some(s) = severity {
             f.severity = s;
         }
-        if let Some(u) = url {
-            f.url = Some(u.to_string());
+        if url.is_some() {
+            f.url = url;
         }
         if let Some(t) = new_text {
             f.text = t;
@@ -1748,11 +1739,11 @@ impl State {
     }
 
     pub fn withdraw(&mut self, agent: &str, id: &str, fid: &str, reason: &str, now: Ms) -> Result<()> {
+        let reason = bounded(reason, "reason", MAX_REASON)?;
         let login = self.login_of(agent);
         let r = self.review_mut(id)?;
         r.check_login(agent, &login)?;
         let f = Self::own_finding(r, agent, fid)?;
-        let reason = clip(reason, 1000);
         f.withdrawn = Some(reason.clone());
         let fid = f.id.clone();
         r.log(now, agent, "withdraw", format!("withdrew {fid}. {reason}"));
