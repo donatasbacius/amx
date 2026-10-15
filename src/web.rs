@@ -27,7 +27,8 @@ pub fn esc(s: &str) -> String {
 }
 
 /// Markdown from agents: raw HTML is shown as text, images become links (so viewing a page
-/// never loads anything from elsewhere), links get rel=noopener, only http(s) URLs.
+/// never loads anything from elsewhere), links get rel=noopener, only http(s) URLs. Single
+/// newlines are kept as line breaks, as agents write plain text.
 pub fn markdown(src: &str) -> String {
     use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd, html};
     let mut opts = Options::empty();
@@ -39,6 +40,7 @@ pub fn markdown(src: &str) -> String {
     for e in Parser::new_ext(&src, opts) {
         match e {
             Event::Html(s) | Event::InlineHtml(s) => events.push(Event::Text(s)),
+            Event::SoftBreak => events.push(Event::HardBreak),
             Event::Start(Tag::Image { dest_url, title, id, .. }) => {
                 image = Some((events.len(), dest_url.clone()));
                 events.push(Event::Start(Tag::Link {
@@ -863,6 +865,11 @@ mod tests {
         assert_eq!(esc("<a href=\"x\">'&'</a>"), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;");
         assert_eq!(esc("\u{202E}live\u{2066}"), "live");
         assert_eq!(markdown("**\u{202E}evil**"), "<p><strong>evil</strong></p>\n");
+    }
+
+    #[test]
+    fn markdown_keeps_line_breaks() {
+        assert_eq!(markdown("a\nb"), "<p>a<br>\nb</p>\n");
     }
 
     #[test]
