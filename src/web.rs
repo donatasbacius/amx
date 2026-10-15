@@ -25,19 +25,42 @@ pub fn esc(s: &str) -> String {
     out
 }
 
-/// Markdown from agents: raw HTML is shown as text, links get rel=noopener, only http(s) URLs.
+/// Markdown from agents: raw HTML is shown as text, images become links (so viewing a page
+/// never loads anything from elsewhere), links get rel=noopener, only http(s) URLs.
 pub fn markdown(src: &str) -> String {
-    use pulldown_cmark::{Options, Parser, html};
+    use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd, html};
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
-    let events = Parser::new_ext(src, opts).map(|e| match e {
-        pulldown_cmark::Event::Html(s) | pulldown_cmark::Event::InlineHtml(s) => pulldown_cmark::Event::Text(s),
-        e => e,
-    });
+    let mut events = Vec::new();
+    let mut image = None;
+    for e in Parser::new_ext(src, opts) {
+        match e {
+            Event::Html(s) | Event::InlineHtml(s) => events.push(Event::Text(s)),
+            Event::Start(Tag::Image { dest_url, title, id, .. }) => {
+                image = Some((events.len(), dest_url.clone()));
+                events.push(Event::Start(Tag::Link {
+                    link_type: LinkType::Inline,
+                    dest_url,
+                    title,
+                    id,
+                }));
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some((start, url)) = image.take()
+                    && events.len() == start + 1
+                {
+                    events.push(Event::Text(url));
+                }
+                events.push(Event::End(TagEnd::Link));
+            }
+            e => events.push(e),
+        }
+    }
     let mut raw = String::new();
-    html::push_html(&mut raw, events);
+    html::push_html(&mut raw, events.into_iter());
     ammonia::Builder::default()
+        .rm_tags(["img"])
         .url_schemes(["http", "https"].into())
         .link_rel(Some("noopener noreferrer nofollow"))
         .clean(&raw)
@@ -844,6 +867,10 @@ mod tests {
         assert!(h.contains("href=\"https://github.com/a/b\""));
         assert!(h.contains("noopener"));
         assert!(markdown("returns Vec<String> now").contains("Vec&lt;String&gt;"));
+        let h = markdown("see ![pixel](https://tracker.example.invalid/p.png?leak=1) and ![](https://x.example/a.png)");
+        assert!(!h.contains("<img"), "{h}");
+        assert!(h.contains(r#"href="https://tracker.example.invalid/p.png?leak=1""#) && h.contains(">pixel</a>"), "{h}");
+        assert!(h.contains(">https://x.example/a.png</a>"), "{h}");
     }
 
     #[test]

@@ -20,7 +20,12 @@ pub struct Config {
     pub tailnet_listen: Option<SocketAddr>,
     pub timing: Timing,
     pub consensus: Consensus,
-    /// Finished reviews kept in memory for the web page and `review_status`.
+    /// Tests only; not read from the config file.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub conn_limits: crate::server::ConnLimits,
+    /// Finished reviews kept in memory for the web page and `review_status`, plus up to 10 that
+    /// failed before anyone took them.
     pub history: usize,
     /// Keep reviews and agents' pending events in this JSON file across restarts.
     pub state: Option<PathBuf>,
@@ -88,6 +93,7 @@ impl Default for Config {
             tailnet_listen: None,
             timing: Timing::default(),
             consensus: Consensus::default(),
+            conn_limits: crate::server::ConnLimits::default(),
             history: 50,
             state: None,
         }

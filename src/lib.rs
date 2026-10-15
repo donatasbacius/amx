@@ -41,18 +41,7 @@ impl Running {
 }
 
 fn spawn_server(hub: &Arc<Hub>, listener: tokio::net::TcpListener, kind: Listener) -> JoinHandle<()> {
-    let app = server::router(hub.clone(), kind);
-    let mut down = hub.shutdown.subscribe();
-    tokio::spawn(async move {
-        let res = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(async move {
-                let _ = down.wait_for(|d| *d).await;
-            })
-            .await;
-        if let Err(e) = res {
-            tracing::error!("server error: {e}");
-        }
-    })
+    tokio::spawn(server::serve(hub.clone(), listener, kind))
 }
 
 /// Where links to the web page point when `public_url` isn't set.
