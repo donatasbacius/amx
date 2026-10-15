@@ -681,3 +681,87 @@ fn closing_remarks_after_the_result_do_not_change_it() {
     assert!(amx::web::render_review(r, sim.now).contains("fixing the off-by-one"));
     assert!(sim.s.next_actions("alice-codex", sim.now).is_empty() && sim.s.busy_with("rev-a").is_none());
 }
+
+fn reload(s: &State, saved: Ms, now: Ms) -> State {
+    let json = serde_json::to_string(&s.snapshot(saved)).unwrap();
+    let mut fresh = State::new(Timing::default(), Consensus::default(), 50);
+    fresh.web_url = s.web_url.clone();
+    fresh.restore(serde_json::from_str(&json).unwrap(), now);
+    fresh
+}
+
+#[test]
+fn state_survives_a_snapshot_and_the_review_carries_on() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let done = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &done);
+    sim.accept("rev-b", &done);
+    sim.submit("rev-a", &done, &[("major", "cache never invalidated")]);
+    sim.submit("rev-b", &done, &[]);
+    sim.vote("rev-b", &done, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&done), Phase::Done);
+    sim.s.say("alice-codex", &done, "Thanks", sim.now).unwrap();
+    for a in ["alice-codex", "rev-a", "rev-b"] {
+        sim.events(a);
+    }
+
+    let mut req = NewReview::new("https://github.com/rust-lang/rust/pull/2");
+    req.reviewers = Some(2);
+    let open = sim.s.request_review("alice-codex", req, sim.now).unwrap();
+    sim.accept("rev-a", &open);
+    sim.accept("rev-b", &open);
+    sim.submit("rev-a", &open, &[("minor", "missing doc comment")]);
+    sim.events("rev-a");
+    assert!(sim.s.has_undelivered("rev-b") && sim.s.has_undelivered("alice-codex"));
+
+    let mut s = reload(&sim.s, sim.now, sim.now);
+    for id in [&done, &open] {
+        assert_eq!(format!("{:?}", s.review(id).unwrap()), format!("{:?}", sim.s.review(id).unwrap()));
+    }
+    assert_eq!(s.reviews.len(), 2);
+    for a in sim.s.agents.all() {
+        let b = s.agents.get(&a.name).unwrap();
+        assert_eq!((&b.login, b.role, b.last_seen), (&a.login, a.role, a.last_seen));
+        assert_eq!(s.peek_events(&a.name, 0), sim.s.peek_events(&a.name, 0));
+        assert_eq!(s.has_undelivered(&a.name), sim.s.has_undelivered(&a.name));
+    }
+    assert_eq!(s.agents.all().count(), sim.s.agents.all().count());
+    assert!(s.touch("rev-a", &who("mallory@example.com"), None, sim.now).is_err(), "name stays bound to its login");
+    let next = s.request_review("rev-a", NewReview::new("https://github.com/rust-lang/rust/pull/3"), sim.now).unwrap();
+    assert_eq!(next, "r3");
+
+    let later = sim.now + 3_600_000;
+    let shifted = reload(&sim.s, sim.now, later);
+    let (before, after) = (sim.s.review(&open).unwrap(), shifted.review(&open).unwrap());
+    assert_eq!(after.deadline, before.deadline + 3_600_000, "time left is kept across the outage");
+    assert_eq!(shifted.review(&done).unwrap().deadline, sim.s.review(&done).unwrap().deadline);
+    assert!(shifted.agents.online("rev-b", later));
+
+    sim.s = reload(&sim.s, sim.now, sim.now);
+    sim.submit("rev-b", &open, &[]);
+    assert_eq!(sim.phase(&open), Phase::Voting(1));
+    sim.vote("rev-b", &open, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&open), Phase::Done);
+    assert_eq!(sim.verdict(&open), Verdict::Approve);
+    let result = sim.events("alice-codex");
+    assert!(result.contains("Reviewers assigned") && result.contains("APPROVE"), "{result}");
+}
+
+#[test]
+fn reviewers_lost_in_a_restart_are_dropped_after_the_usual_silence() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[]);
+    let now = sim.now + 86_400_000;
+    sim.s = reload(&sim.s, sim.now, now);
+    sim.now = now;
+    sim.leave("rev-b");
+    sim.advance(290);
+    assert!(sim.s.review(&id).unwrap().slot("rev-b").unwrap().active());
+    sim.advance(20);
+    let r = sim.s.review(&id).unwrap();
+    assert!(r.slot("rev-b").unwrap().dropped.is_some());
+    assert_eq!(r.phase, Phase::Done);
+}

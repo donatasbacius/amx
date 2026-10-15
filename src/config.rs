@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +20,8 @@ pub struct Config {
     pub consensus: Consensus,
     /// Finished reviews kept in memory for the web page and `review_status`.
     pub history: usize,
+    /// Keep reviews and agents' pending events in this JSON file across restarts.
+    pub state: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -46,7 +48,7 @@ impl Default for Timing {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Consensus {
     pub reviewers: usize,
@@ -80,6 +82,7 @@ impl Default for Config {
             timing: Timing::default(),
             consensus: Consensus::default(),
             history: 50,
+            state: None,
         }
     }
 }
@@ -120,11 +123,12 @@ mod tests {
 
     #[test]
     fn parses_partial_config() {
-        let c: Config = toml::from_str("port = 9000\n[timing]\nvote_secs = 60\n[consensus]\nreviewers = 3").unwrap();
+        let c: Config = toml::from_str("port = 9000\nstate = \"/var/lib/amx/state.json\"\n[timing]\nvote_secs = 60\n[consensus]\nreviewers = 3").unwrap();
         assert_eq!(c.port, 9000);
         assert_eq!(c.timing.vote_secs, 60);
         assert_eq!(c.timing.offer_secs, 120);
         assert_eq!(c.consensus.reviewers, 3);
+        assert_eq!(c.state.as_deref(), Some(Path::new("/var/lib/amx/state.json")));
         assert!(c.tailnet);
         assert!(toml::from_str::<Config>("prot = 1").is_err());
     }

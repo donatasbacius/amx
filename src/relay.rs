@@ -98,7 +98,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub seq: u64,
     pub at: Ms,
@@ -106,7 +106,7 @@ pub struct AgentEvent {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub name: String,
     pub login: String,
@@ -115,6 +115,7 @@ pub struct Agent {
     pub first_seen: Ms,
     pub last_seen: Ms,
     /// Requests currently blocked in `wait` (or a watcher) for this agent.
+    #[serde(skip)]
     pub waiting: u32,
     events: VecDeque<AgentEvent>,
     next_seq: u64,
@@ -163,7 +164,7 @@ impl Agents {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "phase", content = "round")]
 pub enum Phase {
     Offering,
@@ -189,7 +190,7 @@ impl Phase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ReviewParams {
     pub reviewers: usize,
     pub consensus: Consensus,
@@ -198,7 +199,7 @@ pub struct ReviewParams {
     pub vote_secs: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Submission {
     pub at: Ms,
     pub head_sha: String,
@@ -206,7 +207,7 @@ pub struct Submission {
     pub summary: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Slot {
     pub agent: String,
     pub login: String,
@@ -221,14 +222,14 @@ impl Slot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Choice {
     Agree,
     Disagree,
     Duplicate(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vote {
     pub choice: Choice,
     /// On an agree vote: the severity the voter thinks is fair, when it differs.
@@ -239,7 +240,7 @@ pub struct Vote {
     pub at: Ms,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     Confirmed,
     Rejected,
@@ -248,7 +249,7 @@ pub enum Status {
     Withdrawn,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
     pub status: Status,
     pub severity: Severity,
@@ -259,7 +260,7 @@ pub struct Outcome {
     pub disagree: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub id: String,
     /// `None` for findings carried over from the previous review into a re-review.
@@ -275,22 +276,22 @@ pub struct Finding {
     pub outcome: Option<Outcome>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub at: Ms,
     pub who: String,
-    pub kind: &'static str,
+    pub kind: String,
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewResult {
     pub verdict: Verdict,
     pub at: Ms,
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Review {
     pub id: String,
     pub pr: PrRef,
@@ -375,7 +376,7 @@ impl Review {
         self.log.push(LogEntry {
             at,
             who: who.to_string(),
-            kind,
+            kind: kind.to_string(),
             text: text.into(),
         });
     }
@@ -564,6 +565,18 @@ pub struct OnlineAgent {
 
 type Fingerprint = (Vec<(String, bool)>, usize, Vec<(String, Phase, usize)>);
 
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// What `--state` keeps across restarts: reviews, agents' bindings and undelivered events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub version: u32,
+    pub saved_at: Ms,
+    next_review: u64,
+    agents: Vec<Agent>,
+    pub reviews: Vec<Review>,
+}
+
 pub struct State {
     pub agents: Agents,
     pub reviews: Vec<Review>,
@@ -621,6 +634,46 @@ impl State {
         }
     }
 
+    pub fn snapshot(&self, now: Ms) -> Snapshot {
+        let agents = self
+            .agents
+            .all()
+            .map(|a| {
+                let mut a = a.clone();
+                if a.waiting > 0 {
+                    a.last_seen = now;
+                }
+                a
+            })
+            .collect();
+        Snapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at: now,
+            next_review: self.next_review,
+            agents,
+            reviews: self.reviews.clone(),
+        }
+    }
+
+    /// Loads a snapshot as if the relay's clock had stopped while it was down: unfinished
+    /// deadlines and agents' silence resume where they were.
+    pub fn restore(&mut self, snap: Snapshot, now: Ms) {
+        let down = now.saturating_sub(snap.saved_at);
+        self.next_review = snap.next_review;
+        self.agents.map = snap
+            .agents
+            .into_iter()
+            .map(|mut a| {
+                a.last_seen = (a.last_seen + down).min(now);
+                (a.name.clone(), a)
+            })
+            .collect();
+        self.reviews = snap.reviews;
+        for r in self.reviews.iter_mut().filter(|r| r.phase.active()) {
+            r.deadline += down;
+        }
+    }
+
     pub fn review(&self, id: &str) -> Option<&Review> {
         let id = id.trim();
         self.reviews.iter().find(|r| r.id.eq_ignore_ascii_case(id))
@@ -631,7 +684,7 @@ impl State {
         self.reviews
             .iter_mut()
             .find(|r| r.id.eq_ignore_ascii_case(id))
-            .ok_or_else(|| anyhow!("no review {id} (the relay keeps reviews in memory only; it may have restarted)"))
+            .ok_or_else(|| anyhow!("no review {id} (the relay may have restarted)"))
     }
 
     /// Records that `name` is alive and binds the name to the caller's Tailscale login.

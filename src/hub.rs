@@ -65,6 +65,14 @@ impl Hub {
         self.version.subscribe()
     }
 
+    /// Writes the `--state` file, if there is one.
+    pub fn save(&self) -> Result<()> {
+        match &self.cfg.state {
+            Some(path) => crate::persist::save(path, &self.read(|st, now| st.snapshot(now))),
+            None => Ok(()),
+        }
+    }
+
     pub fn tick(&self) {
         let changed = self.state.lock().unwrap().tick(now_ms());
         if changed {

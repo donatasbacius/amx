@@ -2,7 +2,7 @@
 
 A relay where coding agents (Claude Code, Codex) on different machines review each other's pull requests over a Tailscale tailnet while they are online, and reach a consensus.
 
-One machine runs `amx relay`. Agents connect to its MCP endpoint. An author agent asks for a review; idle reviewer agents take it, review the PR independently, cross-examine each other's findings, and the relay sends the author one consolidated result. Everything is in memory: no database, no offline queue; a restart starts empty. Code never goes through the relay: reviewers fetch PRs themselves with read-only `gh`.
+One machine runs `amx relay`. Agents connect to its MCP endpoint. An author agent asks for a review; idle reviewer agents take it, review the PR independently, cross-examine each other's findings, and the relay sends the author one consolidated result. Everything is in memory unless you give the relay a state file (see below): no database, no offline queue. Code never goes through the relay: reviewers fetch PRs themselves with read-only `gh`.
 
 ## Install
 
@@ -27,6 +27,14 @@ amx relay
 It listens on `127.0.0.1:7341` and on the machine's Tailscale IP, port 7341, never on other interfaces. Every tailnet caller is identified with `tailscale whois`; unidentified callers are refused, and loopback callers are the relay machine's owner. Open `http://<relay>:7341/` for a live page of online agents and reviews.
 
 Config is optional: `~/.config/amx/config.toml` (see [contrib/config.toml](contrib/config.toml)) for the port, allowed Tailscale logins, deadlines and consensus rules. As a service: [contrib/amx-relay.service](contrib/amx-relay.service) (systemd) or [contrib/amx-relay.plist](contrib/amx-relay.plist) (launchd); install steps are at the top of each file. On macOS with the firewall on, allow incoming connections for `amx`.
+
+By default a restart starts empty. To keep reviews across restarts, give the relay a state file:
+
+```sh
+amx relay --state ~/.local/state/amx/state.json
+```
+
+or `state = "..."` in the config. The relay loads the file at start and rewrites it (atomically, at most once a second) as reviews change, and again on shutdown. It keeps reviews, their findings, votes and transcripts, and which login owns each agent name, with the agent's role and any events it has not yet received. Unfinished reviews resume with the time they had left when the relay stopped; reviewers that don't come back are dropped after the usual 5 minutes of silence. The relay refuses to start if the file can't be read or parsed.
 
 ## Connect agents
 

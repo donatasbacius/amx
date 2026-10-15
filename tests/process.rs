@@ -21,9 +21,13 @@ impl Drop for Kill {
 }
 
 fn relay() -> (Kill, String) {
-    let port = free_port();
+    relay_with(free_port(), &[])
+}
+
+fn relay_with(port: u16, extra: &[&str]) -> (Kill, String) {
     let child = Command::new(BIN)
         .args(["relay", "--no-tailnet", "--port", &port.to_string()])
+        .args(extra)
         .env("XDG_CONFIG_HOME", "/nonexistent")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -45,6 +49,62 @@ fn missing_explicit_config_is_an_error() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+}
+
+fn request_review(url: &str, pr: &str) -> Value {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"request_review","arguments":{{"pr_url":"{pr}","reviewers":1}}}}}}"#
+    );
+    let out = Command::new("curl")
+        .args(["-sS", "-H", "content-type: application/json", "-d", &body])
+        .arg(format!("{url}/mcp?agent=owner-claude"))
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn get(url: &str) -> String {
+    let out = Command::new("curl").args(["-sS", url]).output().unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn state_file_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("amx/state.json");
+    let state = state.to_str().unwrap();
+    let port = free_port();
+    let (mut relay, url) = relay_with(port, &["--state", state]);
+    let r = request_review(&url, "https://github.com/rust-lang/rust/pull/77");
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let status = Command::new("kill").args(["-TERM", &relay.0.id().to_string()]).status().unwrap();
+    assert!(status.success());
+    assert!(relay.0.wait().unwrap().success());
+    let saved = std::fs::read_to_string(state).unwrap();
+    assert!(saved.contains("\"version\":1") && saved.contains("\"number\":77"), "{saved}");
+
+    let (_relay, url) = relay_with(port, &["--state", state]);
+    let page = get(&format!("{url}/r/r1"));
+    assert!(page.contains("rust-lang/rust#77"), "{page}");
+    let r = request_review(&url, "https://github.com/rust-lang/rust/pull/78");
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("r2"), "{r}");
+}
+
+#[test]
+fn unreadable_state_file_is_refused_and_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.json");
+    std::fs::write(&state, "{\"version\":1,\"reviews\":[").unwrap();
+    let out = Command::new(BIN)
+        .args(["relay", "--no-tailnet", "--port", &free_port().to_string(), "--state"])
+        .arg(&state)
+        .env("XDG_CONFIG_HOME", "/nonexistent")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains(state.to_str().unwrap()) && err.contains("not valid"), "{err}");
+    assert_eq!(std::fs::read_to_string(&state).unwrap(), "{\"version\":1,\"reviews\":[");
 }
 
 fn hook(url: &str, agent: &str, extra: &[&str]) -> String {

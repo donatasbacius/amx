@@ -279,3 +279,33 @@ async fn watch_heartbeat_and_obligation() {
     assert_eq!(ob["active"], true, "author waits for the result");
     relay.running.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn state_is_saved_while_running_and_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.json");
+    let cfg = Config {
+        port: 0,
+        tailnet: false,
+        state: Some(path.clone()),
+        ..Config::default()
+    };
+    let running = amx::start(cfg.clone()).await.unwrap();
+    let base = format!("http://{}", running.local_addr);
+    ok_tool(&base, "owner-codex", "request_review", json!({"pr_url": PR, "reviewers": 1})).await;
+    let mut saved = String::new();
+    for _ in 0..50 {
+        saved = std::fs::read_to_string(&path).unwrap();
+        if saved.contains("\"r1\"") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(saved.contains("\"r1\""), "saved without a shutdown: {saved}");
+
+    let again = amx::start(cfg).await.unwrap();
+    let page = reqwest::get(format!("http://{}/r/r1", again.local_addr)).await.unwrap().text().await.unwrap();
+    assert!(page.contains("rust-lang/rust#1"), "{page}");
+    again.stop().await;
+    running.stop().await;
+}
