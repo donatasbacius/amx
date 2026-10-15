@@ -3,6 +3,7 @@ pub mod config;
 pub mod hooks;
 pub mod hub;
 pub mod mcp;
+pub mod persist;
 pub mod prurl;
 pub mod relay;
 pub mod server;
@@ -32,6 +33,9 @@ impl Running {
             if tokio::time::timeout(Duration::from_millis(500), &mut t).await.is_err() {
                 t.abort();
             }
+        }
+        if let Err(e) = self.hub.save() {
+            tracing::error!("{e:#}");
         }
     }
 }
@@ -114,6 +118,26 @@ async fn tick_loop(hub: Arc<Hub>) {
     }
 }
 
+/// Saves at most once a second while the state keeps changing.
+async fn persist_loop(hub: Arc<Hub>) {
+    let mut rx = hub.subscribe();
+    let mut down = hub.shutdown.subscribe();
+    loop {
+        tokio::select! {
+            r = rx.changed() => if r.is_err() { return },
+            _ = down.wait_for(|d| *d) => return,
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = down.wait_for(|d| *d) => return,
+        }
+        rx.borrow_and_update();
+        if let Err(e) = hub.save() {
+            tracing::error!("{e:#}");
+        }
+    }
+}
+
 pub async fn start(cfg: Config) -> Result<Running> {
     let ts = tailscale::Tailscale::new(if cfg.tailnet || cfg.tailnet_listen.is_some() {
         tailscale::find_bin(cfg.tailscale_bin.as_deref())
@@ -121,6 +145,14 @@ pub async fn start(cfg: Config) -> Result<Running> {
         None
     });
     let hub = Hub::new(cfg, ts);
+    if let Some(path) = &hub.cfg.state {
+        if let Some(snap) = persist::load(path)? {
+            let n = snap.reviews.len();
+            hub.write(|st, now| st.restore(snap, now));
+            tracing::info!("restored {n} review(s) from {}", path.display());
+        }
+        hub.save()?;
+    }
     let local_addr = SocketAddr::from(([127, 0, 0, 1], hub.cfg.port));
     let local = tokio::net::TcpListener::bind(local_addr)
         .await
@@ -130,6 +162,9 @@ pub async fn start(cfg: Config) -> Result<Running> {
     hub.set_web_url(&format!("http://{local_addr}"));
     tracing::info!("amx relay listening on http://{local_addr} (this machine's owner)");
     let mut tasks = vec![spawn_server(&hub, local, Listener::Local), tokio::spawn(tick_loop(hub.clone()))];
+    if hub.cfg.state.is_some() {
+        tasks.push(tokio::spawn(persist_loop(hub.clone())));
+    }
     if hub.cfg.tailnet || hub.cfg.tailnet_listen.is_some() {
         tasks.push(tokio::spawn(tailnet_listener_loop(hub.clone())));
     }

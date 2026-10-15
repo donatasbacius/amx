@@ -55,7 +55,7 @@ enum HookEvent {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the relay (in memory; restart starts empty)
+    /// Run the relay
     Relay {
         /// Config file (default ~/.config/amx/config.toml)
         #[arg(long, env = "AMX_CONFIG")]
@@ -67,6 +67,9 @@ enum Cmd {
         no_tailnet: bool,
         #[arg(long)]
         tailscale_bin: Option<PathBuf>,
+        /// Keep reviews in this JSON file across restarts (default: memory only)
+        #[arg(long)]
+        state: Option<PathBuf>,
         /// TESTING ONLY: extra listener that applies tailnet (whois) identity rules
         #[arg(long, hide = true)]
         tailnet_listen: Option<SocketAddr>,
@@ -109,6 +112,7 @@ async fn run() -> Result<()> {
             port,
             no_tailnet,
             tailscale_bin,
+            state,
             tailnet_listen,
         } => {
             tracing_subscriber::fmt()
@@ -127,6 +131,7 @@ async fn run() -> Result<()> {
             }
             cfg.tailnet_listen = tailnet_listen.or(cfg.tailnet_listen);
             cfg.tailscale_bin = tailscale_bin.or(cfg.tailscale_bin);
+            cfg.state = state.or(cfg.state);
             let running = amx::start(cfg).await?;
             shutdown_signal().await;
             tracing::info!("shutting down");

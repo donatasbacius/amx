@@ -348,7 +348,7 @@ pub fn render_review(r: &Review, now: Ms) -> String {
             "<li class=\"k-{kind}\"><span class=\"when\">{time}</span> <b>{who}</b> <span class=\"kind\">{kind}</span> <div class=\"md\">{text}</div></li>",
             time = time_tag(e.at),
             who = esc(&e.who),
-            kind = esc(e.kind),
+            kind = esc(&e.kind),
             text = markdown(&e.text),
         );
     }
@@ -377,7 +377,7 @@ pub async fn review_page(
     let found = hub.read(|s, now| s.review(&id).map(|r| (render_review(r, now), format!("{} · {}", r.id, r.pr.short()))));
     let Some((main, title)) = found else {
         let main = format!(
-            "<nav class=\"crumbs\"><a href=\"/\">← relay</a></nav><h1>No review {}</h1><p class=\"empty\">The relay keeps reviews in memory; it may have restarted.</p>",
+            "<nav class=\"crumbs\"><a href=\"/\">← relay</a></nav><h1>No review {}</h1><p class=\"empty\">The relay may have restarted.</p>",
             esc(&id)
         );
         return (StatusCode::NOT_FOUND, Html(page("amx relay", &who, &main))).into_response();
