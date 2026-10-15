@@ -1,5 +1,5 @@
 use crate::hub::Hub;
-use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, NewReview, Role, SubmitIn, VoteIn};
+use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, Ms, NewReview, Role, State, SubmitIn, VoteIn};
 use crate::tailscale::Identity;
 use crate::text;
 use anyhow::{Result, anyhow};
@@ -170,6 +170,8 @@ struct WaitArgs {
     timeout_seconds: Option<u64>,
     #[serde(default)]
     progress: bool,
+    /// From `amx mcp`: the last `amx/seq` its client received.
+    after: Option<u64>,
 }
 
 /// `reviewers` was the count before it could name agents; a number is still accepted.
@@ -266,9 +268,10 @@ struct StatusArgs {
     review_id: Option<String>,
 }
 
-/// The NEXT lines for `actions`. A task whose full text is in one of `events` or in `seen` gets
-/// a one-line pointer, and the idle line is left out when an event already says what to do.
-pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], seen: &[String]) -> String {
+/// The NEXT lines for `actions`. A task whose full text is in one of `events`, or that was
+/// already owed before this call (`known`), gets a one-line pointer, and the idle line is left
+/// out when an event already says what to do.
+pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], known: &[String]) -> String {
     let has_next = |t: &str| t.lines().any(|l| l.starts_with("NEXT:"));
     if actions.is_empty() {
         return match role {
@@ -281,7 +284,7 @@ pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], seen: &[
     let lines: Vec<String> = actions
         .iter()
         .map(|a| match (&a.task, &a.short) {
-            (Some(t), Some(short)) if seen.contains(t) || events.iter().any(|e| e.task.as_ref() == Some(t)) => {
+            (Some(t), Some(short)) if known.contains(t) || events.iter().any(|e| e.task.as_ref() == Some(t)) => {
                 format!("NEXT: {short}")
             }
             _ if has_next(&a.text) => format!("[{}] {}", a.review, a.text),
@@ -291,32 +294,31 @@ pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], seen: &[
     lines.join("\n\n")
 }
 
-fn role_of(hub: &Hub, agent: &str) -> Role {
-    hub.read(|s, _| s.agents.get(agent).map(|a| a.role).unwrap_or(Role::Author))
+/// The NEXT lines owed now after `events` (pointing to `known` tasks), and whether any is urgent.
+fn next_after(s: &State, agent: &str, events: &[AgentEvent], known: &[String], now: Ms) -> (String, bool) {
+    let role = s.agents.get(agent).map(|a| a.role).unwrap_or(Role::Author);
+    let actions = s.next_actions(agent, now);
+    (next_text(&actions, role, events, known), actions.iter().any(|a| a.urgent))
 }
 
-/// The actions owed now, the tasks among them this session has already been given, and marks
-/// them all as given.
-fn owed(hub: &Hub, agent: &str, events: &[AgentEvent]) -> (Vec<Action>, Vec<String>) {
-    hub.write(|s, now| {
-        let actions = s.next_actions(agent, now);
-        let tasks: Vec<String> = actions.iter().filter_map(|a| a.task.clone()).collect();
-        let seen = tasks.iter().filter(|t| s.was_shown(agent, t)).cloned().collect();
-        let given: Vec<String> = tasks.into_iter().chain(events.iter().filter_map(|e| e.task.clone())).collect();
-        s.mark_shown(agent, &given);
-        (actions, seen)
-    })
+fn owed_tasks(s: &State, agent: &str, now: Ms) -> Vec<String> {
+    s.next_actions(agent, now).into_iter().filter_map(|a| a.task).collect()
 }
 
-/// Appends the NEXT lines; tasks shown here in full are not delivered again by `wait`.
-fn with_next(hub: &Hub, agent: &str, head: String) -> String {
-    let (actions, seen) = owed(hub, agent, &[]);
-    let tasks: Vec<String> = actions.iter().filter_map(|a| a.task.clone()).collect();
-    hub.write(|s, _| s.forget_tasks(agent, &tasks));
-    format!("{head}\n\n{}", next_text(&actions, role_of(hub, agent), &[], &seen))
+/// Appends the NEXT lines. A task already owed `before` the call is only pointed to (`wait`
+/// gives it in full); one this call gives in full isn't queued again for `wait`.
+fn with_next(hub: &Hub, agent: &str, before: &[String], head: String) -> String {
+    let next = hub.quiet(|s, now| {
+        let new: Vec<String> = owed_tasks(s, agent, now).into_iter().filter(|t| !before.contains(t)).collect();
+        s.forget_tasks(agent, &new);
+        next_after(s, agent, &[], before, now).0
+    });
+    format!("{head}\n\n{next}")
 }
 
-async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<String> {
+/// Runs one tool; `seq` is set when the result carries events to acknowledge.
+async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value, seq: &mut Option<u64>) -> Result<String> {
+    let before = hub.read(|s, now| owed_tasks(s, agent, now));
     match name {
         "hello" => {
             let r: RoleArgs = args(a)?;
@@ -328,24 +330,24 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
                     text::online(&s.online(now), agent),
                 )
             });
-            Ok(with_next(hub, agent, format!("{intro}\n\n{online}")))
+            Ok(with_next(hub, agent, &before, format!("{intro}\n\n{online}")))
         }
         "online" => Ok(hub.read(|s, now| text::online(&s.online(now), agent))),
         "wait" => {
             let w: WaitArgs = args(a)?;
             let secs = w.timeout_seconds.unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX);
-            let events = hub.wait(agent, Duration::from_secs(secs), w.progress).await;
-            let (actions, seen) = owed(hub, agent, &events);
-            if !events.is_empty() || actions.iter().any(|a| a.task.as_ref().is_some_and(|t| !seen.contains(t))) {
-                // Saved before replying, so a crash doesn't hand the same events or tasks out again.
-                if let Err(e) = hub.save() {
-                    tracing::error!("{e:#}");
-                }
+            let (events, reached) = hub.wait(agent, Duration::from_secs(secs), w.progress, w.after).await;
+            if w.after.is_some() {
+                *seq = Some(reached);
+            } else if !events.is_empty()
+                && let Err(e) = hub.save()
+            {
+                // Saved before replying, so a crash doesn't hand the same events out again.
+                tracing::error!("{e:#}");
             }
-            let role = role_of(hub, agent);
-            let next = next_text(&actions, role, &events, &seen);
+            let (next, urgent) = hub.read(|s, now| next_after(s, agent, &events, &[], now));
             Ok(match (events.is_empty(), next.is_empty()) {
-                (true, _) if actions.iter().any(|a| a.urgent) => next,
+                (true, _) if urgent => next,
                 (true, _) => format!("No new events.\n\n{next}"),
                 (false, true) => text::events(&events),
                 (false, false) => format!("{}\n\n===\n{next}", text::events(&events)),
@@ -388,17 +390,17 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
             } else {
                 format!("Review {id} requested from {}; {idle} of them idle now (busy ones are offered it if they free up before the offer closes).", picked.join(", "))
             };
-            Ok(with_next(hub, agent, head))
+            Ok(with_next(hub, agent, &before, head))
         }
         "accept_review" => {
             let r: IdArgs = args(a)?;
             hub.write(|s, now| s.accept(agent, &r.review_id, now))?;
-            Ok(with_next(hub, agent, format!("You accepted {}.", r.review_id)))
+            Ok(with_next(hub, agent, &before, format!("You accepted {}.", r.review_id)))
         }
         "decline_review" => {
             let r: IdArgs = args(a)?;
             hub.write(|s, now| s.decline(agent, &r.review_id, &r.reason, now))?;
-            Ok(with_next(hub, agent, format!("Declined {}.", r.review_id)))
+            Ok(with_next(hub, agent, &before, format!("Declined {}.", r.review_id)))
         }
         "submit_findings" => {
             let r: SubmitArgs = args(a)?;
@@ -418,7 +420,7 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
                 findings,
             };
             let n = hub.write(|s, now| s.submit(agent, &r.review_id, sub, now))?;
-            Ok(with_next(hub, agent, format!("Submitted {n} finding(s) for {}.", r.review_id)))
+            Ok(with_next(hub, agent, &before, format!("Submitted {n} finding(s) for {}.", r.review_id)))
         }
         "vote" => {
             let r: VoteArgs = args(a)?;
@@ -438,12 +440,12 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
             if !v.ignored.is_empty() {
                 head.push_str(&format!(" Ignored your votes on {}: withdrawn by their authors.", v.ignored.join(", ")));
             }
-            Ok(with_next(hub, agent, head))
+            Ok(with_next(hub, agent, &before, head))
         }
         "say" => {
             let r: SayArgs = args(a)?;
             hub.write(|s, now| s.say(agent, &r.review_id, &r.text, now))?;
-            Ok(with_next(hub, agent, format!("Posted to {}.", r.review_id)))
+            Ok(with_next(hub, agent, &before, format!("Posted to {}.", r.review_id)))
         }
         "amend_finding" => {
             let r: AmendArgs = args(a)?;
@@ -453,20 +455,23 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
                 text: r.text,
             };
             hub.write(|s, now| s.amend(agent, &r.review_id, &r.finding, change, now))?;
-            if !r.reason.is_empty() {
-                let _ = hub.write(|s, now| s.say(agent, &r.review_id, &r.reason, now));
+            let mut head = format!("Amended {}.", r.finding);
+            if !r.reason.is_empty()
+                && let Err(e) = hub.write(|s, now| s.say(agent, &r.review_id, &r.reason, now))
+            {
+                head.push_str(&format!(" Your reason was not posted: {e:#}"));
             }
-            Ok(with_next(hub, agent, format!("Amended {}.", r.finding)))
+            Ok(with_next(hub, agent, &before, head))
         }
         "withdraw_finding" => {
             let r: AmendArgs = args(a)?;
             hub.write(|s, now| s.withdraw(agent, &r.review_id, &r.finding, &r.reason, now))?;
-            Ok(with_next(hub, agent, format!("Withdrew {}.", r.finding)))
+            Ok(with_next(hub, agent, &before, format!("Withdrew {}.", r.finding)))
         }
         "request_rereview" => {
             let r: RereviewArgs = args(a)?;
             let id = hub.write(|s, now| s.rereview(agent, &r.review_id, &r.new_head_sha, &r.note, now))?;
-            Ok(with_next(hub, agent, format!("Re-review {id} requested (follows {}).", r.review_id)))
+            Ok(with_next(hub, agent, &before, format!("Re-review {id} requested (follows {}).", r.review_id)))
         }
         "review_status" => {
             let r: StatusArgs = args(a)?;
@@ -490,7 +495,7 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
                     } else {
                         format!("Your reviews in progress:\n{}", mine.join("\n"))
                     };
-                    Ok(with_next(hub, agent, head))
+                    Ok(with_next(hub, agent, &before, head))
                 }
             }
         }
@@ -552,18 +557,20 @@ pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, 
         "tools/list" => Some(ok(id, json!({ "tools": tools() }))),
         "tools/call" => {
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+            let mut seq = None;
             let res = match touched {
-                Ok(()) => call_tool(hub, agent, tool, args).await,
+                Ok(()) => call_tool(hub, agent, tool, args, &mut seq).await,
                 Err(e) => Err(e),
             };
             let (text, is_error) = match res {
                 Ok(t) => (t, false),
                 Err(e) => (format!("Error: {e:#}"), true),
             };
-            Some(ok(
-                id,
-                json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }),
-            ))
+            let mut result = json!({ "content": [{ "type": "text", "text": text }], "isError": is_error });
+            if let Some(n) = seq {
+                result["_meta"] = json!({ "amx/seq": n });
+            }
+            Some(ok(id, result))
         }
         "resources/list" => Some(ok(id, json!({ "resources": [] }))),
         "prompts/list" => Some(ok(id, json!({ "prompts": [] }))),

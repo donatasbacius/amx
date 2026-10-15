@@ -430,7 +430,7 @@ fn tailnet_links_prefer_the_magicdns_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wait_points_to_tasks_instead_of_repeating_them() {
+async fn owed_tasks_are_given_in_full_once_per_result() {
     let relay = start(None, vec![]).await;
     let base = relay.local.clone();
     for rev in ["rev-a", "rev-b"] {
@@ -450,8 +450,15 @@ async fn wait_points_to_tasks_instead_of_repeating_them() {
     let last = ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[{"severity":"nit","text":"rename x"}]})).await;
     assert!(last.contains("You must vote on: F1, F2.") && last.matches("cache never invalidated").count() == 1, "{last}");
     assert!(!last.contains("finding: \"F3\""), "the example never names your own finding: {last}");
-    let owed = ok_tool(&base, "rev-b", "wait", json!({})).await;
-    assert_eq!(owed, "NEXT: r1: vote on F1, F2 as described above.", "a task already given is only pointed to");
+    let said = ok_tool(&base, "rev-b", "say", json!({"review_id":"r1","text":"Looking at F1."})).await;
+    assert!(said.ends_with("NEXT: r1: vote on F1, F2 as described above.") && !said.contains("cache never"), "a task owed before the call is pointed to: {said}");
+    ok_tool(&base, "author", "wait", json!({"timeout_seconds": 1})).await;
+    let status = ok_tool(&base, "rev-b", "review_status", json!({})).await;
+    assert!(status.ends_with("NEXT: r1: vote on F1, F2 as described above."), "{status}");
+    for _ in 0..2 {
+        let owed = ok_tool(&base, "rev-b", "wait", json!({})).await;
+        assert!(owed.contains("You must vote on: F1, F2.") && owed.matches("cache never invalidated").count() == 1, "an owed task is given in full whenever asked: {owed}");
+    }
 
     let vote = ok_tool(&base, "rev-a", "wait", json!({"timeout_seconds": 5})).await;
     assert_eq!(vote.matches("rename x").count(), 1, "{vote}");
@@ -534,6 +541,44 @@ async fn delivered_events_are_saved_before_wait_returns() {
     assert!(offer.contains("Review offer"), "{offer}");
     assert_eq!(agent_in(&path, "rev")["delivered"], 1, "a crash now must not deliver the offer again");
     running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn events_stay_until_a_later_wait_acknowledges_them() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    ok_tool(&base, "rev", "hello", json!({"role":"reviewer"})).await;
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev"]})).await;
+    ok_tool(&base, "rev", "accept_review", json!({"review_id":"r1"})).await;
+    ok_tool(&base, "author", "say", json!({"review_id":"r1","text":"Mind the cache."})).await;
+    let wait = |after: u64| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait","arguments":{"timeout_seconds":1,"after":after}}});
+    let text = |v: &Value| v["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    let (_, first) = rpc(&base, "rev", wait(0)).await;
+    assert!(text(&first).contains("Mind the cache."), "{first}");
+    let seq = first["result"]["_meta"]["amx/seq"].as_u64().expect("the seq to acknowledge");
+    let ob: Value = reqwest::get(format!("{base}/api/obligation?agent=rev")).await.unwrap().json().await.unwrap();
+    assert!(!ob["text"].as_str().unwrap().contains("undelivered"), "handed out is enough for the Stop hook: {ob}");
+    let (_, again) = rpc(&base, "rev", wait(0)).await;
+    assert!(text(&again).contains("Mind the cache."), "not acknowledged, so delivered again: {again}");
+    let (_, next) = rpc(&base, "rev", wait(seq)).await;
+    assert!(!text(&next).contains("Mind the cache.") && text(&next).contains("submit_findings"), "{next}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_agents_change_nothing() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    ok_tool(&base, "rev", "hello", json!({"role":"reviewer"})).await;
+    ok_tool(&base, "author", "hello", json!({"role":"author"})).await;
+    let version = || *relay.running.hub.subscribe().borrow();
+    let before = version();
+    for _ in 0..2 {
+        ok_tool(&base, "rev", "wait", json!({"timeout_seconds": 1})).await;
+        ok_tool(&base, "author", "review_status", json!({})).await;
+    }
+    assert_eq!(version(), before, "nothing to save or refresh");
+    relay.running.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

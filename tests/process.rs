@@ -222,3 +222,70 @@ fn stdio_proxy_keeps_waiting_while_idle() {
     assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("Review offer"), "{resp}");
     assert!(progress >= 1 && started.elapsed() > Duration::from_secs(2), "one call spans several relay long-polls, whatever timeout it asks for");
 }
+
+#[test]
+fn stdio_proxy_redelivers_what_a_cancelled_wait_returned() {
+    let (_relay, url) = relay();
+    let mut proxy = Kill(
+        Command::new(BIN)
+            .args(["mcp", "--relay", &url, "--agent", "rev-lost", "--role", "reviewer", "--wait-max", "3", "--wait-step", "1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = proxy.0.stdin.take().unwrap();
+    let mut lines = BufReader::new(proxy.0.stdout.take().unwrap()).lines();
+    let mut call = |line: &str| -> String {
+        writeln!(stdin, "{line}").unwrap();
+        let v: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        v["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string()
+    };
+    call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    call(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hello","arguments":{"role":"reviewer"}}}"#);
+    assert_eq!(request_review(&url, "https://github.com/rust-lang/rust/pull/6")["result"]["isError"], false);
+    call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"accept_review","arguments":{"review_id":"r1"}}}"#);
+    let say = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"say","arguments":{"review_id":"r1","text":"Mind the cache."}}}"#;
+    let out = Command::new("curl")
+        .args(["-sS", "-H", "content-type: application/json", "-d", say])
+        .arg(format!("{url}/mcp?agent=owner-claude"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let wait = |id: u32| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"wait","arguments":{{}}}}}}"#);
+    assert!(call(&wait(4)).contains("Mind the cache."));
+    let cancelled = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}}"#;
+    let again = call(&format!("{cancelled}\n{}", wait(5)));
+    assert!(again.contains("Mind the cache."), "the client dropped the reply, so it comes again: {again}");
+    let next = call(&wait(6));
+    assert!(!next.contains("Mind the cache.") && next.contains("submit_findings"), "a later request acknowledges it: {next}");
+}
+
+#[test]
+fn stdio_proxy_rides_out_a_relay_restart() {
+    let port = free_port();
+    let relay = relay_with(port, &[]);
+    let url = relay.1.clone();
+    let mut proxy = Kill(
+        Command::new(BIN)
+            .args(["mcp", "--relay", &url, "--agent", "rev-restart", "--role", "reviewer", "--wait-max", "20", "--wait-step", "1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = proxy.0.stdin.take().unwrap();
+    let mut lines = BufReader::new(proxy.0.stdout.take().unwrap()).lines();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"hello","arguments":{{"role":"reviewer"}}}}}}"#).unwrap();
+    lines.next().unwrap().unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"wait","arguments":{{}}}}}}"#).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    drop(relay);
+    std::thread::sleep(Duration::from_millis(1500));
+    let (_relay, _) = relay_with(port, &[]);
+    std::thread::sleep(Duration::from_millis(3000));
+    assert_eq!(request_review(&url, "https://github.com/rust-lang/rust/pull/7")["result"]["isError"], false);
+    let v: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("Review offer"), "{v}");
+}
