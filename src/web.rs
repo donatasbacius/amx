@@ -1,7 +1,7 @@
 use crate::hub::Hub;
 use crate::relay::{Choice, Finding, Ms, Phase, Review, State, Status, Verdict};
 use crate::tailscale::Identity;
-use crate::text::{dur, iso, phase_badge, severity_split, short_sha};
+use crate::text::{dur, iso, phase_badge, severity_split, short_sha, split_note, split_range};
 use axum::extract::{Path, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -336,7 +336,9 @@ fn status_badge(f: &Finding) -> String {
     };
     let mut s = format!("<span class=\"badge s-{cls}\">{}</span>", esc(&label));
     if let Some(o) = &f.outcome {
-        if o.downgraded {
+        if let Some(range) = split_range(f) {
+            let _ = write!(s, "<span class=\"badge s-stale\">severity split {range}: the lower stands</span>");
+        } else if o.downgraded {
             s.push_str("<span class=\"badge s-stale\">blocking → major (not unanimous)</span>");
         } else if o.severity != f.severity {
             let _ = write!(s, "<span class=\"badge s-stale\">{} → {} (by vote)</span>", f.severity.as_str(), o.severity.as_str());
@@ -369,11 +371,12 @@ fn render_summary(out: &mut String, r: &Review, findings: &[&Finding]) {
         let _ = write!(
             out,
             "<tr><th scope=\"row\"><a class=\"fid\" href=\"#{id}\">{id}</a></th><td class=\"ftitle\">{title}</td>\
-             <td><span class=\"sev sev-{sev}\">{sev}</span></td><td>{by}</td><td>{status}</td>\
+             <td><span class=\"sev sev-{sev}\">{sev}</span>{split}</td><td>{by}</td><td>{status}</td>\
              <td class=\"num\"><span title=\"agree (counting who raised it)\">{agree} ✓</span> <span title=\"disagree\">{disagree} ✗</span></td></tr>",
             id = esc(&f.id),
             title = esc(&title(&f.text)),
             sev = sev.as_str(),
+            split = split_range(f).map(|x| format!(" <span class=\"muted\">(split: {x})</span>")).unwrap_or_default(),
             by = raised_by(f),
         );
     }
@@ -409,7 +412,9 @@ fn render_finding(out: &mut String, f: &Finding) {
     if let Some(w) = &f.withdrawn {
         let _ = write!(out, "<div class=\"facts\">withdrawn: {}</div>", esc(w));
     }
-    if let Some(split) = severity_split(f) {
+    if let Some(split) = split_note(f) {
+        let _ = write!(out, "<div class=\"facts\">severity {}</div>", esc(&split));
+    } else if let Some(split) = severity_split(f) {
         let _ = write!(out, "<div class=\"facts\">disputed: {}</div>", esc(&split));
     }
     if !f.votes.is_empty() {
@@ -590,6 +595,7 @@ fn summary_json(r: &Review, f: &Finding) -> Value {
         "id": f.id,
         "title": title(&f.text),
         "severity": f.outcome.as_ref().map(|o| o.severity).unwrap_or(f.severity),
+        "severity_split": split_range(f),
         "by": f.by,
         "origin": f.origin,
         "outcome": outcome(f).map(|(_, l)| l).unwrap_or_else(|| if r.phase.active() { "open".into() } else { "undecided".into() }),

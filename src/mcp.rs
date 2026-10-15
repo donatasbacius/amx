@@ -1,5 +1,5 @@
 use crate::hub::Hub;
-use crate::relay::{Action, AmendIn, FindingIn, NewReview, Role, SubmitIn, VoteIn};
+use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, NewReview, Role, SubmitIn, VoteIn};
 use crate::tailscale::Identity;
 use crate::text;
 use anyhow::{Result, anyhow};
@@ -10,8 +10,10 @@ use std::time::Duration;
 
 const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 /// Codex's default MCP tool timeout and Claude Code's HTTP first-byte timer are both 60s.
+/// `amx mcp` repeats the wait to block longer (see `WAIT_PROXY_DEFAULT`).
 pub const WAIT_DEFAULT: u64 = 45;
 pub const WAIT_MAX: u64 = 50;
+pub const WAIT_PROXY_DEFAULT: u64 = 600;
 
 /// Tools that count as taking part, so they register the agent and keep it online.
 /// The rest (`online`, `review_status`) only read.
@@ -54,9 +56,10 @@ pub fn tools() -> Value {
         },
         {
             "name": "wait",
-            "description": "Block until something happens for you (a review offer, a phase change, a vote request, a message, a result) or the timeout passes, then return the new events and a NEXT line telling you exactly what to do. Returns immediately if you already owe an action. Reviewers: call this in a loop forever. Authors: call it after request_review until the result arrives. Also keeps you marked online.",
+            "description": "Block until something needs you (a review offer, a review or vote task, a message, the result) or the timeout passes, then return the new events and a NEXT line telling you exactly what to do. Returns immediately if you already owe an action. Reviewers: call this in a loop forever. Authors: call it after request_review until the result arrives. Also keeps you marked online.",
             "inputSchema": { "type": "object", "properties": {
-                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_MAX, "description": format!("Default {WAIT_DEFAULT}, max {WAIT_MAX}.") }
+                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_MAX, "description": format!("Default {WAIT_DEFAULT}, max {WAIT_MAX}; through `amx mcp`, leave it out to wait up to its --wait-max.") },
+                "progress": { "type": "boolean", "description": "Also wake for progress that needs no action from you (phase changes, dropped reviewers, withdrawn findings, a finished review). Default false." }
             } }
         },
         {
@@ -78,7 +81,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "accept_review",
-            "description": "Take a review you were offered (reviewers only, one review at a time). The first N to accept are assigned; you then get the review task from `wait`.",
+            "description": "Take a review you were offered (reviewers only, one review at a time). The first N to accept are assigned; the result is your review task: start at once.",
             "inputSchema": { "type": "object", "properties": { "review_id": rid }, "required": ["review_id"] }
         },
         {
@@ -103,7 +106,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "vote",
-            "description": "Cross-examination: vote on other reviewers' findings (you must vote on every one the relay lists for you). agree = the problem is real; if you think its severity is wrong, still agree and give the severity you think is fair (a confirmed finding takes the severity most of its supporters back; if only the finding's author and you take part and you rate it differently, it ends disputed with both severities shown); disagree = wrong or not a problem at all (reason required, be specific); duplicate = same issue as another finding (give duplicate_of). Verify against the code before agreeing. You can send several votes in one call and change a vote until the round ends.",
+            "description": "Cross-examination: vote on other reviewers' findings (you must vote on every one the relay lists for you). agree = the problem is real; if you think its severity is wrong, still agree and give the severity you think is fair (a confirmed finding takes the severity most of its supporters back; if only the finding's author and you take part and you rate it differently, it is confirmed at the lower severity with both shown); disagree = wrong or not a problem at all (reason required, be specific); duplicate = same issue as another finding (give duplicate_of). Verify against the code before agreeing. You can send several votes in one call and change a vote until the round ends; votes on withdrawn findings are ignored.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "votes": { "type": "array", "items": { "type": "object", "properties": {
@@ -166,6 +169,8 @@ struct RoleArgs {
 #[derive(Deserialize)]
 struct WaitArgs {
     timeout_seconds: Option<u64>,
+    #[serde(default)]
+    progress: bool,
 }
 
 /// `reviewers` was the count before it could name agents; a number is still accepted.
@@ -262,22 +267,23 @@ struct StatusArgs {
     review_id: Option<String>,
 }
 
-pub fn next_text(actions: &[Action], role: Role, has_events: bool) -> String {
+/// The NEXT lines for `actions`. A task whose full text is in one of `events` gets a one-line
+/// pointer, and the idle line is left out when an event already says what to do.
+pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent]) -> String {
     if actions.is_empty() {
         return match role {
+            _ if events.iter().any(|e| e.text.contains("NEXT:")) => String::new(),
             Role::Reviewer => "NEXT: nothing for you right now. Call `wait` again (keep looping).".into(),
-            Role::Author if has_events => "NEXT: nothing pending on the relay.".into(),
+            Role::Author if !events.is_empty() => "NEXT: nothing pending on the relay.".into(),
             Role::Author => "NEXT: nothing pending. Use `request_review` to get a PR reviewed.".into(),
         };
     }
     let lines: Vec<String> = actions
         .iter()
-        .map(|a| {
-            if a.text.contains("NEXT:") {
-                format!("[{}] {}", a.review, a.text)
-            } else {
-                format!("NEXT: {}", a.text)
-            }
+        .map(|a| match (&a.task, &a.short) {
+            (Some(t), Some(short)) if events.iter().any(|e| e.task.as_ref() == Some(t)) => format!("NEXT: {short}"),
+            _ if a.text.contains("NEXT:") => format!("[{}] {}", a.review, a.text),
+            _ => format!("NEXT: {}", a.text),
         })
         .collect();
     lines.join("\n\n")
@@ -287,9 +293,15 @@ fn role_of(hub: &Hub, agent: &str) -> Role {
     hub.read(|s, _| s.agents.get(agent).map(|a| a.role).unwrap_or(Role::Author))
 }
 
+/// Appends the NEXT lines; tasks shown here in full are not delivered again by `wait`.
 fn with_next(hub: &Hub, agent: &str, head: String) -> String {
-    let actions = hub.read(|s, now| s.next_actions(agent, now));
-    format!("{head}\n\n{}", next_text(&actions, role_of(hub, agent), false))
+    let actions = hub.write(|s, now| {
+        let actions = s.next_actions(agent, now);
+        let shown: Vec<String> = actions.iter().filter_map(|a| a.task.clone()).collect();
+        s.forget_tasks(agent, &shown);
+        actions
+    });
+    format!("{head}\n\n{}", next_text(&actions, role_of(hub, agent), &[]))
 }
 
 async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<String> {
@@ -310,13 +322,13 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
         "wait" => {
             let w: WaitArgs = args(a)?;
             let secs = w.timeout_seconds.unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX);
-            let (events, actions) = hub.wait(agent, Duration::from_secs(secs)).await;
+            let (events, actions) = hub.wait(agent, Duration::from_secs(secs), w.progress).await;
             let role = role_of(hub, agent);
-            let next = next_text(&actions, role, !events.is_empty());
-            Ok(if events.is_empty() {
-                format!("No new events.\n\n{next}")
-            } else {
-                format!("{}\n\n===\n{next}", text::events(&events))
+            let next = next_text(&actions, role, &events);
+            Ok(match (events.is_empty(), next.is_empty()) {
+                (true, _) => format!("No new events.\n\n{next}"),
+                (false, true) => text::events(&events),
+                (false, false) => format!("{}\n\n===\n{next}", text::events(&events)),
             })
         }
         "request_review" => {
@@ -401,8 +413,12 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
                     duplicate_of: v.duplicate_of,
                 })
                 .collect();
-            let n = hub.write(|s, now| s.vote(agent, &r.review_id, votes, now))?;
-            Ok(with_next(hub, agent, format!("Recorded {n} vote(s) on {}.", r.review_id)))
+            let v = hub.write(|s, now| s.vote(agent, &r.review_id, votes, now))?;
+            let mut head = format!("Recorded {} vote(s) on {}.", v.recorded, r.review_id);
+            if !v.ignored.is_empty() {
+                head.push_str(&format!(" Ignored your votes on {}: withdrawn by their authors.", v.ignored.join(", ")));
+            }
+            Ok(with_next(hub, agent, head))
         }
         "say" => {
             let r: SayArgs = args(a)?;

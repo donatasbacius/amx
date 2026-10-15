@@ -58,7 +58,7 @@ impl Sim {
 
     fn events(&mut self, name: &str) -> String {
         self.s
-            .take_events(name)
+            .take_events(name, true)
             .into_iter()
             .map(|e| e.text)
             .collect::<Vec<_>>()
@@ -115,6 +115,15 @@ impl Sim {
         self.s.vote(agent, id, votes, self.now).unwrap();
     }
 
+    /// Lets the reply window of a later voting round run out.
+    fn skip_replies(&mut self) {
+        self.advance(Timing::default().reply_secs);
+    }
+
+    fn task(&self, name: &str) -> String {
+        self.s.next_actions(name, self.now).first().map(|a| a.text.clone()).unwrap_or_default()
+    }
+
     fn phase(&self, id: &str) -> Phase {
         self.s.review(id).unwrap().phase
     }
@@ -148,10 +157,11 @@ fn happy_path_two_reviewers() {
     assert!(offer.contains("accept_review") && offer.contains(PR), "{offer}");
     assert!(sim.s.next_actions("rev-a", sim.now)[0].urgent);
     sim.accept("rev-a", &id);
+    let task = sim.task("rev-a");
+    assert!(task.contains("gh pr diff") && task.contains("submit_findings") && task.contains("at least 20m00s"), "starts on accept: {task}");
     sim.accept("rev-b", &id);
     assert_eq!(sim.phase(&id), Phase::Reviewing);
-    let task = sim.events("rev-a");
-    assert!(task.contains("gh pr diff") && task.contains("submit_findings"), "{task}");
+    assert_eq!(sim.events("rev-a"), "", "the task came with the accept");
     assert!(sim.events("alice-codex").contains("Reviewers assigned: rev-a, rev-b"));
 
     sim.submit("rev-a", &id, &[("major", "cache never invalidated")]);
@@ -247,6 +257,7 @@ fn blocking_needs_unanimity() {
     sim.vote("rev-b", &id, &[("F1", "agree")]);
     sim.vote("rev-c", &id, &[("F1", "disagree")]);
     assert_eq!(sim.phase(&id), Phase::Voting(2));
+    sim.skip_replies();
     sim.vote("rev-b", &id, &[("F1", "agree")]);
     sim.vote("rev-c", &id, &[("F1", "disagree")]);
     let r = sim.s.review(&id).unwrap();
@@ -283,6 +294,7 @@ fn split_vote_is_disputed_and_majority_rejects() {
     sim.submit("rev-a", &id, &[("major", "should use a BTreeMap")]);
     sim.submit("rev-b", &id, &[]);
     sim.vote("rev-b", &id, &[("F1", "disagree")]);
+    sim.skip_replies();
     sim.vote("rev-b", &id, &[("F1", "disagree")]);
     assert_eq!(sim.status(&id, "F1"), Status::Disputed);
     assert_eq!(sim.verdict(&id), Verdict::Approve, "disputed findings don't block");
@@ -297,7 +309,10 @@ fn split_vote_is_disputed_and_majority_rejects() {
     sim.submit("rev-a", &id, &[("major", "wrong")]);
     sim.submit("rev-b", &id, &[]);
     sim.submit("rev-c", &id, &[]);
-    for _ in 0..2 {
+    for round in 1..=2 {
+        if round == 2 {
+            sim.skip_replies();
+        }
         sim.vote("rev-b", &id, &[("F1", "disagree")]);
         sim.vote("rev-c", &id, &[("F1", "disagree")]);
     }
@@ -329,11 +344,11 @@ fn amend_and_withdraw() {
         reason: None,
         duplicate_of: None,
     };
-    let err = sim.s.vote("rev-b", &id, vec![stale], sim.now).unwrap_err().to_string();
-    assert!(err.contains("F2 was withdrawn") && err.contains("open in round 2: F1"), "{err}");
+    let voted = sim.s.vote("rev-b", &id, vec![stale], sim.now).unwrap();
+    assert_eq!((voted.recorded, voted.ignored), (0, vec!["F2".to_string()]), "votes on withdrawn findings are ignored");
     assert!(sim.s.withdraw("rev-b", &id, "F1", "not mine", sim.now).is_err());
     assert_eq!(sim.s.review(&id).unwrap().owed_votes("rev-b").len(), 1);
-    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    sim.vote("rev-b", &id, &[("F2", "agree"), ("F1", "agree")]);
     assert_eq!(sim.status(&id, "F1"), Status::Confirmed);
     assert_eq!(sim.status(&id, "F2"), Status::Withdrawn);
     assert_eq!(sim.verdict(&id), Verdict::Approve);
@@ -425,7 +440,7 @@ fn offers_respect_roles_and_busy_reviewers() {
     assert!(sim.events("bob-codex").is_empty());
     sim.accept("rev-a", &id);
     let other = sim.request("bob-codex", 1);
-    assert!(sim.events("rev-a").contains("You are assigned"));
+    assert!(sim.task("rev-a").contains("submit_findings"));
     assert!(sim.s.accept("rev-a", &other, sim.now).is_err(), "busy");
     sim.submit("rev-a", &id, &[]);
     sim.s.tick(sim.now);
@@ -490,6 +505,7 @@ fn rereview_rechecks_previous_findings() {
     sim.submit("rev-b", &id, &[("nit", "naming")]);
     sim.vote("rev-a", &id, &[("F2", "disagree")]);
     sim.vote("rev-b", &id, &[("F1", "agree")]);
+    sim.skip_replies();
     sim.vote("rev-a", &id, &[("F2", "disagree")]);
     assert_eq!(sim.status(&id, "F2"), Status::Disputed);
     assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
@@ -608,6 +624,7 @@ fn overstated_finding_is_confirmed_at_the_severity_its_supporters_back() {
     sim.s.vote("rev-c", &id, vec![rate("F1", "minor")], sim.now).unwrap();
     assert_eq!(sim.phase(&id), Phase::Voting(2), "a severity dispute gets a second round");
     assert!(sim.events("rev-a").contains("agree, as minor"));
+    sim.skip_replies();
     sim.s.vote("rev-b", &id, vec![rate("F1", "minor")], sim.now).unwrap();
     sim.s.vote("rev-c", &id, vec![rate("F1", "nit")], sim.now).unwrap();
     let r = sim.s.review(&id).unwrap();
@@ -628,7 +645,10 @@ fn blocking_backed_by_a_majority_but_rated_lower_by_one_becomes_major() {
     sim.submit("rev-a", &id, &[("blocking", "regex is quadratic again")]);
     sim.submit("rev-b", &id, &[]);
     sim.submit("rev-c", &id, &[]);
-    for _ in 0..2 {
+    for round in 1..=2 {
+        if round == 2 {
+            sim.skip_replies();
+        }
         sim.vote("rev-b", &id, &[("F1", "agree")]);
         sim.s.vote("rev-c", &id, vec![rate("F1", "major")], sim.now).unwrap();
     }
@@ -638,26 +658,23 @@ fn blocking_backed_by_a_majority_but_rated_lower_by_one_becomes_major() {
 }
 
 #[test]
-fn two_reviewers_split_on_severity_is_disputed() {
+fn two_reviewers_split_on_severity_confirm_the_lower() {
     let mut sim = setup(&["rev-a", "rev-b"]);
     let id = sim.request("alice-codex", 2);
     sim.accept("rev-a", &id);
     sim.accept("rev-b", &id);
     sim.submit("rev-a", &id, &[("blocking", "cache key ignores the locale")]);
     sim.submit("rev-b", &id, &[]);
-    for _ in 0..2 {
-        sim.s.vote("rev-b", &id, vec![rate("F1", "nit")], sim.now).unwrap();
-    }
+    sim.s.vote("rev-b", &id, vec![rate("F1", "major")], sim.now).unwrap();
+    sim.skip_replies();
+    sim.s.vote("rev-b", &id, vec![rate("F1", "major")], sim.now).unwrap();
     assert_eq!(sim.phase(&id), Phase::Done);
     let o = sim.s.review(&id).unwrap().finding("F1").unwrap().outcome.clone().unwrap();
-    assert_eq!((o.status, o.severity, o.severity_split), (Status::Disputed, amx::relay::Severity::Blocking, true));
-    assert_eq!(sim.verdict(&id), Verdict::Approve, "a severity dispute doesn't block");
+    assert_eq!((o.status, o.severity, o.downgraded, o.severity_split), (Status::Confirmed, amx::relay::Severity::Major, false, true));
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested, "both agree it is a must-fix");
     let result = sim.events("alice-codex");
-    assert!(result.contains("Disputed") && result.contains("raised as blocking by rev-a; rev-b agrees it's real but rates it nit"), "{result}");
-    assert!(result.contains("rev-b: agree, as nit — real, but overstated"), "{result}");
-    assert!(result.contains("could not agree on F1"), "the author is told to judge it: {result}");
-    let page = amx::web::render_review(sim.s.review(&id).unwrap(), sim.now);
-    assert!(page.contains("disputed severity") && page.contains("raised as blocking by rev-a; rev-b agrees it&#39;s real but rates it nit"));
+    assert!(result.contains("- F1 [major, split: blocking/major (rev-a: blocking, rev-b: major)]"), "{result}");
+    assert!(result.contains("rev-b: agree, as major — real, but overstated") && !result.contains("Disputed"), "{result}");
 }
 
 #[test]
@@ -685,7 +702,10 @@ fn three_or_more_reviewers_split_on_severity_still_resolve_by_majority() {
     sim.submit("rev-a", &id, &[("blocking", "cache key ignores the locale")]);
     sim.submit("rev-b", &id, &[]);
     sim.submit("rev-c", &id, &[]);
-    for _ in 0..2 {
+    for round in 1..=2 {
+        if round == 2 {
+            sim.skip_replies();
+        }
         sim.s.vote("rev-b", &id, vec![rate("F1", "nit")], sim.now).unwrap();
         sim.s.vote("rev-c", &id, vec![rate("F1", "minor")], sim.now).unwrap();
     }
@@ -701,7 +721,10 @@ fn three_or_more_reviewers_split_on_severity_still_resolve_by_majority() {
     for r in ["rev-b", "rev-c", "rev-d"] {
         sim.submit(r, &id, &[]);
     }
-    for _ in 0..2 {
+    for round in 1..=2 {
+        if round == 2 {
+            sim.skip_replies();
+        }
         sim.vote("rev-b", &id, &[("F1", "agree")]);
         sim.s.vote("rev-c", &id, vec![rate("F1", "nit")], sim.now).unwrap();
         sim.s.vote("rev-d", &id, vec![rate("F1", "nit")], sim.now).unwrap();
@@ -763,7 +786,7 @@ fn state_survives_a_snapshot_and_the_review_carries_on() {
     sim.accept("rev-b", &open);
     sim.submit("rev-a", &open, &[("minor", "missing doc comment")]);
     sim.events("rev-a");
-    assert!(sim.s.has_undelivered("rev-b") && sim.s.has_undelivered("alice-codex"));
+    assert!(!sim.s.peek_events("alice-codex", 0).0.is_empty());
 
     let mut s = reload(&sim.s, sim.now, sim.now);
     for id in [&done, &open] {
@@ -815,4 +838,115 @@ fn reviewers_lost_in_a_restart_are_dropped_after_the_usual_silence() {
     let r = sim.s.review(&id).unwrap();
     assert!(r.slot("rev-b").unwrap().dropped.is_some());
     assert_eq!(r.phase, Phase::Done);
+}
+
+#[test]
+fn reviewers_start_on_accept() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    assert_eq!(sim.phase(&id), Phase::Offering);
+    sim.submit("rev-a", &id, &[("minor", "typo in the error message")]);
+    assert!(sim.task("rev-a").contains("your findings are in"), "{}", sim.task("rev-a"));
+    sim.accept("rev-b", &id);
+    assert_eq!(sim.phase(&id), Phase::Reviewing);
+    assert_eq!(sim.s.review(&id).unwrap().finding("F1").unwrap().by.as_deref(), Some("rev-a"));
+    sim.submit("rev-b", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Voting(1));
+}
+
+#[test]
+fn done_tasks_and_progress_are_not_delivered() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    assert!(sim.s.take_events("rev-a", false).is_empty(), "the offer was answered");
+    assert!(!sim.s.has_undelivered("rev-b"));
+    sim.submit("rev-a", &id, &[("major", "cache never invalidated")]);
+    sim.submit("rev-b", &id, &[("minor", "missing doc comment")]);
+    assert!(sim.s.has_undelivered("rev-b"));
+    let task = sim.task("rev-b");
+    let next = task.lines().find(|l| l.starts_with("NEXT:")).unwrap();
+    assert!(next.contains("finding: \"F1\"") && !next.contains("\"F2\""), "never suggests a vote on your own finding: {next}");
+    assert_eq!(task.matches("cache never invalidated").count(), 1, "{task}");
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    assert!(sim.s.take_events("rev-b", false).is_empty(), "the vote task is done");
+    sim.vote("rev-a", &id, &[("F2", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    let author: Vec<String> = sim.s.take_events("alice-codex", false).into_iter().map(|e| e.text).collect();
+    assert_eq!(author.len(), 1, "authors wake for the result only: {author:?}");
+    assert!(author[0].contains("Review result"));
+    assert!(sim.s.take_events("rev-a", false).is_empty(), "\"Review finished\" is progress");
+}
+
+#[test]
+fn finding_authors_reply_before_round_two_votes() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("major", "race on shutdown")]);
+    sim.submit("rev-b", &id, &[("major", "leaks a file handle")]);
+    sim.submit("rev-c", &id, &[]);
+    sim.vote("rev-a", &id, &[("F2", "agree")]);
+    sim.vote("rev-b", &id, &[("F1", "disagree")]);
+    sim.vote("rev-c", &id, &[("F1", "agree"), ("F2", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Voting(2));
+    let r = sim.s.review(&id).unwrap();
+    assert!(r.replying && r.deadline_left(sim.now) == Timing::default().reply_secs * 1000);
+    let a = sim.events("rev-a");
+    assert!(a.contains("your findings F1 drew objections") && a.contains("rev-b thinks F1 is wrong") && !a.contains("leaks a file handle"), "{a}");
+    assert!(sim.events("rev-c").is_empty(), "voters wait for the reply");
+    let err = sim.s.vote("rev-c", &id, vec![VoteIn { finding: "F1".into(), vote: "agree".into(), severity: None, reason: None, duplicate_of: None }], sim.now).unwrap_err();
+    assert!(err.to_string().contains("once the authors of contested findings have replied"), "{err}");
+    sim.advance(30);
+    assert_eq!(sim.phase(&id), Phase::Voting(2));
+    sim.s.say("rev-a", &id, "Line 10 drops the lock before joining.", sim.now).unwrap();
+    assert!(!sim.s.review(&id).unwrap().replying, "votes open once every author has replied");
+    let c = sim.events("rev-c");
+    assert!(c.contains("Line 10 drops the lock") && c.contains("You must vote on: F1."), "{c}");
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    sim.vote("rev-c", &id, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    assert_eq!(sim.status(&id, "F1"), Status::Confirmed);
+}
+
+#[test]
+fn reply_window_closes_on_its_own() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "race on shutdown")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.vote("rev-b", &id, &[("F1", "disagree")]);
+    sim.advance(Timing::default().reply_secs - 10);
+    assert!(sim.s.review(&id).unwrap().replying);
+    sim.advance(10);
+    assert!(!sim.s.review(&id).unwrap().replying);
+    assert!(sim.events("rev-b").contains("Cross-examination round 2"));
+}
+
+#[test]
+fn snapshots_from_0_4_still_load() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    let mut v = serde_json::to_value(sim.s.snapshot(sim.now)).unwrap();
+    for r in v["reviews"].as_array_mut().unwrap() {
+        r["params"].as_object_mut().unwrap().remove("reply_secs");
+    }
+    for a in v["agents"].as_array_mut().unwrap() {
+        for e in a["events"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("task");
+        }
+    }
+    let text = v.to_string();
+    assert!(!text.contains("reply_secs") && !text.contains("\"task\"") && !text.contains("\"progress\"") && !text.contains("replying"), "{text}");
+    let mut s = State::new(Timing::default(), Consensus::default(), 50);
+    s.restore(serde_json::from_str(&text).unwrap(), sim.now);
+    assert_eq!(s.review(&id).unwrap().params.reply_secs, 90);
+    assert!(s.next_actions("rev-b", sim.now)[0].text.contains("accept_review"));
 }

@@ -272,7 +272,7 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     assert_eq!(v["phase"], "done");
     assert_eq!(v["verdict"], "changes_requested");
     assert_eq!(v["findings"][0]["votes"]["rev-b"]["choice"], "Agree");
-    assert_eq!(v["summary"][0], json!({"id":"F1","title":"SECRET until revealed","severity":"major","by":"rev-a","origin":null,"outcome":"confirmed","agree":2,"disagree":0}));
+    assert_eq!(v["summary"][0], json!({"id":"F1","title":"SECRET until revealed","severity":"major","severity_split":null,"by":"rev-a","origin":null,"outcome":"confirmed","agree":2,"disagree":0}));
     assert!(v["result"]["text"].as_str().unwrap().contains("CHANGES REQUESTED"));
     assert!(v["log"].as_array().unwrap().iter().any(|e| e["kind"] == "result"));
     let stages: Vec<&str> = v["timeline"].as_array().unwrap().iter().map(|s| s["state"].as_str().unwrap()).collect();
@@ -427,4 +427,44 @@ fn tailnet_links_prefer_the_magicdns_name() {
     let addr = "192.0.2.7:7341".parse().unwrap();
     assert_eq!(amx::tailnet_url(addr, Some("relay.example.ts.net")), "http://relay.example.ts.net:7341");
     assert_eq!(amx::tailnet_url(addr, None), "http://192.0.2.7:7341");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_points_to_tasks_instead_of_repeating_them() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    for rev in ["rev-a", "rev-b"] {
+        ok_tool(&base, rev, "hello", json!({"role":"reviewer"})).await;
+    }
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev-a", "rev-b"]})).await;
+    let offer = ok_tool(&base, "rev-a", "wait", json!({"timeout_seconds": 5})).await;
+    assert!(offer.ends_with("NEXT: r1: accept or decline the offer above.") && offer.matches(PR).count() == 1, "{offer}");
+
+    let acc = ok_tool(&base, "rev-a", "accept_review", json!({"review_id":"r1"})).await;
+    assert!(acc.contains("gh pr diff") && acc.contains("at least 20m00s"), "starts at once: {acc}");
+    ok_tool(&base, "rev-b", "accept_review", json!({"review_id":"r1"})).await;
+    let findings = json!([{"severity":"major","text":"cache never invalidated"},{"severity":"minor","text":"typo in docs"}]);
+    ok_tool(&base, "rev-a", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","findings":findings})).await;
+    let idle = ok_tool(&base, "rev-a", "wait", json!({"timeout_seconds": 1})).await;
+    assert!(idle.starts_with("No new events."), "no second copy of the task: {idle}");
+    let last = ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[{"severity":"nit","text":"rename x"}]})).await;
+    assert!(last.contains("You must vote on: F1, F2.") && last.matches("cache never invalidated").count() == 1, "{last}");
+    assert!(!last.contains("finding: \"F3\""), "the example never names your own finding: {last}");
+
+    let vote = ok_tool(&base, "rev-a", "wait", json!({"timeout_seconds": 5})).await;
+    assert_eq!(vote.matches("rename x").count(), 1, "{vote}");
+    assert!(vote.contains("You must vote on: F3.") && vote.ends_with("NEXT: r1: vote on F3 as described above."), "{vote}");
+
+    ok_tool(&base, "rev-a", "withdraw_finding", json!({"review_id":"r1","finding":"F2","reason":"fixed upstream"})).await;
+    let voted = ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree"},{"finding":"F2","vote":"agree"}]})).await;
+    assert!(voted.contains("Recorded 1 vote(s) on r1. Ignored your votes on F2: withdrawn by their authors."), "{voted}");
+
+    let quiet = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 1})).await;
+    assert!(quiet.starts_with("No new events."), "progress doesn't wake the author: {quiet}");
+    ok_tool(&base, "rev-a", "vote", json!({"review_id":"r1","votes":[{"finding":"F3","vote":"agree"}]})).await;
+    let result = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 5})).await;
+    assert!(result.starts_with("[r1] Review result") && !result.contains("===") && !result.contains("nothing pending"), "{result}");
+    let finished = ok_tool(&base, "rev-b", "wait", json!({"timeout_seconds": 1, "progress": true})).await;
+    assert!(finished.contains("Review finished"), "{finished}");
+    relay.running.stop().await;
 }

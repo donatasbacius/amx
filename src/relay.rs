@@ -104,6 +104,12 @@ pub struct AgentEvent {
     pub at: Ms,
     pub review: Option<String>,
     pub text: String,
+    /// The obligation this event hands out (see `Action::task`); dropped once it is met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Needs no action; `wait` skips it unless asked for progress.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub progress: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +155,18 @@ impl Agents {
     }
 
     fn notify(&mut self, name: &str, review: &str, text: String, now: Ms) {
+        self.push(name, review, text, None, false, now);
+    }
+
+    fn notify_task(&mut self, name: &str, review: &str, task: String, text: String, now: Ms) {
+        self.push(name, review, text, Some(task), false, now);
+    }
+
+    fn progress(&mut self, name: &str, review: &str, text: String, now: Ms) {
+        self.push(name, review, text, None, true, now);
+    }
+
+    fn push(&mut self, name: &str, review: &str, text: String, task: Option<String>, progress: bool, now: Ms) {
         if let Some(a) = self.map.get_mut(name) {
             a.next_seq += 1;
             a.events.push_back(AgentEvent {
@@ -156,6 +174,8 @@ impl Agents {
                 at: now,
                 review: Some(review.to_string()),
                 text,
+                task,
+                progress,
             });
             while a.events.len() > MAX_EVENTS {
                 a.events.pop_front();
@@ -197,6 +217,12 @@ pub struct ReviewParams {
     pub offer_secs: u64,
     pub review_secs: u64,
     pub vote_secs: u64,
+    #[serde(default = "default_reply_secs")]
+    pub reply_secs: u64,
+}
+
+fn default_reply_secs() -> u64 {
+    Timing::default().reply_secs
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,7 +280,7 @@ pub struct Outcome {
     pub status: Status,
     pub severity: Severity,
     pub downgraded: bool,
-    /// Disputed because its only two supporters rate it differently.
+    /// Its only two supporters rate it differently, so it takes the lower severity.
     pub severity_split: bool,
     pub agree: usize,
     pub disagree: usize,
@@ -318,6 +344,12 @@ pub struct Review {
     pub since_sha: Option<String>,
     pub head_sha: Option<String>,
     next_finding: u32,
+    /// In a later voting round: the authors of contested findings may still reply before votes open.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replying: bool,
+    /// Who has amended, withdrawn or spoken since the current round started.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub replied: BTreeSet<String>,
 }
 
 impl Review {
@@ -368,6 +400,16 @@ impl Review {
                 None => true,
                 Some(v) => v.round < round || v.revision < f.revision,
             })
+            .collect()
+    }
+
+    /// `agent`'s own findings reopened in the current round.
+    pub fn contested_by(&self, agent: &str) -> Vec<String> {
+        let round = self.round();
+        self.findings
+            .iter()
+            .filter(|f| f.by.as_deref() == Some(agent) && f.withdrawn.is_none() && f.open_round == round && round > 1)
+            .map(|f| f.id.clone())
             .collect()
     }
 
@@ -458,8 +500,6 @@ pub fn decide(findings: &mut [Finding], c: &Consensus) {
         let severity_split = disagree == 0 && agree == 2 && rated[0] != rated[1];
         let status = if let Some(t) = merged.get(&f.id) {
             Status::Duplicate(t.clone())
-        } else if severity_split {
-            Status::Disputed
         } else if total > 0.0 && agree as f64 > c.confirm_fraction * total {
             severity = rated[agree / 2];
             let unanimous = disagree == 0 && rated.iter().all(|s| *s == Severity::Blocking);
@@ -558,6 +598,47 @@ pub struct Action {
     pub review: String,
     pub urgent: bool,
     pub text: String,
+    /// Identifies the obligation, so an event that already carries its text can be pointed to.
+    pub task: Option<String>,
+    /// One line to use instead of `text` when such an event is delivered with it.
+    pub short: Option<String>,
+}
+
+impl Action {
+    fn info(review: &str, text: String) -> Action {
+        Action {
+            review: review.to_string(),
+            urgent: false,
+            text,
+            task: None,
+            short: None,
+        }
+    }
+}
+
+pub fn offer_task(review: &str) -> String {
+    format!("{review}:offer")
+}
+
+pub fn reply_task(r: &Review) -> String {
+    format!("{}:reply:{}", r.id, r.round())
+}
+
+pub fn review_task(review: &str) -> String {
+    format!("{review}:review")
+}
+
+/// Changes whenever the set of owed findings or their revisions change.
+pub fn vote_task(r: &Review, owed: &[&Finding]) -> String {
+    let ids: Vec<String> = owed.iter().map(|f| format!("{}.{}", f.id, f.revision)).collect();
+    format!("{}:vote:{}:{}", r.id, r.round(), ids.join(","))
+}
+
+#[derive(Debug)]
+/// What a `vote` call recorded, and the votes it skipped because their finding was withdrawn.
+pub struct Voted {
+    pub recorded: usize,
+    pub ignored: Vec<String>,
 }
 
 pub struct OnlineAgent {
@@ -777,17 +858,43 @@ impl State {
         Ok(())
     }
 
-    pub fn take_events(&mut self, name: &str) -> Vec<AgentEvent> {
+    /// New events for `name`, minus tasks it has already done and, unless asked for, progress.
+    pub fn take_events(&mut self, name: &str, progress: bool) -> Vec<AgentEvent> {
+        let open = self.open_tasks(name);
         let Some(a) = self.agents.map.get_mut(name) else {
             return Vec::new();
         };
-        let fresh: Vec<AgentEvent> = a.events.iter().filter(|e| e.seq > a.delivered).cloned().collect();
+        let fresh: Vec<AgentEvent> = a
+            .events
+            .iter()
+            .filter(|e| e.seq > a.delivered && (progress || !e.progress))
+            .filter(|e| e.task.as_ref().is_none_or(|t| open.contains(t)))
+            .cloned()
+            .collect();
         a.delivered = a.next_seq;
         fresh
     }
 
     pub fn has_undelivered(&self, name: &str) -> bool {
-        self.agents.get(name).is_some_and(|a| a.next_seq > a.delivered)
+        let open = self.open_tasks(name);
+        self.agents.get(name).is_some_and(|a| {
+            a.events
+                .iter()
+                .any(|e| e.seq > a.delivered && !e.progress && e.task.as_ref().is_none_or(|t| open.contains(t)))
+        })
+    }
+
+    fn open_tasks(&self, name: &str) -> HashSet<String> {
+        self.next_actions(name, 0).into_iter().filter_map(|a| a.task).collect()
+    }
+
+    /// Drops queued events for tasks whose full text `name` has just been given in a tool result.
+    pub fn forget_tasks(&mut self, name: &str, tasks: &[String]) {
+        if let Some(a) = self.agents.map.get_mut(name) {
+            let delivered = a.delivered;
+            a.events
+                .retain(|e| e.seq <= delivered || e.task.as_ref().is_none_or(|t| !tasks.contains(t)));
+        }
     }
 
     /// Events after `after` without marking them delivered (for watchers).
@@ -808,42 +915,71 @@ impl State {
         let reviewer = self.agents.get(name).is_some_and(|a| a.role == Role::Reviewer);
         for r in self.reviews.iter().filter(|r| r.phase.active()) {
             let left = text::dur(r.deadline_left(now));
+            let id = &r.id;
             if let Some(slot) = r.slot(name).filter(|s| s.active()) {
                 match r.phase {
-                    Phase::Reviewing if slot.submission.is_none() => out.push(Action {
-                        review: r.id.clone(),
-                        urgent: true,
-                        text: text::review_task(r, &left),
-                    }),
-                    Phase::Voting(_) => {
-                        let owed = r.owed_votes(name);
-                        if owed.is_empty() {
-                            out.push(Action {
-                                review: r.id.clone(),
-                                urgent: false,
-                                text: format!(
-                                    "{}: your votes for round {} are in. Call `wait` for the other reviewers (you may `say` something in the meantime). Round ends in {left}.",
-                                    r.id,
-                                    r.round()
-                                ),
-                            });
+                    Phase::Offering | Phase::Reviewing if slot.submission.is_none() => {
+                        let left = if r.phase == Phase::Offering {
+                            format!("at least {}", text::dur(r.params.review_secs * 1000))
+                        } else {
+                            left.clone()
+                        };
+                        out.push(Action {
+                            review: id.clone(),
+                            urgent: true,
+                            text: text::review_task(r, &left),
+                            task: Some(review_task(id)),
+                            short: Some(format!("{id}: review the PR as described above, then call `submit_findings`.")),
+                        });
+                    }
+                    Phase::Offering | Phase::Reviewing => out.push(Action::info(
+                        id,
+                        format!("{id}: your findings are in; everyone's are revealed once all reviewers have submitted. Call `wait`."),
+                    )),
+                    Phase::Voting(round) if r.replying => {
+                        let mine = r.contested_by(name);
+                        if mine.is_empty() || r.replied.contains(name) {
+                            out.push(Action::info(
+                                id,
+                                format!("{id}: round {round} votes open once the authors of contested findings have replied (at most {left}). Call `wait`."),
+                            ));
                         } else {
                             out.push(Action {
-                                review: r.id.clone(),
-                                urgent: true,
-                                text: text::vote_task(r, name, &owed, &left),
+                                review: id.clone(),
+                                urgent: false,
+                                text: format!(
+                                    "{id}: your findings {} are contested. Before round {round} votes open (in {left}), `amend_finding`, `withdraw_finding`, or `say` why they stand. Then call `wait`.",
+                                    mine.join(", ")
+                                ),
+                                task: Some(reply_task(r)),
+                                short: Some(format!("{id}: reply as described above (within {left}), then call `wait`.")),
                             });
                         }
                     }
-                    _ => out.push(Action {
-                        review: r.id.clone(),
-                        urgent: false,
-                        text: format!(
-                            "{}: waiting for the other reviewers ({}, ends in {left}). Call `wait`.",
-                            r.id,
-                            r.phase.label()
-                        ),
-                    }),
+                    Phase::Voting(round) => {
+                        let owed = r.owed_votes(name);
+                        if owed.is_empty() {
+                            let voted = r.findings.iter().any(|f| f.open_round == round && f.votes.get(name).is_some_and(|v| v.round == round));
+                            out.push(Action::info(
+                                id,
+                                if voted {
+                                    format!("{id}: your votes for round {round} are in. Call `wait` for the other reviewers (you may `say` something meanwhile). Round ends in {left}.")
+                                } else {
+                                    format!("{id}: nothing for you to vote on in round {round}. Call `wait` (you may `say` something meanwhile). Round ends in {left}.")
+                                },
+                            ));
+                        } else {
+                            let ids: Vec<&str> = owed.iter().map(|f| f.id.as_str()).collect();
+                            out.push(Action {
+                                review: id.clone(),
+                                urgent: true,
+                                text: text::vote_task(r, &owed, &left),
+                                task: Some(vote_task(r, &owed)),
+                                short: Some(format!("{id}: vote on {} as described above.", ids.join(", "))),
+                            });
+                        }
+                    }
+                    Phase::Done | Phase::Failed => {}
                 }
             } else if r.phase == Phase::Offering
                 && r.offered.contains(name)
@@ -852,25 +988,26 @@ impl State {
                 && idle
             {
                 out.push(Action {
-                    review: r.id.clone(),
+                    review: id.clone(),
                     urgent: true,
                     text: format!(
-                        "{}: review offer for {} from {}. Call `accept_review` (review_id \"{}\") to take it or `decline_review` if you can't. Offer closes in {left}.",
-                        r.id, r.pr.url(), r.author, r.id
+                        "{id}: review offer for {} from {}. Call `accept_review` (review_id \"{id}\") to take it or `decline_review` if you can't. Offer closes in {left}.",
+                        r.pr.url(),
+                        r.author
                     ),
+                    task: Some(offer_task(id)),
+                    short: Some(format!("{id}: accept or decline the offer above.")),
                 });
             }
             if r.author == name {
-                out.push(Action {
-                    review: r.id.clone(),
-                    urgent: false,
-                    text: format!(
-                        "{}: your review of {} is in {} (ends in {left}). Call `wait`; the consolidated result will arrive as an event.",
-                        r.id,
+                out.push(Action::info(
+                    id,
+                    format!(
+                        "{id}: your review of {} is in {} (ends in {left}). Call `wait`; the consolidated result will arrive as an event.",
                         r.pr.short(),
                         r.phase.label()
                     ),
-                });
+                ));
             }
         }
         out.sort_by_key(|a| !a.urgent);
@@ -933,6 +1070,7 @@ impl State {
             offer_secs: req.offer_secs.unwrap_or(t.offer_secs).clamp(5, 3600),
             review_secs: req.review_secs.unwrap_or(t.review_secs).clamp(10, 4 * 3600),
             vote_secs: req.vote_secs.unwrap_or(t.vote_secs).clamp(10, 4 * 3600),
+            reply_secs: t.reply_secs.min(600),
         };
         self.next_review += 1;
         let mut r = Review {
@@ -959,6 +1097,8 @@ impl State {
             since_sha: None,
             head_sha: req.head_sha,
             next_finding: 0,
+            replying: false,
+            replied: BTreeSet::new(),
         };
         let from = if r.picked.is_empty() { String::new() } else { format!(" from {}", r.picked.join(", ")) };
         r.log(now, author, "request", format!("requested {reviewers} reviewer(s){from}. {}", r.note));
@@ -1057,7 +1197,7 @@ impl State {
         if slot.submission.is_some() {
             bail!("you already submitted findings for {}; amend them during cross-examination", r.id);
         }
-        if r.phase != Phase::Reviewing {
+        if !matches!(r.phase, Phase::Offering | Phase::Reviewing) {
             bail!("{} is not in the independent review phase ({})", r.id, r.phase.label());
         }
         let head_sha = head_sha.trim();
@@ -1109,11 +1249,17 @@ impl State {
         Ok(n)
     }
 
-    pub fn vote(&mut self, agent: &str, id: &str, votes: Vec<VoteIn>, now: Ms) -> Result<usize> {
+    pub fn vote(&mut self, agent: &str, id: &str, votes: Vec<VoteIn>, now: Ms) -> Result<Voted> {
         let r = self.review_mut(id)?;
         let Phase::Voting(round) = r.phase else {
             bail!("{} is not in cross-examination ({}); call `wait`", r.id, r.phase.label());
         };
+        if r.replying {
+            bail!(
+                "round {round} votes open once the authors of contested findings have replied (at most {}); call `wait`",
+                text::dur(r.deadline_left(now))
+            );
+        }
         if !r.slot(agent).is_some_and(Slot::active) {
             bail!("you are not an active reviewer on {}", r.id);
         }
@@ -1128,13 +1274,15 @@ impl State {
             .collect();
         let open = format!("nothing was recorded; resend only votes on findings open in round {round}: {}", open.join(", "));
         let mut parsed = Vec::new();
+        let mut ignored = Vec::new();
         for v in &votes {
             let f = r.finding(&v.finding).ok_or_else(|| anyhow!("{} has no finding {}", r.id, v.finding))?;
             if f.by.as_deref() == Some(agent) {
                 bail!("{} is your own finding; use amend_finding or withdraw_finding instead", f.id);
             }
             if f.withdrawn.is_some() {
-                bail!("{} was withdrawn, so it needs no vote; {open}", f.id);
+                ignored.push(f.id.clone());
+                continue;
             }
             if f.open_round != round {
                 bail!("{} is not open for voting in round {round}; {open}", f.id);
@@ -1174,7 +1322,7 @@ impl State {
             let severity = severity.filter(|s| choice == Choice::Agree && *s != f.severity);
             parsed.push((f.id.clone(), choice, severity, reason));
         }
-        let n = parsed.len();
+        let recorded = parsed.len();
         for (fid, choice, severity, reason) in parsed {
             let line = match (&choice, severity) {
                 (Choice::Agree, Some(s)) => format!("{fid}: agree, as {}", s.as_str()),
@@ -1197,7 +1345,7 @@ impl State {
             r.log(now, agent, "vote", line);
         }
         self.advance(now);
-        Ok(n)
+        Ok(Voted { recorded, ignored })
     }
 
     pub fn say(&mut self, agent: &str, id: &str, msg: &str, now: Ms) -> Result<()> {
@@ -1211,11 +1359,15 @@ impl State {
             bail!("reviewers can discuss once findings are revealed (cross-examination); work independently until then");
         }
         r.log(now, agent, "say", msg.clone());
+        if r.replying {
+            r.replied.insert(agent.to_string());
+        }
         let to = r.others(agent);
         let rid = r.id.clone();
         for a in to {
             self.agents.notify(&a, &rid, format!("[{rid}] {agent} says:\n{msg}"), now);
         }
+        self.advance(now);
         Ok(())
     }
 
@@ -1271,9 +1423,17 @@ impl State {
         let line = format!("amended {} [{}]: {}", f.id, f.severity.as_str(), f.text);
         let fid = f.id.clone();
         r.log(now, agent, "amend", line);
+        r.replied.insert(agent.to_string());
         let rid = r.id.clone();
+        let author = r.author.clone();
+        let replying = r.replying;
         for a in r.others(agent) {
-            self.agents.notify(&a, &rid, format!("[{rid}] {agent} amended {fid}; votes on it are reopened."), now);
+            let text = format!("[{rid}] {agent} amended {fid}; votes on it are reopened.");
+            if a == author || replying {
+                self.agents.progress(&a, &rid, text, now);
+            } else {
+                self.agents.notify(&a, &rid, text, now);
+            }
         }
         self.advance(now);
         Ok(())
@@ -1286,9 +1446,10 @@ impl State {
         f.withdrawn = Some(reason.clone());
         let fid = f.id.clone();
         r.log(now, agent, "withdraw", format!("withdrew {fid}. {reason}"));
+        r.replied.insert(agent.to_string());
         let rid = r.id.clone();
         for a in r.others(agent) {
-            self.agents.notify(&a, &rid, format!("[{rid}] {agent} withdrew {fid}: no vote needed."), now);
+            self.agents.progress(&a, &rid, format!("[{rid}] {agent} withdrew {fid}: no vote needed."), now);
         }
         self.advance(now);
         Ok(())
@@ -1329,6 +1490,7 @@ impl State {
         req.review_secs = Some(prev.params.review_secs);
         req.vote_secs = Some(prev.params.vote_secs);
         let mut r = self.new_review(author, req, now)?;
+        r.params.reply_secs = prev.params.reply_secs;
         let busy: HashSet<String> = self
             .reviews
             .iter()
@@ -1377,6 +1539,11 @@ impl State {
                 submission: None,
             });
             r.log(now, &agent, "accept", format!("assigned again (reviewed {})", prev.id));
+        }
+        let left = format!("at least {}", text::dur(r.params.review_secs * 1000));
+        for s in &r.slots {
+            let text = format!("[{}] You are assigned again (you reviewed {}).\n{}", r.id, prev.id, text::review_task(&r, &left));
+            self.agents.notify_task(&s.agent, &r.id, review_task(&r.id), text, now);
         }
         let new_id = r.id.clone();
         self.reviews.push(r);
@@ -1469,7 +1636,7 @@ impl State {
                     .collect();
                 for a in eligible {
                     r.offered.insert(a.clone());
-                    agents.notify(&a, &r.id, text::offer(r, now), now);
+                    agents.notify_task(&a, &r.id, offer_task(&r.id), text::offer(r, now), now);
                     changed = true;
                 }
                 let n = r.active_slots().count();
@@ -1510,6 +1677,17 @@ impl State {
             }
             Phase::Voting(round) => {
                 let mut changed = drop_silent(r, agents, drop_ms, now);
+                if r.replying {
+                    let waiting = r
+                        .active_slots()
+                        .any(|s| !r.replied.contains(&s.agent) && !r.contested_by(&s.agent).is_empty());
+                    if now < r.deadline && waiting {
+                        return changed;
+                    }
+                    r.replying = false;
+                    open_votes(r, agents, false, now);
+                    return true;
+                }
                 let owing = |r: &Review| -> Vec<String> {
                     r.active_slots()
                         .filter(|s| !r.owed_votes(&s.agent).is_empty())
@@ -1571,7 +1749,7 @@ fn drop_slot(r: &mut Review, agents: &mut Agents, agent: &str, why: &str, now: M
     }
     r.log(now, agent, "drop", format!("dropped: {why}"));
     agents.notify(agent, &r.id, format!("[{}] You were dropped from the review ({why}). You are free for other reviews; call `wait`.", r.id), now);
-    agents.notify(&r.author, &r.id, format!("[{}] {agent} was dropped ({why}); the review continues with the others.", r.id), now);
+    agents.progress(&r.author, &r.id, format!("[{}] {agent} was dropped ({why}); the review continues with the others.", r.id), now);
 }
 
 fn start_reviewing(r: &mut Review, agents: &mut Agents, now: Ms) {
@@ -1581,14 +1759,11 @@ fn start_reviewing(r: &mut Review, agents: &mut Agents, now: Ms) {
     r.log(now, "relay", "phase", format!("independent review started with {}", names.join(", ")));
     for a in r.offered.clone() {
         if !names.contains(&a) && !r.declined.contains(&a) {
-            agents.notify(&a, &r.id, format!("[{}] Offer closed: the review has its reviewers. Call `wait`.", r.id), now);
+            agents.progress(&a, &r.id, format!("[{}] Offer closed: the review has its reviewers. Call `wait`.", r.id), now);
         }
     }
     let left = text::dur(r.deadline_left(now));
-    for a in &names {
-        agents.notify(a, &r.id, format!("[{}] You are assigned.\n{}", r.id, text::review_task(r, &left)), now);
-    }
-    agents.notify(
+    agents.progress(
         &r.author,
         &r.id,
         format!(
@@ -1603,7 +1778,7 @@ fn start_reviewing(r: &mut Review, agents: &mut Agents, now: Ms) {
 
 fn start_voting(r: &mut Review, agents: &mut Agents, round: u8, web: &str, now: Ms) {
     r.phase = Phase::Voting(round);
-    r.deadline = now + r.params.vote_secs * 1000;
+    r.replied.clear();
     let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
     let owed: usize = names.iter().map(|a| r.owed_votes(a).len()).sum();
     if owed == 0 {
@@ -1611,30 +1786,54 @@ fn start_voting(r: &mut Review, agents: &mut Agents, round: u8, web: &str, now: 
         return;
     }
     r.log(now, "relay", "phase", format!("cross-examination round {round} started"));
+    let authors: Vec<String> = names.into_iter().filter(|a| !r.contested_by(a).is_empty()).collect();
+    if authors.is_empty() || r.params.reply_secs == 0 {
+        open_votes(r, agents, false, now);
+        return;
+    }
+    r.replying = true;
+    r.deadline = now + r.params.reply_secs * 1000;
+    let left = text::dur(r.deadline_left(now));
+    for a in &authors {
+        let text = format!("[{}] {}", r.id, text::reply_task(r, a, &left));
+        agents.notify_task(a, &r.id, reply_task(r), text, now);
+    }
+    open_votes(r, agents, true, now);
+}
+
+/// Sends the round's vote tasks; while `replying`, only tells the PR author the round has begun.
+fn open_votes(r: &mut Review, agents: &mut Agents, replying: bool, now: Ms) {
+    let round = r.round();
+    let open = r.findings.iter().filter(|f| f.open_round == round && f.withdrawn.is_none()).count();
+    let msg = if replying {
+        format!("[{}] Cross-examination round {round}: the authors of contested findings may reply before the reviewers vote again on {open} finding(s). Call `wait`.", r.id)
+    } else {
+        format!("[{}] Cross-examination round {round}: reviewers are voting on {open} finding(s). Call `wait`.", r.id)
+    };
+    agents.progress(&r.author, &r.id, msg, now);
+    if replying {
+        return;
+    }
+    r.deadline = now + r.params.vote_secs * 1000;
+    let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
+    if names.iter().all(|a| r.owed_votes(a).is_empty()) {
+        return;
+    }
     let left = text::dur(r.deadline_left(now));
     for a in &names {
         let owed = r.owed_votes(a);
-        let msg = if owed.is_empty() {
-            format!(
-                "[{}] Round {round} started; nothing for you to vote on (your own findings are being discussed: you may `amend_finding` or `withdraw_finding`, or `say` something). Call `wait`.\n\n{}",
+        if !owed.is_empty() {
+            let text = format!("[{}] {}", r.id, text::vote_task(r, &owed, &left));
+            agents.notify_task(a, &r.id, vote_task(r, &owed), text, now);
+        } else if round == 1 {
+            let text = format!(
+                "[{}] Round 1 started; nothing for you to vote on (your own findings are being discussed: you may `amend_finding` or `withdraw_finding`, or `say` something). Call `wait`.\n\n{}",
                 r.id,
-                text::findings_for(r, round)
-            )
-        } else {
-            format!("[{}] {}", r.id, text::vote_task(r, a, &owed, &left))
-        };
-        agents.notify(a, &r.id, msg, now);
+                text::round_findings(r, &[])
+            );
+            agents.notify(a, &r.id, text, now);
+        }
     }
-    agents.notify(
-        &r.author,
-        &r.id,
-        format!(
-            "[{}] Cross-examination round {round}: reviewers are voting on {} finding(s). Call `wait`.",
-            r.id,
-            r.findings.iter().filter(|f| f.open_round == round && f.withdrawn.is_none()).count()
-        ),
-        now,
-    );
 }
 
 fn finish(r: &mut Review, agents: &mut Agents, web: &str, now: Ms) {
@@ -1653,7 +1852,7 @@ fn finish(r: &mut Review, agents: &mut Agents, web: &str, now: Ms) {
     agents.notify(&r.author, &r.id, body, now);
     let names: Vec<String> = r.slots.iter().filter(|s| s.active()).map(|s| s.agent.clone()).collect();
     for a in names {
-        agents.notify(
+        agents.progress(
             &a,
             &r.id,
             format!("[{}] Review finished: {}. Thanks; you are free for other reviews. Call `wait`.", r.id, verdict.as_str()),

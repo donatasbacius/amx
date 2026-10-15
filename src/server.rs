@@ -284,7 +284,7 @@ async fn obligation(State(hub): St, Extension(who): Extension<Identity>, Query(q
         )
     });
     let role = role.unwrap_or(Role::Author);
-    let mut text = crate::mcp::next_text(&actions, role, false);
+    let mut text = crate::mcp::next_text(&actions, role, &[]);
     if pending {
         text = format!("You have undelivered amx events: call `wait` now.\n\n{text}");
     }

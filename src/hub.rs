@@ -109,7 +109,8 @@ impl Hub {
     }
 
     /// Blocks until `name` has new events or something it must act on, or the timeout passes.
-    pub async fn wait(&self, name: &str, timeout: Duration) -> (Vec<AgentEvent>, Vec<Action>) {
+    /// Progress events are dropped unless `progress` is set.
+    pub async fn wait(&self, name: &str, timeout: Duration, progress: bool) -> (Vec<AgentEvent>, Vec<Action>) {
         let mut rx = self.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         self.state.lock().unwrap().set_waiting(name, 1, now_ms());
@@ -122,7 +123,7 @@ impl Hub {
             let (events, actions) = {
                 let mut st = self.state.lock().unwrap();
                 let now = now_ms();
-                let ev = st.take_events(name);
+                let ev = st.take_events(name, progress);
                 (ev, st.next_actions(name, now))
             };
             let urgent = actions.iter().any(|a| a.urgent);
@@ -138,7 +139,7 @@ impl Hub {
         }
     }
 
-    /// Events after `after` without consuming them; keeps the agent online while it blocks.
+    /// Events after `after` without consuming them, progress left out; keeps the agent online while it blocks.
     pub async fn watch_events(&self, name: &str, after: u64, timeout: Duration) -> (Vec<AgentEvent>, u64) {
         let mut rx = self.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
@@ -149,7 +150,8 @@ impl Hub {
         };
         loop {
             rx.borrow_and_update();
-            let (events, last) = self.state.lock().unwrap().peek_events(name, after);
+            let (mut events, last) = self.state.lock().unwrap().peek_events(name, after);
+            events.retain(|e| !e.progress);
             if !events.is_empty() || last < after {
                 return (events, last);
             }
