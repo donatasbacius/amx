@@ -267,11 +267,13 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     assert!(v["deadline_left_ms"].as_u64().unwrap() > 0);
 
     ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
-    ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree"}]})).await;
+    ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree","severity":"major"}]})).await;
     let v: Value = get("/api/reviews/r1").await.unwrap().json().await.unwrap();
     assert_eq!(v["phase"], "done");
     assert_eq!(v["verdict"], "changes_requested");
     assert_eq!(v["findings"][0]["votes"]["rev-b"]["choice"], "Agree");
+    assert_eq!(v["findings"][0]["votes"]["rev-b"]["severity"], "major", "the severity the vote backs");
+    assert!(v["log"].as_array().unwrap().iter().any(|e| e["text"] == "F1: agree (major)"), "{}", v["log"]);
     assert_eq!(v["summary"][0], json!({"id":"F1","title":"SECRET until revealed","severity":"major","severity_split":null,"by":"rev-a","origin":null,"outcome":"confirmed","agree":2,"disagree":0}));
     assert!(v["result"]["text"].as_str().unwrap().contains("CHANGES REQUESTED"));
     assert!(v["log"].as_array().unwrap().iter().any(|e| e["kind"] == "result"));
@@ -450,17 +452,23 @@ async fn wait_points_to_tasks_instead_of_repeating_them() {
     let last = ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[{"severity":"nit","text":"rename x"}]})).await;
     assert!(last.contains("You must vote on: F1, F2.") && last.matches("cache never invalidated").count() == 1, "{last}");
     assert!(!last.contains("finding: \"F3\""), "the example never names your own finding: {last}");
+    let owed = ok_tool(&base, "rev-b", "wait", json!({})).await;
+    assert_eq!(owed, "NEXT: r1: vote on F1, F2 as described above.", "a task already given is only pointed to");
 
     let vote = ok_tool(&base, "rev-a", "wait", json!({"timeout_seconds": 5})).await;
     assert_eq!(vote.matches("rename x").count(), 1, "{vote}");
     assert!(vote.contains("You must vote on: F3.") && vote.ends_with("NEXT: r1: vote on F3 as described above."), "{vote}");
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
+    assert_eq!(rpc(&base, "rev-a", init).await.0, 200);
+    let again = ok_tool(&base, "rev-a", "wait", json!({})).await;
+    assert!(again.contains("You must vote on: F3.") && again.contains("rename x"), "a new session gets the task in full: {again}");
 
     ok_tool(&base, "rev-a", "withdraw_finding", json!({"review_id":"r1","finding":"F2","reason":"fixed upstream"})).await;
     let voted = ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree"},{"finding":"F2","vote":"agree"}]})).await;
     assert!(voted.contains("Recorded 1 vote(s) on r1. Ignored your votes on F2: withdrawn by their authors."), "{voted}");
 
     let quiet = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 1})).await;
-    assert!(quiet.starts_with("No new events."), "progress doesn't wake the author: {quiet}");
+    assert!(quiet.starts_with("No new events.") && quiet.lines().count() == 3, "progress doesn't wake the author: {quiet}");
     ok_tool(&base, "rev-a", "vote", json!({"review_id":"r1","votes":[{"finding":"F3","vote":"agree"}]})).await;
     let result = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 5})).await;
     assert!(result.starts_with("[r1] Review result") && !result.contains("===") && !result.contains("nothing pending"), "{result}");

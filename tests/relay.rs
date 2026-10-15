@@ -950,3 +950,67 @@ fn snapshots_from_0_4_still_load() {
     assert_eq!(s.review(&id).unwrap().params.reply_secs, 90);
     assert!(s.next_actions("rev-b", sim.now)[0].text.contains("accept_review"));
 }
+
+#[test]
+fn a_new_session_drops_events_about_reviews_it_is_no_longer_in() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "off by one")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    sim.s.say("rev-a", &id, "Glad to help.", sim.now).unwrap();
+    assert!(sim.s.has_undelivered("alice-codex"), "the result is owed to the author");
+    sim.s.new_session("alice-codex");
+    let author = sim.events("alice-codex");
+    assert!(author.contains("Review result") && !author.contains("Glad to help"), "{author}");
+
+    sim.s.say("alice-codex", &id, "Thanks, fixing it.", sim.now).unwrap();
+    assert!(!sim.s.has_undelivered("rev-a"), "closing remarks don't keep a reviewer from stopping");
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    assert!(sim.s.has_undelivered("rev-a"));
+    sim.s = reload(&sim.s, sim.now, sim.now);
+    sim.s.new_session("rev-a");
+    let a = sim.events("rev-a");
+    assert!(a.contains(&format!("[{id2}] You are assigned again")) && !a.contains("fixing it"), "a reviewer that reconnects keeps its task: {a}");
+    sim.s.new_session("rev-b");
+    let b = sim.events("rev-b");
+    assert!(b.contains("assigned again") && !b.contains("fixing it") && !b.contains("Review finished"), "{b}");
+}
+
+#[test]
+fn snapshots_from_0_5_still_load() {
+    let mut sim = setup(&["rev-a"]);
+    let id = sim.request("alice-codex", 1);
+    sim.accept("rev-a", &id);
+    sim.submit("rev-a", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    let mut v = serde_json::to_value(sim.s.snapshot(sim.now)).unwrap();
+    assert!(v.to_string().contains("\"result\":true"));
+    for a in v["agents"].as_array_mut().unwrap() {
+        for e in a["events"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("result");
+        }
+    }
+    let mut s = State::new(Timing::default(), Consensus::default(), 50);
+    s.restore(serde_json::from_value(v).unwrap(), sim.now);
+    assert!(s.take_events("alice-codex", false)[0].text.contains("Review result"));
+}
+
+#[test]
+fn transcript_shows_the_severity_an_agree_vote_backs() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("minor", "bidi characters pass through")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.s.vote("rev-b", &id, vec![rate("F1", "minor")], sim.now).unwrap();
+    assert_eq!(sim.phase(&id), Phase::Done, "rating it as raised is plain agreement");
+    let r = sim.s.review(&id).unwrap();
+    assert!(r.finding("F1").unwrap().votes["rev-b"].severity.is_none());
+    assert!(r.log.iter().any(|e| e.text == "F1: agree (minor) — real, but overstated"), "{:?}", r.log);
+    assert!(amx::web::render_review(r, sim.now).contains("agree (minor)"));
+}

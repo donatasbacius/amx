@@ -56,9 +56,8 @@ pub fn tools() -> Value {
         },
         {
             "name": "wait",
-            "description": "Block until something needs you (a review offer, a review or vote task, a message, the result) or the timeout passes, then return the new events and a NEXT line telling you exactly what to do. Returns immediately if you already owe an action. Reviewers: call this in a loop forever. Authors: call it after request_review until the result arrives. Also keeps you marked online.",
+            "description": "Block until something needs you (a review offer, a review or vote task, a message, the result), then return the new events and a NEXT line telling you exactly what to do. If nothing happens for a while it returns \"No new events.\"; just call it again. Returns immediately if you already owe an action. Reviewers: call this in a loop forever. Authors: call it after request_review until the result arrives. Also keeps you marked online.",
             "inputSchema": { "type": "object", "properties": {
-                "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_MAX, "description": format!("Default {WAIT_DEFAULT}, max {WAIT_MAX}; through `amx mcp`, leave it out to wait up to its --wait-max.") },
                 "progress": { "type": "boolean", "description": "Also wake for progress that needs no action from you (phase changes, dropped reviewers, withdrawn findings, a finished review). Default false." }
             } }
         },
@@ -267,9 +266,9 @@ struct StatusArgs {
     review_id: Option<String>,
 }
 
-/// The NEXT lines for `actions`. A task whose full text is in one of `events` gets a one-line
-/// pointer, and the idle line is left out when an event already says what to do.
-pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent]) -> String {
+/// The NEXT lines for `actions`. A task whose full text is in one of `events` or in `seen` gets
+/// a one-line pointer, and the idle line is left out when an event already says what to do.
+pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], seen: &[String]) -> String {
     if actions.is_empty() {
         return match role {
             _ if events.iter().any(|e| e.text.contains("NEXT:")) => String::new(),
@@ -281,7 +280,9 @@ pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent]) -> Strin
     let lines: Vec<String> = actions
         .iter()
         .map(|a| match (&a.task, &a.short) {
-            (Some(t), Some(short)) if events.iter().any(|e| e.task.as_ref() == Some(t)) => format!("NEXT: {short}"),
+            (Some(t), Some(short)) if seen.contains(t) || events.iter().any(|e| e.task.as_ref() == Some(t)) => {
+                format!("NEXT: {short}")
+            }
             _ if a.text.contains("NEXT:") => format!("[{}] {}", a.review, a.text),
             _ => format!("NEXT: {}", a.text),
         })
@@ -293,15 +294,25 @@ fn role_of(hub: &Hub, agent: &str) -> Role {
     hub.read(|s, _| s.agents.get(agent).map(|a| a.role).unwrap_or(Role::Author))
 }
 
+/// The actions owed now, the tasks among them this session has already been given, and marks
+/// them all as given.
+fn owed(hub: &Hub, agent: &str, events: &[AgentEvent]) -> (Vec<Action>, Vec<String>) {
+    hub.write(|s, now| {
+        let actions = s.next_actions(agent, now);
+        let tasks: Vec<String> = actions.iter().filter_map(|a| a.task.clone()).collect();
+        let seen = tasks.iter().filter(|t| s.was_shown(agent, t)).cloned().collect();
+        let given: Vec<String> = tasks.into_iter().chain(events.iter().filter_map(|e| e.task.clone())).collect();
+        s.mark_shown(agent, &given);
+        (actions, seen)
+    })
+}
+
 /// Appends the NEXT lines; tasks shown here in full are not delivered again by `wait`.
 fn with_next(hub: &Hub, agent: &str, head: String) -> String {
-    let actions = hub.write(|s, now| {
-        let actions = s.next_actions(agent, now);
-        let shown: Vec<String> = actions.iter().filter_map(|a| a.task.clone()).collect();
-        s.forget_tasks(agent, &shown);
-        actions
-    });
-    format!("{head}\n\n{}", next_text(&actions, role_of(hub, agent), &[]))
+    let (actions, seen) = owed(hub, agent, &[]);
+    let tasks: Vec<String> = actions.iter().filter_map(|a| a.task.clone()).collect();
+    hub.write(|s, _| s.forget_tasks(agent, &tasks));
+    format!("{head}\n\n{}", next_text(&actions, role_of(hub, agent), &[], &seen))
 }
 
 async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<String> {
@@ -322,10 +333,12 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value) -> Result<Strin
         "wait" => {
             let w: WaitArgs = args(a)?;
             let secs = w.timeout_seconds.unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX);
-            let (events, actions) = hub.wait(agent, Duration::from_secs(secs), w.progress).await;
+            let (events, _) = hub.wait(agent, Duration::from_secs(secs), w.progress).await;
+            let (actions, seen) = owed(hub, agent, &events);
             let role = role_of(hub, agent);
-            let next = next_text(&actions, role, &events);
+            let next = next_text(&actions, role, &events, &seen);
             Ok(match (events.is_empty(), next.is_empty()) {
+                (true, _) if actions.iter().any(|a| a.urgent) => next,
                 (true, _) => format!("No new events.\n\n{next}"),
                 (false, true) => text::events(&events),
                 (false, false) => format!("{}\n\n===\n{next}", text::events(&events)),
@@ -506,6 +519,7 @@ pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, 
             {
                 return Some(error_response(id, -32000, &format!("{e:#}")));
             }
+            hub.write(|s, _| s.new_session(agent));
             let requested = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
             let version = if PROTOCOL_VERSIONS.contains(&requested) {
                 requested
@@ -564,5 +578,7 @@ mod tests {
             .filter(|n| !super::ACTIVE_TOOLS.contains(n))
             .collect();
         assert_eq!(read_only, ["online", "review_status"]);
+        let wait = tools.as_array().unwrap().iter().find(|t| t["name"] == "wait").unwrap();
+        assert!(wait["inputSchema"]["properties"].get("timeout_seconds").is_none(), "models set any timeout they see");
     }
 }

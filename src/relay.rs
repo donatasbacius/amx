@@ -110,6 +110,23 @@ pub struct AgentEvent {
     /// Needs no action; `wait` skips it unless asked for progress.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub progress: bool,
+    /// A review's result or failure notice for its author.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub result: bool,
+}
+
+impl AgentEvent {
+    fn new(review: &str, text: String, now: Ms) -> AgentEvent {
+        AgentEvent {
+            seq: 0,
+            at: now,
+            review: Some(review.to_string()),
+            text,
+            task: None,
+            progress: false,
+            result: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +143,9 @@ pub struct Agent {
     events: VecDeque<AgentEvent>,
     next_seq: u64,
     delivered: u64,
+    /// Task parts (see `task_parts`) given in full to the current session.
+    #[serde(skip)]
+    shown: HashSet<String>,
 }
 
 pub struct Agents {
@@ -155,28 +175,26 @@ impl Agents {
     }
 
     fn notify(&mut self, name: &str, review: &str, text: String, now: Ms) {
-        self.push(name, review, text, None, false, now);
+        self.push(name, AgentEvent::new(review, text, now));
     }
 
     fn notify_task(&mut self, name: &str, review: &str, task: String, text: String, now: Ms) {
-        self.push(name, review, text, Some(task), false, now);
+        self.push(name, AgentEvent { task: Some(task), ..AgentEvent::new(review, text, now) });
     }
 
     fn progress(&mut self, name: &str, review: &str, text: String, now: Ms) {
-        self.push(name, review, text, None, true, now);
+        self.push(name, AgentEvent { progress: true, ..AgentEvent::new(review, text, now) });
     }
 
-    fn push(&mut self, name: &str, review: &str, text: String, task: Option<String>, progress: bool, now: Ms) {
+    fn outcome(&mut self, name: &str, review: &str, text: String, now: Ms) {
+        self.push(name, AgentEvent { result: true, ..AgentEvent::new(review, text, now) });
+    }
+
+    fn push(&mut self, name: &str, mut ev: AgentEvent) {
         if let Some(a) = self.map.get_mut(name) {
             a.next_seq += 1;
-            a.events.push_back(AgentEvent {
-                seq: a.next_seq,
-                at: now,
-                review: Some(review.to_string()),
-                text,
-                task,
-                progress,
-            });
+            ev.seq = a.next_seq;
+            a.events.push_back(ev);
             while a.events.len() > MAX_EVENTS {
                 a.events.pop_front();
             }
@@ -634,6 +652,14 @@ pub fn vote_task(r: &Review, owed: &[&Finding]) -> String {
     format!("{}:vote:{}:{}", r.id, r.round(), ids.join(","))
 }
 
+/// A vote task counts as shown once each finding revision in it has been, so a shrinking list isn't repeated.
+fn task_parts(task: &str) -> Vec<String> {
+    match task.rsplit_once(':') {
+        Some((head, ids)) if head.contains(":vote:") => ids.split(',').map(|i| format!("{head}:{i}")).collect(),
+        _ => vec![task.to_string()],
+    }
+}
+
 #[derive(Debug)]
 /// What a `vote` call recorded, and the votes it skipped because their finding was withdrawn.
 pub struct Voted {
@@ -793,6 +819,7 @@ impl State {
             events: VecDeque::new(),
             next_seq: 0,
             delivered: 0,
+            shown: HashSet::new(),
         });
         if now.saturating_sub(a.last_seen) >= timing.online_secs * 1000 && a.waiting == 0 {
             a.first_seen = now;
@@ -875,13 +902,57 @@ impl State {
         fresh
     }
 
+    /// Undelivered events that need the agent; talk on finished reviews doesn't.
     pub fn has_undelivered(&self, name: &str) -> bool {
         let open = self.open_tasks(name);
         self.agents.get(name).is_some_and(|a| {
             a.events
                 .iter()
-                .any(|e| e.seq > a.delivered && !e.progress && e.task.as_ref().is_none_or(|t| open.contains(t)))
+                .any(|e| e.seq > a.delivered && !e.progress && self.live(name, e, &open))
         })
+    }
+
+    /// An open task, its author's result, or anything about an unfinished review `name` is in.
+    fn live(&self, name: &str, e: &AgentEvent, open: &HashSet<String>) -> bool {
+        match &e.task {
+            Some(t) => open.contains(t),
+            None => {
+                e.result
+                    || e.review
+                        .as_deref()
+                        .and_then(|id| self.review(id))
+                        .is_some_and(|r| r.phase.active() && r.participant(name))
+            }
+        }
+    }
+
+    /// A new MCP session under `name`: forgets what the previous one was shown and the queued
+    /// events it no longer needs.
+    pub fn new_session(&mut self, name: &str) {
+        let open = self.open_tasks(name);
+        let Some(a) = self.agents.get(name) else {
+            return;
+        };
+        let keep: HashSet<u64> = a.events.iter().filter(|e| self.live(name, e, &open)).map(|e| e.seq).collect();
+        if let Some(a) = self.agents.map.get_mut(name) {
+            a.events.retain(|e| keep.contains(&e.seq));
+            a.shown.clear();
+        }
+    }
+
+    /// Records that `name` has been given these tasks in full.
+    pub fn mark_shown(&mut self, name: &str, tasks: &[String]) {
+        let open: HashSet<String> = self.open_tasks(name).iter().flat_map(|t| task_parts(t)).collect();
+        if let Some(a) = self.agents.map.get_mut(name) {
+            a.shown.extend(tasks.iter().flat_map(|t| task_parts(t)));
+            a.shown.retain(|p| open.contains(p));
+        }
+    }
+
+    pub fn was_shown(&self, name: &str, task: &str) -> bool {
+        self.agents
+            .get(name)
+            .is_some_and(|a| task_parts(task).iter().all(|p| a.shown.contains(p)))
     }
 
     fn open_tasks(&self, name: &str) -> HashSet<String> {
@@ -1324,24 +1395,18 @@ impl State {
         }
         let recorded = parsed.len();
         for (fid, choice, severity, reason) in parsed {
-            let line = match (&choice, severity) {
-                (Choice::Agree, Some(s)) => format!("{fid}: agree, as {}", s.as_str()),
-                (Choice::Agree, None) => format!("{fid}: agree"),
-                (Choice::Disagree, _) => format!("{fid}: disagree"),
-                (Choice::Duplicate(t), _) => format!("{fid}: duplicate of {t}"),
-            } + &reason.as_deref().map(|s| format!(" — {s}")).unwrap_or_default();
             let f = r.findings.iter_mut().find(|f| f.id == fid).expect("validated");
-            f.votes.insert(
-                agent.to_string(),
-                Vote {
-                    choice,
-                    severity,
-                    reason,
-                    round,
-                    revision: f.revision,
-                    at: now,
-                },
-            );
+            let vote = Vote {
+                choice,
+                severity,
+                reason,
+                round,
+                revision: f.revision,
+                at: now,
+            };
+            let line = format!("{fid}: {}", text::vote_label(f, &vote))
+                + &vote.reason.as_deref().map(|s| format!(" — {s}")).unwrap_or_default();
+            f.votes.insert(agent.to_string(), vote);
             r.log(now, agent, "vote", line);
         }
         self.advance(now);
@@ -1849,7 +1914,7 @@ fn finish(r: &mut Review, agents: &mut Agents, web: &str, now: Ms) {
         text: body.clone(),
     });
     r.log(now, "relay", "result", format!("consensus: {}", verdict.as_str()));
-    agents.notify(&r.author, &r.id, body, now);
+    agents.outcome(&r.author, &r.id, body, now);
     let names: Vec<String> = r.slots.iter().filter(|s| s.active()).map(|s| s.agent.clone()).collect();
     for a in names {
         agents.progress(
@@ -1866,7 +1931,7 @@ fn fail(r: &mut Review, agents: &mut Agents, why: &str, now: Ms) {
     r.ended = Some(now);
     r.failure = Some(why.to_string());
     r.log(now, "relay", "failed", why);
-    agents.notify(&r.author, &r.id, format!("[{}] Review of {} failed: {why}. You can try `request_review` again later.", r.id, r.pr.url()), now);
+    agents.outcome(&r.author, &r.id, format!("[{}] Review of {} failed: {why}. You can try `request_review` again later.", r.id, r.pr.url()), now);
     let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
     for a in names {
         agents.notify(&a, &r.id, format!("[{}] Review cancelled: {why}. Call `wait`.", r.id), now);
