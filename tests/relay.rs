@@ -366,6 +366,7 @@ fn missed_deadline_drops_reviewer() {
     let r = sim.s.review(&id).unwrap();
     assert_eq!(r.slot("rev-b").unwrap().dropped.as_deref(), Some("missed the review deadline"));
     assert_eq!(sim.phase(&id), Phase::Done, "a single remaining reviewer has nobody to vote");
+    assert_eq!(sim.status(&id, "F1"), Status::Confirmed, "the only reviewer's word stands");
     assert!(sim.events("rev-b").contains("You were dropped"));
     let result = sim.events("alice-codex");
     assert!(result.contains("rev-b (dropped: missed the review deadline)"), "{result}");
@@ -1103,32 +1104,7 @@ fn outcome(sim: &Sim, id: &str, f: &str) -> amx::relay::Outcome {
 }
 
 #[test]
-fn votes_on_an_earlier_revision_do_not_count() {
-    let mut sim = setup(&["rev-a", "rev-b"]);
-    let id = sim.request("alice-codex", 2);
-    sim.accept("rev-a", &id);
-    sim.accept("rev-b", &id);
-    sim.submit("rev-a", &id, &[("minor", "small thing")]);
-    sim.submit("rev-b", &id, &[("nit", "typo")]);
-    sim.vote("rev-b", &id, &[("F1", "agree")]);
-    let change = AmendIn {
-        severity: Some("blocking".into()),
-        text: Some("now a blocker".into()),
-        ..Default::default()
-    };
-    sim.advance(590);
-    sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap();
-    sim.vote("rev-a", &id, &[("F2", "agree")]);
-    sim.advance(11);
-    assert_eq!(sim.phase(&id), Phase::Done);
-    assert!(sim.s.review(&id).unwrap().slot("rev-b").unwrap().active(), "an amendment too late to vote on drops nobody");
-    let o = outcome(&sim, &id, "F1");
-    assert_eq!((o.status, o.agree, o.disagree), (Status::Unverified, 1, 0), "rev-b agreed with the minor version only");
-    assert_eq!(sim.verdict(&id), Verdict::Approve, "its author's word alone doesn't make it a blocker");
-    let result = sim.events("alice-codex");
-    assert!(result.contains("Not cross-examined") && result.contains("now a blocker"), "{result}");
-    assert!(result.contains("rev-b: agree on an earlier revision, not counted (round 1)"), "{result}");
-
+fn findings_are_amended_only_in_the_reply_window() {
     let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
     let id = sim.request("alice-codex", 3);
     for r in ["rev-a", "rev-b", "rev-c"] {
@@ -1137,58 +1113,23 @@ fn votes_on_an_earlier_revision_do_not_count() {
     sim.submit("rev-a", &id, &[("minor", "small thing")]);
     sim.submit("rev-b", &id, &[]);
     sim.submit("rev-c", &id, &[]);
-    sim.vote("rev-b", &id, &[("F1", "agree")]);
-    sim.vote("rev-c", &id, &[("F1", "disagree")]);
-    assert_eq!(sim.phase(&id), Phase::Voting(2));
-    let change = AmendIn {
-        severity: Some("major".into()),
-        ..Default::default()
-    };
-    sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap();
-    sim.vote("rev-c", &id, &[("F1", "disagree")]);
-    sim.advance(601);
-    assert_eq!(sim.phase(&id), Phase::Done);
-    let o = outcome(&sim, &id, "F1");
-    assert_eq!((o.status, o.agree, o.disagree), (Status::Disputed, 1, 1), "a plain agree doesn't follow the finding to major");
-    assert_eq!(sim.verdict(&id), Verdict::Approve);
-    let result = sim.events("alice-codex");
-    assert!(result.contains("rev-b: agree on an earlier revision, not counted (round 1)"), "{result}");
-}
-
-#[test]
-fn reopening_a_settled_finding_late_drops_nobody_and_confirms_nothing() {
-    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
-    let id = sim.request("alice-codex", 3);
-    for r in ["rev-a", "rev-b", "rev-c"] {
-        sim.accept(r, &id);
-    }
-    sim.submit("rev-a", &id, &[("minor", "settled early")]);
-    sim.submit("rev-b", &id, &[("minor", "contested")]);
-    sim.submit("rev-c", &id, &[]);
-    sim.vote("rev-a", &id, &[("F2", "agree")]);
     sim.vote("rev-b", &id, &[("F1", "disagree")]);
-    sim.vote("rev-c", &id, &[("F1", "disagree"), ("F2", "disagree")]);
-    sim.skip_replies();
-    assert_eq!(sim.phase(&id), Phase::Voting(2));
-    sim.advance(590);
-    let change = AmendIn {
-        severity: Some("blocking".into()),
-        ..Default::default()
-    };
-    sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap();
-    sim.vote("rev-a", &id, &[("F2", "agree")]);
-    sim.vote("rev-c", &id, &[("F2", "agree")]);
-    sim.advance(11);
-    assert_eq!(sim.phase(&id), Phase::Done);
-    let r = sim.s.review(&id).unwrap();
-    assert!(r.active_slots().count() == 3, "{:?}", r.slots);
-    assert_eq!(sim.status(&id, "F1"), Status::Unverified, "a rejected finding doesn't come back on its author's word");
-    assert_eq!(sim.status(&id, "F2"), Status::Confirmed);
-    assert_eq!(sim.verdict(&id), Verdict::Approve);
+    let blocking = || AmendIn { severity: Some("blocking".into()), ..Default::default() };
+    let err = sim.s.amend("rev-a", &id, "F1", blocking(), sim.now).unwrap_err().to_string();
+    assert!(err.contains("reply window"), "rev-b already voted on it: {err}");
+    sim.vote("rev-c", &id, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Voting(2), "rev-b's objection carries it into round 2");
+    sim.s.amend("rev-a", &id, "F1", blocking(), sim.now).unwrap();
+    assert!(!sim.s.review(&id).unwrap().replying);
+    sim.vote("rev-c", &id, &[("F1", "agree")]);
+    assert!(sim.s.amend("rev-a", &id, "F1", blocking(), sim.now).is_err(), "votes on it are open");
+    sim.vote("rev-b", &id, &[("F1", "disagree")]);
+    let o = outcome(&sim, &id, "F1");
+    assert_eq!((o.status, o.severity), (Status::Confirmed, amx::relay::Severity::Major), "an objection keeps it from blocking");
 }
 
 #[test]
-fn a_vote_owed_from_the_round_start_still_drops_a_silent_voter() {
+fn a_voter_silent_on_an_amended_finding_is_dropped() {
     let mut sim = setup(&["rev-a", "rev-b"]);
     let id = sim.request("alice-codex", 2);
     sim.accept("rev-a", &id);
@@ -1196,15 +1137,40 @@ fn a_vote_owed_from_the_round_start_still_drops_a_silent_voter() {
     sim.submit("rev-a", &id, &[("major", "leak")]);
     sim.submit("rev-b", &id, &[]);
     sim.vote("rev-b", &id, &[("F1", "disagree")]);
-    sim.skip_replies();
+    let change = AmendIn { severity: Some("blocking".into()), ..Default::default() };
+    sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap();
     sim.advance(601);
     assert_eq!(sim.phase(&id), Phase::Done);
     let r = sim.s.review(&id).unwrap();
     assert_eq!(r.slot("rev-b").unwrap().dropped.as_deref(), Some("missed the round 2 voting deadline"));
+    assert_eq!(sim.status(&id, "F1"), Status::Unverified, "its author's word alone never confirms it");
+    let result = sim.events("alice-codex");
+    assert!(result.contains("rev-b: disagree on an earlier revision, not counted"), "{result}");
 }
 
 #[test]
-fn findings_nobody_cross_examined_are_unverified() {
+fn findings_nobody_else_backed_are_unverified() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("blocking", "says blocker")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.leave("rev-b");
+    sim.advance(301);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    assert_eq!(sim.status(&id, "F1"), Status::Unverified, "rev-b took part, so rev-a's word alone doesn't count");
+    assert_eq!(sim.verdict(&id), Verdict::Approve, "unverified findings don't decide the verdict");
+    let result = sim.events("alice-codex");
+    assert!(!result.contains("Confirmed findings") && result.contains("Not cross-examined") && result.contains("says blocker"), "{result}");
+    assert!(result.contains("F1 were not cross-examined"), "{result}");
+    assert!(amx::web::render_review(sim.s.review(&id).unwrap()).contains("unverified"));
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    assert_eq!(sim.s.review(&id2).unwrap().findings.len(), 1, "unverified findings are re-checked");
+}
+
+#[test]
+fn a_review_whose_reviewers_all_dropped_fails() {
     let mut sim = setup(&["rev-a", "rev-b"]);
     let id = sim.request("alice-codex", 2);
     sim.accept("rev-a", &id);
@@ -1214,27 +1180,10 @@ fn findings_nobody_cross_examined_are_unverified() {
     sim.leave("rev-a");
     sim.leave("rev-b");
     sim.advance(301);
-    assert_eq!(sim.phase(&id), Phase::Done);
-    assert_eq!(sim.status(&id, "F1"), Status::Unverified);
-    assert_eq!(sim.status(&id, "F2"), Status::Unverified);
-    assert_eq!(sim.verdict(&id), Verdict::Approve, "unverified findings don't decide the verdict");
+    assert_eq!(sim.phase(&id), Phase::Failed);
     let result = sim.events("alice-codex");
-    assert!(!result.contains("Confirmed findings") && result.contains("Not cross-examined") && result.contains("says blocker"), "{result}");
-    assert!(result.contains("F1, F2 were not cross-examined"), "{result}");
-    assert!(amx::web::render_review(sim.s.review(&id).unwrap()).contains("unverified"));
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
-    assert_eq!(sim.s.review(&id2).unwrap().findings.len(), 2, "unverified findings are re-checked");
-
-    let mut sim = setup(&["rev-a", "rev-b"]);
-    let id = sim.request("alice-codex", 2);
-    sim.accept("rev-a", &id);
-    sim.accept("rev-b", &id);
-    sim.submit("rev-a", &id, &[("major", "still here")]);
-    sim.submit("rev-b", &id, &[]);
-    sim.leave("rev-b");
-    sim.advance(301);
-    assert_eq!(sim.phase(&id), Phase::Done);
-    assert_eq!(sim.status(&id, "F1"), Status::Confirmed, "a reviewer still present stands by its finding");
+    assert!(result.contains("failed: all reviewers dropped out") && !result.contains("APPROVE"), "{result}");
+    assert!(amx::web::render_review(sim.s.review(&id).unwrap()).contains("says blocker"), "the findings stay readable");
 }
 
 #[test]
@@ -1613,7 +1562,7 @@ fn votes_and_amendments_count_against_the_talk_limits() {
     }
     sim.submit("rev-a", &id, &[("major", "off by one"), ("minor", "typo")]);
     sim.submit("rev-b", &id, &[]);
-    sim.submit("rev-c", &id, &[]);
+    sim.submit("rev-c", &id, &[("minor", "keeps the reply window open")]);
     let log = |sim: &Sim| sim.s.review(&id).unwrap().log.len();
     sim.s.vote("rev-b", &id, vec![reasoned("F1", "agree", "real")], sim.now).unwrap();
     let before = log(&sim);
@@ -1624,7 +1573,10 @@ fn votes_and_amendments_count_against_the_talk_limits() {
     }
     let err = sim.s.vote("rev-b", &id, vec![reasoned("F1", "agree", "real again")], sim.now).unwrap_err().to_string();
     assert!(err.contains("10 messages a minute"), "changed votes are talk: {err}");
-    sim.s.vote("rev-b", &id, vec![reasoned("F2", "agree", "first vote")], sim.now).unwrap();
+    sim.s.vote("rev-b", &id, vec![reasoned("F2", "agree", "first vote"), reasoned("F3", "disagree", "no")], sim.now).unwrap();
+    sim.vote("rev-a", &id, &[("F3", "agree")]);
+    sim.vote("rev-c", &id, &[("F1", "agree"), ("F2", "disagree")]);
+    assert!(sim.s.review(&id).unwrap().replying);
 
     for i in 0..3 {
         let change = AmendIn { text: Some(format!("typo, take {i}")), ..AmendIn::default() };
