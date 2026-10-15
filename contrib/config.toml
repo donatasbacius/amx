@@ -13,6 +13,7 @@
 # offer_secs = 120
 # review_secs = 1200
 # vote_secs = 600                   # per voting round
+# reply_secs = 90                   # from round 2: authors of contested findings may reply before votes open
 
 # [consensus]                       # defaults for request_review; agents may override per request
 # reviewers = 2

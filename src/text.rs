@@ -1,4 +1,4 @@
-use crate::relay::{Agent, AgentEvent, Choice, Finding, Ms, OnlineAgent, Phase, Review, Role, Status, Verdict, Vote};
+use crate::relay::{Agent, AgentEvent, Choice, Finding, Ms, OnlineAgent, Phase, Review, Role, Severity, Status, Verdict, Vote};
 use std::fmt::Write;
 
 pub fn iso(ms: Ms) -> String {
@@ -186,77 +186,112 @@ pub fn findings_for(r: &Review, round: u8) -> String {
     s
 }
 
-pub fn vote_task(r: &Review, agent: &str, owed: &[&Finding], left: &str) -> String {
+/// The findings a round is about: all of them in round 1, then only the reopened ones.
+pub fn round_findings(r: &Review, owed: &[&Finding]) -> String {
     let round = r.round();
+    if round <= 1 {
+        return findings_for(r, round);
+    }
+    let mut s = String::from("Contested findings:\n");
+    for f in r.findings.iter().filter(|f| f.open_round == round && f.withdrawn.is_none()) {
+        let _ = writeln!(s, "{}", finding_line(f));
+        s.push_str(&votes_lines(f));
+    }
+    let withdrawn: Vec<&str> = r.findings.iter().filter(|f| f.withdrawn.is_some()).map(|f| f.id.as_str()).collect();
+    if !withdrawn.is_empty() && owed.is_empty() {
+        let _ = writeln!(s, "Withdrawn: {}", withdrawn.join(", "));
+    }
+    s
+}
+
+pub fn vote_task(r: &Review, owed: &[&Finding], left: &str) -> String {
+    let round = r.round();
+    let ids: Vec<&str> = owed.iter().map(|f| f.id.as_str()).collect();
     let mut s = if round == 1 {
         format!(
-            "Cross-examination round 1 of {}: all findings are revealed. Check each finding below against the code before you vote.\n",
+            "Cross-examination round 1 of {}: all findings are revealed. Check each finding against the code before you vote.\n",
             r.params.consensus.vote_rounds
         )
     } else {
         format!(
-            "Cross-examination round {round}: these findings drew disagreement on whether they are real or on their severity. Read the reasons, re-check the code, and vote again (you may change your mind).\n"
+            "Cross-examination round {round}: these findings drew disagreement on whether they are real or on their severity. Read the reasons and any replies, re-check the code, and vote again (you may change your mind).\n"
         )
     };
-    s.push_str("You must vote on:\n");
-    for f in owed {
-        let _ = writeln!(s, "{}", finding_line(f));
-        if round > 1 || f.revision > 0 {
-            s.push_str(&votes_lines(f));
-        }
-        if f.by.is_none() {
-            s.push_str("    (carried over: agree = still present at the new head, disagree = fixed)\n");
-        }
-    }
-    let _ = writeln!(
-        s,
-        "NEXT: call `vote` with review_id \"{}\" and votes like [{{finding: \"{}\", vote: \"agree\"}}, {{finding: \"F2\", vote: \"agree\", severity: \"minor\", reason: \"real, but overstated\"}}, {{finding: \"F3\", vote: \"disagree\", reason: \"why it is wrong\"}}, {{finding: \"F4\", vote: \"duplicate\", duplicate_of: \"F1\"}}]. \
-         Disagree only when the problem is not real (with a concrete reason); if it is real but its severity is wrong, agree and give the severity you think is fair. Use `say` to discuss with the other reviewers. Round ends in {left}; reviewers who have not voted by then are dropped.",
-        r.id,
-        owed.first().map(|f| f.id.as_str()).unwrap_or("F1")
-    );
-    let mine: Vec<&Finding> = r
-        .findings
-        .iter()
-        .filter(|f| f.by.as_deref() == Some(agent) && f.withdrawn.is_none() && f.open_round == round)
-        .collect();
-    if !mine.is_empty() && round > 1 {
-        let ids: Vec<&str> = mine.iter().map(|f| f.id.as_str()).collect();
-        let _ = writeln!(
-            s,
-            "Your own findings {} are disputed: you may `amend_finding` (clarify, change severity) or `withdraw_finding` if the objection is right. Do it now: the round ends as soon as the others have voted.",
-            ids.join(", ")
-        );
+    let _ = writeln!(s, "You must vote on: {}.", ids.join(", "));
+    if owed.iter().any(|f| f.by.is_none()) {
+        s.push_str("Carried-over findings (C…): agree = still present at the new head, disagree = fixed.\n");
     }
     s.push('\n');
-    s.push_str(&findings_for(r, round));
+    s.push_str(&round_findings(r, owed));
+    let _ = write!(
+        s,
+        "\nNEXT: call `vote` with review_id \"{}\" and votes like [{{finding: \"{}\", vote: \"agree\"}}]. Other forms: {{vote: \"agree\", severity: \"minor\", reason: \"real, but overstated\"}}, {{vote: \"disagree\", reason: \"why it is wrong\"}}, {{vote: \"duplicate\", duplicate_of: \"<finding id>\"}}. \
+         Disagree only when the problem is not real (with a concrete reason); if it is real but its severity is wrong, agree and give the severity you think is fair. Use `say` to discuss with the other reviewers. Round ends in {left}; reviewers who have not voted by then are dropped.",
+        r.id,
+        ids.first().copied().unwrap_or("F1")
+    );
     s
 }
 
-/// How the two supporters of a severity-split finding rate it.
-pub fn severity_split(f: &Finding) -> Option<String> {
-    if !f.outcome.as_ref().is_some_and(|o| o.severity_split) {
-        return None;
-    }
+/// For the author of contested findings at the start of a later round.
+pub fn reply_task(r: &Review, agent: &str, left: &str) -> String {
+    let mine = r.contested_by(agent);
+    format!(
+        "Cross-examination round {}: your findings {} drew objections (votes and reasons below). Before the others vote again, reply within {left}: `amend_finding` to clarify or change severity, `withdraw_finding` if the objection is right, or `say` why it stands. Votes open as soon as every contested finding's author has replied.\n\n{}",
+        r.round(),
+        mine.join(", "),
+        round_findings(r, &[])
+    )
+}
+
+fn split_rates(f: &Finding) -> Option<[(String, &'static str); 2]> {
     let rates = |v: &Vote| v.severity.unwrap_or(f.severity).as_str();
     let mut voters = f.votes.iter().filter(|(_, v)| v.choice != Choice::Disagree);
+    let (a, va) = voters.next()?;
     Some(match &f.by {
-        Some(by) => {
-            let (who, v) = voters.next()?;
-            format!("raised as {} by {by}; {who} agrees it's real but rates it {}", f.severity.as_str(), rates(v))
-        }
+        Some(by) => [(by.clone(), f.severity.as_str()), (a.clone(), rates(va))],
         None => {
-            let (a, va) = voters.next()?;
             let (b, vb) = voters.next()?;
-            format!("{a} rates it {}; {b} rates it {}", rates(va), rates(vb))
+            [(a.clone(), rates(va)), (b.clone(), rates(vb))]
         }
     })
+}
+
+/// How the two supporters of a finding disputed on severity alone rate it.
+pub fn severity_split(f: &Finding) -> Option<String> {
+    if !f.outcome.as_ref().is_some_and(|o| o.severity_split && o.status == Status::Disputed) {
+        return None;
+    }
+    let [(a, ra), (b, rb)] = split_rates(f)?;
+    Some(match &f.by {
+        Some(_) => format!("raised as {ra} by {a}; {b} agrees it's real but rates it {rb}"),
+        None => format!("{a} rates it {ra}; {b} rates it {rb}"),
+    })
+}
+
+/// "blocking/major" for a finding confirmed at the lower of its two supporters' severities.
+pub fn split_range(f: &Finding) -> Option<String> {
+    if !f.outcome.as_ref().is_some_and(|o| o.severity_split && o.status == Status::Confirmed) {
+        return None;
+    }
+    let [(_, ra), (_, rb)] = split_rates(f)?;
+    let (hi, lo) = if Severity::parse(ra) <= Severity::parse(rb) { (ra, rb) } else { (rb, ra) };
+    Some(format!("{hi}/{lo}"))
+}
+
+/// "split: blocking/major (a: blocking, b: major)".
+pub fn split_note(f: &Finding) -> Option<String> {
+    let range = split_range(f)?;
+    let [(a, ra), (b, rb)] = split_rates(f)?;
+    Some(format!("split: {range} ({a}: {ra}, {b}: {rb})"))
 }
 
 fn outcome_line(f: &Finding, carried_label: bool) -> String {
     let o = f.outcome.as_ref().expect("decided");
     let mut s = format!("- {} [{}", f.id, o.severity.as_str());
-    if let Some(split) = severity_split(f) {
+    if let Some(split) = split_note(f) {
+        let _ = write!(s, ", {split}");
+    } else if let Some(split) = severity_split(f) {
         let _ = write!(s, ", disputed: {split}");
     } else if o.downgraded {
         s.push_str(", downgraded from blocking: not unanimous");

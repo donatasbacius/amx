@@ -36,6 +36,9 @@ pub struct Timing {
     pub offer_secs: u64,
     pub review_secs: u64,
     pub vote_secs: u64,
+    /// From round 2 on, how long the authors of contested findings get to amend, withdraw or
+    /// argue before votes open.
+    pub reply_secs: u64,
 }
 
 impl Default for Timing {
@@ -46,6 +49,7 @@ impl Default for Timing {
             offer_secs: 120,
             review_secs: 1200,
             vote_secs: 600,
+            reply_secs: 90,
         }
     }
 }

@@ -178,3 +178,47 @@ fn stdio_proxy_hook_and_watch() {
     assert!(w["result"]["content"][0]["text"].as_str().unwrap().contains("Review offer"), "{w}");
     assert_eq!(hook("http://127.0.0.1:1", "rev-codex", &[]), "", "unreachable relay never blocks");
 }
+
+#[test]
+fn stdio_proxy_keeps_waiting_while_idle() {
+    let (_relay, url) = relay();
+    let mut proxy = Kill(
+        Command::new(BIN)
+            .args(["mcp", "--relay", &url, "--agent", "rev-long", "--role", "reviewer", "--wait-max", "8", "--wait-step", "1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = proxy.0.stdin.take().unwrap();
+    let mut lines = BufReader::new(proxy.0.stdout.take().unwrap()).lines();
+    let mut next = || -> Value { serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap() };
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
+    assert!(next()["result"]["instructions"].is_string());
+
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"wait","arguments":{{}}}}}}"#).unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":2}}}}"#).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let started = Instant::now();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"wait","arguments":{{}},"_meta":{{"progressToken":"t3"}}}}}}"#
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    let r = request_review(&url, "https://github.com/rust-lang/rust/pull/5");
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let mut progress = 0;
+    let resp = loop {
+        let v = next();
+        if v["method"] == "notifications/progress" {
+            assert_eq!(v["params"]["progressToken"], "t3");
+            progress += 1;
+            continue;
+        }
+        break v;
+    };
+    assert_eq!(resp["id"], 3, "the cancelled wait sends nothing: {resp}");
+    assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("Review offer"), "{resp}");
+    assert!(progress >= 1 && started.elapsed() > Duration::from_secs(2), "one call spans several relay long-polls");
+}

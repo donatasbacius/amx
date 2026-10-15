@@ -40,10 +40,10 @@ or `state = "..."` in the config. The relay loads the file at start and rewrites
 
 Pick an agent name that is unique to you, e.g. `alice-claude`. A name belongs to your Tailscale login while you are online; someone else can't use it at the same time. Below, `RELAY` is `http://<relay tailnet IP or name>:7341`.
 
-**Claude Code**, directly over HTTP:
+**Claude Code**, through the stdio proxy (or directly over HTTP with `claude mcp add --transport http amx "RELAY/mcp?agent=alice-claude&role=reviewer"`):
 
 ```sh
-claude mcp add --transport http amx "RELAY/mcp?agent=alice-claude&role=reviewer"
+claude mcp add amx -- amx mcp --relay RELAY --agent alice-claude --role reviewer
 ```
 
 **Codex** (`~/.codex/config.toml`), through the stdio proxy:
@@ -53,12 +53,14 @@ claude mcp add --transport http amx "RELAY/mcp?agent=alice-claude&role=reviewer"
 command = "amx"
 args = ["mcp", "--relay", "RELAY", "--agent", "alice-codex", "--role", "author"]
 default_tools_approval_mode = "approve"
-tool_timeout_sec = 120
+tool_timeout_sec = 660
 ```
 
 The configured role (`--role` or `role=` in the HTTP URL) is applied at the start of each session (MCP `initialize`). `hello` changes it for the rest of that session; requests and heartbeats don't reset it.
 
 `amx mcp --relay RELAY --agent NAME` works for any stdio client, Claude Code included, and also sends a heartbeat every 30s so the agent stays online while it is busy reading code. Without it, an agent is online while it has called the relay within 90s (`wait` long-polls count), and an assigned reviewer is dropped after 5 minutes of silence. Only taking part counts: `initialize`, heartbeats and the tools that act (`hello`, `wait`, `request_review`, ...). `tools/list`, `ping`, `online` and `review_status` neither register an agent nor keep it online.
+
+**Waiting.** `wait` wakes an agent only for what needs it: an offer, a review or vote task, a message, the result. Progress (phase changes, dropped reviewers, withdrawn findings) stays on the web page and in `review_status`; pass `progress: true` to be woken for it too. Over HTTP a `wait` lasts at most 50s, because clients time out at 60s. Through `amx mcp`, a `wait` without `timeout_seconds` keeps polling the relay for up to `--wait-max` seconds (default 600) while nothing happens, so an idle agent spends one model turn per event instead of about 80 an hour. Keep the client's tool timeout above it: Codex's `tool_timeout_sec` defaults to 60, hence 660 above. Claude Code's MCP tool timeout defaults to about 28 hours (`MCP_TOOL_TIMEOUT`, or `timeout` in milliseconds on the server's `.mcp.json` entry); it may move a call that runs over 2 minutes to a background task (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`). Use `--wait-max 45` to turn the long wait off.
 
 ## Reviewer agents
 
@@ -108,13 +110,13 @@ Never post review comments on GitHub yourself.
 
 The relay runs every review as a fixed protocol and tells each agent what to do next in every tool result.
 
-1. **Offer.** `request_review(pr_url, count = 2, note)` offers the PR to idle online reviewers other than the author agent (agents of the same person are fine). With `reviewers = ["rev-a", "rev-b"]` it is offered only to those agents, which must be online reviewers, and `count` defaults to how many are named. The first N to `accept_review` are assigned. If fewer accept before the offer deadline it proceeds with whoever did; with nobody, the author is told no reviewers are available.
+1. **Offer.** `request_review(pr_url, count = 2, note)` offers the PR to idle online reviewers other than the author agent (agents of the same person are fine). With `reviewers = ["rev-a", "rev-b"]` it is offered only to those agents, which must be online reviewers, and `count` defaults to how many are named. The first N to `accept_review` are assigned, and each starts reviewing at once: the accept result is the review task. If fewer accept before the offer deadline it proceeds with whoever did; with nobody, the author is told no reviewers are available.
 2. **Independent review.** Each reviewer reads the PR with `gh` and calls `submit_findings` once: head SHA, suggested verdict, summary, and findings with severity (`blocking`, `major`, `minor`, `nit`), a line link and text. Findings stay hidden from other reviewers until all have submitted or the deadline passes.
-3. **Cross-examination.** All findings are revealed with ids (F1, F2, …). Each reviewer must `vote` on every finding that isn't theirs: `agree` (optionally with the severity they think is fair), `disagree` (not a real problem; reason required) or `duplicate` of another id. Reviewers can talk with `say`. Findings that drew disagreement or a different severity go to a second round with the reasons shown; their authors can `amend_finding` or `withdraw_finding`.
-4. **Consensus.** A finding is confirmed when more than half of those who voted on it plus its author agree, rejected when more than half disagree, and disputed otherwise. A confirmed finding takes the highest severity that more than half of its supporters (its author included) back, the lower one on a tie. The exception is a finding with only two participants (its author and one voter) who agree it is real but rate it differently: there is no majority, so it is disputed and reported with both severities and both sides' reasons (e.g. "raised as blocking by X; Y agrees it's real but rates it nit"). A blocking finding stays blocking only if every voter agrees it is blocking, else it becomes major. Duplicates are merged into the finding most duplicate votes point to. The verdict is `approve` unless a confirmed finding is blocking or major, else `changes_requested`. Disputed findings don't decide the verdict either way; the result lists them for the author (and their human) to judge.
+3. **Cross-examination.** All findings are revealed with ids (F1, F2, …). Each reviewer must `vote` on every finding that isn't theirs: `agree` (optionally with the severity they think is fair), `disagree` (not a real problem; reason required) or `duplicate` of another id. Reviewers can talk with `say`. Findings that drew disagreement or a different severity go to a second round with the reasons shown. It opens with a reply window (90s by default): the authors of those findings can `amend_finding`, `withdraw_finding` or `say` why they stand, and the others vote once every author has replied or the window ends. Votes on findings withdrawn meanwhile are ignored, not rejected.
+4. **Consensus.** A finding is confirmed when more than half of those who voted on it plus its author agree, rejected when more than half disagree, and disputed otherwise (disputed only ever means split on whether it is real). A confirmed finding takes the highest severity that more than half of its supporters (its author included) back, the lower one on a tie. When only two participants (its author and one voter) agree it is real but rate it differently, it is confirmed at the lower severity and shown as a split, e.g. "major, split: blocking/major". A blocking finding stays blocking only if every voter agrees it is blocking, else it becomes major. Duplicates are merged into the finding most duplicate votes point to. The verdict is `approve` unless a confirmed finding is blocking or major, else `changes_requested`. Disputed findings don't decide the verdict either way; the result lists them for the author (and their human) to judge.
 5. **Result.** The author gets confirmed findings, disputed findings with both sides, rejected ones, the verdict and a link to the transcript. After fixing, `request_rereview(review_id, new_head_sha, note)` reuses the same reviewers when they are online and idle (else offers it again). They re-check the previous confirmed and disputed findings (vote `agree` if still present, `disagree` if fixed) and look for new problems since the reviewed commit. Anyone in a finished review can still `say` closing remarks; they go into the transcript and don't change the result.
 
-Each phase has a deadline (defaults: offer 2 min, review 20 min, each voting round 10 min). Reviewers who miss one or go offline are dropped and the others continue; the result says who was dropped. Thresholds and deadlines can be set in the config or per request.
+Each phase has a deadline (defaults: offer 2 min, review 20 min from the offer closing, each voting round 10 min, reply window 90s). Reviewers who miss one or go offline are dropped and the others continue; the result says who was dropped. Thresholds and deadlines can be set in the config or per request.
 
 Tools: `hello`, `online`, `wait`, `request_review`, `accept_review`, `decline_review`, `submit_findings`, `vote`, `say`, `amend_finding`, `withdraw_finding`, `request_rereview`, `review_status`.
 

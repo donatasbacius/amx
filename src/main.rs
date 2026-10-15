@@ -2,6 +2,8 @@ use amx::client::Client;
 use amx::config::Config;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -81,6 +83,13 @@ enum Cmd {
     Mcp {
         #[command(flatten)]
         target: Target,
+        /// Seconds a `wait` without timeout_seconds may block, repeating the relay's 45s long-poll
+        /// while nothing happens; keep it under the client's tool timeout
+        #[arg(long, env = "AMX_WAIT_MAX", default_value_t = amx::mcp::WAIT_PROXY_DEFAULT)]
+        wait_max: u64,
+        /// TESTING ONLY: seconds per long-poll on the relay
+        #[arg(long, hide = true, default_value_t = amx::mcp::WAIT_DEFAULT)]
+        wait_step: u64,
     },
     /// Print one line per new relay event for an agent (for Claude Code's Monitor tool)
     Watch {
@@ -142,7 +151,7 @@ async fn run() -> Result<()> {
             tracing::info!("shutting down");
             running.stop().await;
         }
-        Cmd::Mcp { target } => mcp_stdio(target).await?,
+        Cmd::Mcp { target, wait_max, wait_step } => mcp_stdio(target, wait_max, wait_step).await?,
         Cmd::Watch { target } => watch(target.named()?).await,
         Cmd::Hook {
             client: _,
@@ -206,28 +215,37 @@ async fn watch(client: Client) {
     }
 }
 
-async fn mcp_stdio(target: Target) -> Result<()> {
-    let stdout = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
+type Out = Arc<tokio::sync::Mutex<tokio::io::Stdout>>;
+
+async fn mcp_stdio(target: Target, wait_max: u64, wait_step: u64) -> Result<()> {
+    let stdout: Out = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut client = Arc::new(target.client());
     let mut beating = false;
+    let waits: Arc<std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>> = Default::default();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        let msg: serde_json::Value = match serde_json::from_str(&line) {
+        let msg: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                let err = amx::mcp::error_response(serde_json::Value::Null, -32700, &e.to_string());
+                let err = amx::mcp::error_response(Value::Null, -32700, &e.to_string());
                 write_line(&stdout, &err).await;
                 continue;
             }
         };
-        if msg.get("method").and_then(|m| m.as_str()) == Some("initialize")
+        let method = msg.get("method").and_then(|m| m.as_str());
+        if method == Some("initialize")
             && let Some(name) = msg["params"]["clientInfo"]["name"].as_str()
             && let Some(c) = Arc::get_mut(&mut client)
         {
             c.set_client_name(name);
+        }
+        if method == Some("notifications/cancelled")
+            && let Some(tx) = waits.lock().unwrap().remove(&msg["params"]["requestId"].to_string())
+        {
+            let _ = tx.send(true);
         }
         if !beating {
             beating = true;
@@ -241,10 +259,27 @@ async fn mcp_stdio(target: Target) -> Result<()> {
                 }
             });
         }
-        let (client, stdout) = (client.clone(), stdout.clone());
+        let long = method == Some("tools/call")
+            && msg["params"]["name"] == "wait"
+            && msg["params"]["arguments"]["timeout_seconds"].is_null()
+            && wait_max > 0;
+        let cancel = long.then(|| {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            waits.lock().unwrap().insert(msg["id"].to_string(), tx);
+            rx
+        });
+        let (client, stdout, waits) = (client.clone(), stdout.clone(), waits.clone());
         tokio::spawn(async move {
             let id = msg.get("id").cloned();
-            match client.mcp(&msg).await {
+            let res = match cancel {
+                Some(rx) => {
+                    let r = long_wait(&client, msg, (wait_max, wait_step), rx, &stdout).await;
+                    waits.lock().unwrap().remove(&id.clone().unwrap_or_default().to_string());
+                    r
+                }
+                None => client.mcp(&msg).await,
+            };
+            match res {
                 Ok(Some(resp)) => write_line(&stdout, &resp).await,
                 Ok(None) => {}
                 Err(e) => {
@@ -258,7 +293,44 @@ async fn mcp_stdio(target: Target) -> Result<()> {
     Ok(())
 }
 
-async fn write_line(out: &tokio::sync::Mutex<tokio::io::Stdout>, v: &serde_json::Value) {
+/// Repeats `wait` on the relay while it returns no events, up to `max` seconds in all, so an
+/// idle agent spends one tool call per real event. Returns `None` if the client cancelled it.
+async fn long_wait(
+    client: &Client,
+    mut msg: Value,
+    (max, step): (u64, u64),
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+    out: &Out,
+) -> Result<Option<Value>> {
+    let start = std::time::Instant::now();
+    let token = msg["params"]["_meta"]["progressToken"].clone();
+    loop {
+        let left = max.saturating_sub(start.elapsed().as_secs());
+        let round = std::time::Instant::now();
+        msg["params"]["arguments"]["timeout_seconds"] = json!(left.min(step).clamp(1, amx::mcp::WAIT_MAX));
+        let resp = tokio::select! {
+            r = client.mcp(&msg) => r?,
+            _ = cancel.wait_for(|c| *c) => return Ok(None),
+        };
+        let idle = resp
+            .as_ref()
+            .and_then(|r| r["result"]["content"][0]["text"].as_str())
+            .is_some_and(|t| t.starts_with("No new events."));
+        if !idle || start.elapsed().as_secs() + 1 >= max {
+            return Ok(resp);
+        }
+        if round.elapsed() < Duration::from_secs(1) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        if !token.is_null() {
+            let note = json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                "params": {"progressToken": token, "progress": start.elapsed().as_secs(), "message": "waiting for the relay"}});
+            write_line(out, &note).await;
+        }
+    }
+}
+
+async fn write_line(out: &tokio::sync::Mutex<tokio::io::Stdout>, v: &Value) {
     let mut line = v.to_string();
     line.push('\n');
     let mut out = out.lock().await;
