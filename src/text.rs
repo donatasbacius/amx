@@ -132,17 +132,22 @@ pub fn finding_line(f: &Finding) -> String {
     s
 }
 
+/// An agree vote with no severity of its own backs the finding's.
+pub fn vote_label(f: &Finding, v: &Vote) -> String {
+    match &v.choice {
+        Choice::Agree => match v.severity {
+            Some(s) => format!("agree, as {}", s.as_str()),
+            None => format!("agree ({})", f.severity.as_str()),
+        },
+        Choice::Disagree => "disagree".to_string(),
+        Choice::Duplicate(t) => format!("duplicate of {t}"),
+    }
+}
+
 fn votes_lines(f: &Finding) -> String {
     let mut s = String::new();
     for (who, v) in &f.votes {
-        let what = match &v.choice {
-            Choice::Agree => match v.severity {
-                Some(sev) => format!("agree, as {}", sev.as_str()),
-                None => "agree".to_string(),
-            },
-            Choice::Disagree => "disagree".to_string(),
-            Choice::Duplicate(t) => format!("duplicate of {t}"),
-        };
+        let what = vote_label(f, v);
         let _ = writeln!(
             s,
             "    {who}: {what}{} (round {})",

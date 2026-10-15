@@ -1,7 +1,7 @@
 use crate::hub::Hub;
 use crate::relay::{Choice, Finding, Ms, Phase, Review, State, Status, Verdict};
 use crate::tailscale::Identity;
-use crate::text::{dur, iso, phase_badge, severity_split, short_sha, split_note, split_range};
+use crate::text::{dur, iso, phase_badge, severity_split, short_sha, split_note, split_range, vote_label};
 use axum::extract::{Path, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -420,11 +420,12 @@ fn render_finding(out: &mut String, f: &Finding) {
     if !f.votes.is_empty() {
         out.push_str("<ul class=\"votes\">");
         for (who, v) in &f.votes {
-            let (cls, what) = match &v.choice {
-                Choice::Agree => ("agree", v.severity.map_or("agree".to_string(), |s| format!("agree, as {}", s.as_str()))),
-                Choice::Disagree => ("disagree", "disagree".to_string()),
-                Choice::Duplicate(t) => ("dup", format!("duplicate of {t}")),
+            let cls = match &v.choice {
+                Choice::Agree => "agree",
+                Choice::Disagree => "disagree",
+                Choice::Duplicate(_) => "dup",
             };
+            let what = vote_label(f, v);
             let _ = write!(
                 out,
                 "<li class=\"v-{cls}\"><b>{}</b> {}<span class=\"muted\"> · round {}</span>{}</li>",
@@ -642,6 +643,14 @@ pub fn review_json(r: &Review, rereviews: &[String], now: Ms) -> Value {
                 if let Some(sub) = s.get_mut("submission").and_then(Value::as_object_mut) {
                     sub.insert("summary".into(), Value::String(String::new()));
                 }
+            }
+        }
+    }
+    for f in m.get_mut("findings").and_then(Value::as_array_mut).into_iter().flatten() {
+        let sev = f["severity"].clone();
+        for v in f.get_mut("votes").and_then(Value::as_object_mut).into_iter().flat_map(|o| o.values_mut()) {
+            if v["choice"] == "Agree" && v["severity"].is_null() {
+                v["severity"] = sev.clone();
             }
         }
     }

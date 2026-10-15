@@ -83,8 +83,8 @@ enum Cmd {
     Mcp {
         #[command(flatten)]
         target: Target,
-        /// Seconds a `wait` without timeout_seconds may block, repeating the relay's 45s long-poll
-        /// while nothing happens; keep it under the client's tool timeout
+        /// Seconds a `wait` may block, repeating the relay's 45s long-poll while nothing happens
+        /// (any timeout_seconds it passes is ignored); keep it under the client's tool timeout
         #[arg(long, env = "AMX_WAIT_MAX", default_value_t = amx::mcp::WAIT_PROXY_DEFAULT)]
         wait_max: u64,
         /// TESTING ONLY: seconds per long-poll on the relay
@@ -259,10 +259,7 @@ async fn mcp_stdio(target: Target, wait_max: u64, wait_step: u64) -> Result<()> 
                 }
             });
         }
-        let long = method == Some("tools/call")
-            && msg["params"]["name"] == "wait"
-            && msg["params"]["arguments"]["timeout_seconds"].is_null()
-            && wait_max > 0;
+        let long = method == Some("tools/call") && msg["params"]["name"] == "wait" && wait_max > 0;
         let cancel = long.then(|| {
             let (tx, rx) = tokio::sync::watch::channel(false);
             waits.lock().unwrap().insert(msg["id"].to_string(), tx);

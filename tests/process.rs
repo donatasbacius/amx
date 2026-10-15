@@ -202,7 +202,7 @@ fn stdio_proxy_keeps_waiting_while_idle() {
     let started = Instant::now();
     writeln!(
         stdin,
-        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"wait","arguments":{{}},"_meta":{{"progressToken":"t3"}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"wait","arguments":{{"timeout_seconds":1}},"_meta":{{"progressToken":"t3"}}}}}}"#
     )
     .unwrap();
     std::thread::sleep(Duration::from_millis(2500));
@@ -220,5 +220,5 @@ fn stdio_proxy_keeps_waiting_while_idle() {
     };
     assert_eq!(resp["id"], 3, "the cancelled wait sends nothing: {resp}");
     assert!(resp["result"]["content"][0]["text"].as_str().unwrap().contains("Review offer"), "{resp}");
-    assert!(progress >= 1 && started.elapsed() > Duration::from_secs(2), "one call spans several relay long-polls");
+    assert!(progress >= 1 && started.elapsed() > Duration::from_secs(2), "one call spans several relay long-polls, whatever timeout it asks for");
 }
