@@ -184,7 +184,7 @@ async fn tailnet_identity_and_browser_checks() {
         .unwrap();
     assert_eq!(csrf.status(), 403);
     let page = http.get(format!("{}/", relay.tailnet)).send().await.unwrap().text().await.unwrap();
-    assert!(page.contains("friend@example.com") && page.contains("friend-claude"));
+    assert!(!page.contains("friend@example.com") && page.contains("friend-claude"));
     relay.running.stop().await;
 
     let relay = start(Some(whois_ok(tmp.path())), vec!["someone-else@example.com".into()]).await;
@@ -289,6 +289,11 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     assert_eq!(ids, ["r2", "r1"], "newest first");
     assert_eq!(list["reviews"][0]["active"], true);
     assert_eq!(list["reviews"][1]["verdict"], "changes_requested");
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": 1})).await;
+    let page = get("/r/r1").await.unwrap().text().await.unwrap();
+    assert!(page.contains("other reviews of this PR: <a href=\"/r/r3\">r3</a> (finding reviewers)"), "{page}");
+    let index = get("/").await.unwrap().text().await.unwrap();
+    assert!(index.contains("r3 · author · offered to 2 · 2 reviews") && !index.contains("href=\"/r/r1\""), "one row per PR: {index}");
 
     let missing = get("/api/reviews/r9").await.unwrap();
     assert_eq!(missing.status(), 404);

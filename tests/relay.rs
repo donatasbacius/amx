@@ -519,6 +519,11 @@ fn rereview_rechecks_previous_findings() {
     assert_eq!(r2.phase, Phase::Reviewing, "same reviewers reassigned");
     assert_eq!(r2.findings.len(), 2, "confirmed and disputed findings carried");
     assert_eq!(r2.since_sha.as_deref(), Some(SHA));
+    let page = amx::web::render_review(r2);
+    assert!(page.contains(&format!("C1 was {id}/F1")), "{page}");
+    assert!(page.contains(&format!("https://github.com/rust-lang/rust/compare/{SHA}...{SHA2}")) && page.contains("changes since <code>0123456"), "{page}");
+    let index = amx::web::render_index(&sim.s, sim.now);
+    assert!(index.contains("0 of 2 submitted · 2 reviews") && index.contains("data-deadline") && !index.contains(&format!("href=\"/r/{id}\"")), "{index}");
     let task = sim.events("rev-b");
     assert!(task.contains("re-review") && task.contains("cache never invalidated") && task.contains("compare/"), "{task}");
     sim.submit("rev-a", &id2, &[]);
@@ -565,6 +570,8 @@ fn a_failed_rereview_can_be_retried_from_its_parent() {
     let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
     sim.advance(121);
     assert_eq!(sim.phase(&id2), Phase::Failed);
+    let index = amx::web::render_index(&sim.s, sim.now);
+    assert!(index.contains("no reviewers available, author must ask again · 2 reviews"), "{index}");
     sim.join("rev-new", "friend5@example.com", Role::Reviewer);
     let id3 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
     let r3 = sim.s.review(&id3).unwrap();
@@ -772,6 +779,9 @@ fn review_page_puts_confirmed_findings_first_and_closes_the_rest() {
     assert!(page.contains("<span class=\"ft\">should use a BTreeMap</span>") && !page.contains("<p>should use a BTreeMap</p>"), "{page}");
     assert!(page.contains("rev-c</b> agrees") && !page.contains("agrees, as blocking"), "{page}");
     assert!(!page.contains("summary-table") && !page.contains("local"), "{page}");
+    assert!(page.contains("backs its current revision, or its author was the only reviewer") && page.contains("One nobody else voted on as it stands is unverified"), "{page}");
+    assert!(page.contains("amended only in the reply window") && page.contains("reviewers all dropped out fails"), "{page}");
+    assert!(amx::web::render_index(&sim.s, sim.now).contains("1 to fix"));
 }
 
 #[test]

@@ -7,6 +7,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -283,7 +284,7 @@ fn confirmed(r: &Review) -> usize {
         .count()
 }
 
-fn review_row(out: &mut String, r: &Review) {
+fn review_row(out: &mut String, r: &Review, count: usize) {
     let n = visible(r).count();
     let what = match r.phase {
         Phase::Offering => format!("offered to {}", r.offered.len()),
@@ -292,20 +293,21 @@ fn review_row(out: &mut String, r: &Review) {
             r.active_slots().filter(|s| s.submission.is_some()).count(),
             r.active_slots().count()
         ),
-        Phase::Failed => r.failure.as_deref().map(|f| f.split(':').next().unwrap_or(f).to_string()).unwrap_or_default(),
+        Phase::Failed => format!("{}, author must ask again", r.failure.as_deref().map_or("failed", |f| f.split(':').next().unwrap_or(f))),
         _ if n == 0 => "no findings".into(),
         Phase::Voting(_) => format!("{n} finding{}", if n == 1 { "" } else { "s" }),
         Phase::Done => match confirmed(r) {
             0 => "none confirmed".into(),
+            c if r.result.as_ref().is_some_and(|x| x.verdict == Verdict::ChangesRequested) => format!("{c} to fix"),
             c => format!("{c} of {n} confirmed"),
         },
     };
-    let parent = r.parent.as_deref().map(|p| format!(" · re-review of {}", esc(p))).unwrap_or_default();
+    let more = if count > 1 { format!(" · {count} reviews") } else { String::new() };
     let when = if r.phase.active() { countdown(r.deadline) } else { time_tag(r.ended.unwrap_or(r.created)) };
     let _ = write!(
         out,
         "<li><a class=\"rv\" href=\"/r/{id}\">{pill}<span class=\"rv-pr\">{pr}</span>\
-         <span class=\"rv-meta\">{id} · {author} · {what}{parent}</span><span class=\"rv-when\">{when}</span></a></li>",
+         <span class=\"rv-meta\">{id} · {author} · {what}{more}</span><span class=\"rv-when\">{when}</span></a></li>",
         id = esc(&r.id),
         pill = pill(r),
         pr = esc(&r.pr.short()),
@@ -315,9 +317,13 @@ fn review_row(out: &mut String, r: &Review) {
 }
 
 pub fn render_index(st: &State, now: Ms) -> String {
-    let mut out = String::from("<h1>Reviews</h1>");
+    let mut out = String::from("<h1>Pull requests</h1>");
     let mut reviews: Vec<&Review> = st.reviews.iter().collect();
     reviews.sort_by_key(|r| std::cmp::Reverse(r.created));
+    let count = |r: &Review| st.reviews.iter().filter(|x| x.pr == r.pr).count();
+    let mut seen = HashSet::new();
+    reviews.retain(|r| seen.insert(&r.pr));
+    reviews.sort_by_key(|r| std::cmp::Reverse(r.ended.unwrap_or(r.created)));
     let (active, done): (Vec<&Review>, Vec<&Review>) = reviews.into_iter().partition(|r| r.phase.active());
     if active.is_empty() && done.is_empty() {
         out.push_str("<p class=\"empty\">No reviews yet.</p>");
@@ -328,7 +334,7 @@ pub fn render_index(st: &State, now: Ms) -> String {
         }
         let _ = write!(out, "<h2>{label} <span class=\"count\">{}</span></h2><ul class=\"reviews\">", list.len());
         for r in list {
-            review_row(&mut out, r);
+            review_row(&mut out, r, count(r));
         }
         out.push_str("</ul>");
     }
@@ -339,7 +345,6 @@ pub fn render_index(st: &State, now: Ms) -> String {
     } else {
         out.push_str("<ul class=\"agents\">");
         for a in &online {
-            let owner = if a.login == "local" { String::new() } else { format!(" <span class=\"muted\">{}</span>", esc(&a.login)) };
             let busy = a
                 .busy
                 .as_deref()
@@ -347,9 +352,7 @@ pub fn render_index(st: &State, now: Ms) -> String {
                 .unwrap_or_default();
             let _ = write!(
                 out,
-                "<li title=\"{login} on {node}\"><b>{name}</b> <span class=\"role\">{role}</span>{owner}{busy}</li>",
-                login = esc(&a.login),
-                node = esc(&a.node),
+                "<li><b>{name}</b> <span class=\"role\">{role}</span>{busy}</li>",
                 name = esc(&a.name),
                 role = a.role.as_str(),
             );
@@ -441,8 +444,9 @@ fn render_finding(out: &mut String, r: &Review, f: &Finding, open: bool) {
     let _ = write!(
         out,
         "<details class=\"f\" id=\"{id}\"{open}><summary><span class=\"sev sev-{sev}\">{sev}</span>\
-         <span class=\"ft\">{head}</span><span class=\"fx\">{badge}{tally}<span class=\"fid\">{id}</span></span></summary><div class=\"fb\">",
+         <span class=\"ft\">{head}</span><span class=\"fx\">{badge}{tally}<span class=\"fid\">{fid}</span></span></summary><div class=\"fb\">",
         id = esc(&f.id),
+        fid = esc(&f.origin.as_ref().map_or(f.id.clone(), |o| format!("{} was {o}", f.id))),
         open = if open { " open" } else { "" },
         head = esc(&head),
     );
@@ -636,18 +640,28 @@ pub fn render_review(r: &Review) -> String {
     render_review_page(r, &[])
 }
 
-/// `rereviews` are the ids of later reviews of the same PR started from this one.
-pub fn render_review_page(r: &Review, rereviews: &[String]) -> String {
+/// `others` are the other reviews of the same PR, oldest first, as id and status.
+pub fn render_review_page(r: &Review, others: &[(String, String)]) -> String {
     let mut meta = vec![format!("{} by <b>{}</b>", esc(&r.id), esc(&r.author))];
     if let Some(h) = &r.head_sha {
         meta.push(format!("<code>{}</code>", esc(short_sha(h))));
     }
+    if let (Some(old), Some(new)) = (&r.since_sha, &r.head_sha) {
+        meta.push(format!(
+            "<a href=\"https://github.com/{}/{}/compare/{}...{}\" rel=\"noopener noreferrer\" target=\"_blank\">changes since <code>{}</code></a>",
+            esc(&r.pr.owner),
+            esc(&r.pr.repo),
+            esc(old),
+            esc(new),
+            esc(short_sha(old)),
+        ));
+    }
     if let Some(p) = &r.parent {
         meta.push(format!("re-review of <a href=\"/r/{0}\">{0}</a>", esc(p)));
     }
-    if !rereviews.is_empty() {
-        let links: Vec<String> = rereviews.iter().map(|c| format!("<a href=\"/r/{0}\">{0}</a>", esc(c))).collect();
-        meta.push(format!("re-reviewed in {}", links.join(", ")));
+    if !others.is_empty() {
+        let links: Vec<String> = others.iter().map(|(id, st)| format!("<a href=\"/r/{0}\">{0}</a> ({1})", esc(id), esc(st))).collect();
+        meta.push(format!("other reviews of this PR: {}", links.join(", ")));
     }
     meta.push(format!("requested {}", time_tag(r.created)));
     let mut out = format!(
@@ -668,11 +682,13 @@ pub fn render_review_page(r: &Review, rereviews: &[String]) -> String {
     let c = r.params.consensus;
     let _ = write!(
         out,
-        "<details class=\"more\" id=\"rules\"><summary><h2>Consensus rules</h2></summary><p class=\"prose\">A finding is confirmed when more than {:.0}% of its voters agree, \
-         rejected when more than {:.0}% disagree, and disputed otherwise. {} Up to {} voting round{}.</p></details>",
+        "<details class=\"more\" id=\"rules\"><summary><h2>Consensus rules</h2></summary><p class=\"prose\">A finding is confirmed when more than {:.0}% of its author and voters agree \
+         and a reviewer other than its author backs its current revision, or its author was the only reviewer; it is rejected when more than {:.0}% disagree, \
+         and disputed otherwise. One nobody else voted on as it stands is unverified. Disputed and unverified findings don't affect the verdict. {} \
+         Findings can be amended only in the reply window before a round's votes. Up to {} voting round{}. A review whose reviewers all dropped out fails.</p></details>",
         c.confirm_fraction * 100.0,
         c.confirm_fraction * 100.0,
-        if c.blocking_unanimous { "A blocking finding stays blocking only if nobody disagrees." } else { "" },
+        if c.blocking_unanimous { "A blocking finding stays blocking only if every voter agrees it is blocking." } else { "" },
         c.vote_rounds,
         if c.vote_rounds == 1 { "" } else { "s" },
     );
@@ -781,6 +797,12 @@ fn rereviews(st: &State, id: &str) -> Vec<String> {
         .collect()
 }
 
+fn others(st: &State, r: &Review) -> Vec<(String, String)> {
+    let mut v: Vec<&Review> = st.reviews.iter().filter(|x| x.pr == r.pr && x.id != r.id).collect();
+    v.sort_by_key(|x| x.created);
+    v.into_iter().map(|x| (x.id.clone(), status(x).1.to_lowercase())).collect()
+}
+
 fn snapshot(hub: &Hub, id: &str) -> Option<(Review, Vec<String>, Ms)> {
     hub.read(|s, now| s.review(id).map(|r| (r.clone(), rereviews(s, &r.id), now)))
 }
@@ -826,14 +848,14 @@ pub async fn review_page(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let Some((r, children, _)) = snapshot(&hub, &id) else {
+    let Some((r, others)) = hub.read(|s, _| s.review(&id).map(|r| (r.clone(), others(s, r)))) else {
         let main = format!(
             "<h1>No review {}</h1><p class=\"empty\">The relay may have restarted. <a href=\"/\">All reviews</a></p>",
             esc(&id)
         );
         return (StatusCode::NOT_FOUND, Html(page("amx", &main))).into_response();
     };
-    let main = render_review_page(&r, &children);
+    let main = render_review_page(&r, &others);
     if partial(&headers) {
         return fragment(&headers, main);
     }
