@@ -602,12 +602,6 @@ async fn other_sites_cannot_register_or_keep_agents_alive() {
     relay.running.stop().await;
 }
 
-async fn connect_from(ip: [u8; 4], to: std::net::SocketAddr) -> tokio::net::TcpStream {
-    let sock = tokio::net::TcpSocket::new_v4().unwrap();
-    sock.bind((ip, 0).into()).unwrap();
-    sock.connect(to).await.unwrap()
-}
-
 /// Whether the relay closes the connection within `within` without being sent anything more.
 async fn closed(conn: &mut tokio::net::TcpStream, within: Duration) -> bool {
     use tokio::io::AsyncReadExt;
@@ -631,7 +625,7 @@ async fn idle_and_excess_connections_are_cut_off_before_identification() {
         ..Config::default()
     };
     cfg.conn_limits = amx::server::ConnLimits {
-        max: 8,
+        max: 5,
         per_ip: 3,
         header_timeout: Duration::from_secs(2),
     };
@@ -639,17 +633,11 @@ async fn idle_and_excess_connections_are_cut_off_before_identification() {
     let addr = running.local_addr;
 
     let mut idle = Vec::new();
-    for _ in 0..4 {
-        idle.push(connect_from([127, 0, 0, 1], addr).await);
+    for _ in 0..5 {
+        idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
     }
-    for _ in 0..3 {
-        idle.push(connect_from([127, 0, 0, 2], addr).await);
-    }
-    let mut over_ip = connect_from([127, 0, 0, 2], addr).await;
-    assert!(closed(&mut over_ip, Duration::from_secs(1)).await, "4th connection from one address");
-    idle.push(connect_from([127, 0, 0, 3], addr).await);
-    let mut over_all = connect_from([127, 0, 0, 4], addr).await;
-    assert!(closed(&mut over_all, Duration::from_secs(1)).await, "9th connection overall");
+    let mut over_all = tokio::net::TcpStream::connect(addr).await.unwrap();
+    assert!(closed(&mut over_all, Duration::from_secs(1)).await, "6th connection overall");
     for (i, c) in idle.iter_mut().enumerate() {
         assert!(!closed(c, Duration::from_millis(20)).await, "connection {i} admitted (127.0.0.1 has no per-address cap)");
     }
@@ -665,7 +653,7 @@ async fn idle_and_excess_connections_are_cut_off_before_identification() {
 
     let mut fresh = None;
     for _ in 0..50 {
-        let mut c = connect_from([127, 0, 0, 1], addr).await;
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
         if !closed(&mut c, Duration::from_millis(50)).await {
             fresh = Some(c);
             break;

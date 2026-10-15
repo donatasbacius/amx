@@ -468,6 +468,25 @@ mod tests {
     }
 
     #[test]
+    fn connections_are_capped_per_address_except_loopback_and_in_total() {
+        let conns = Arc::new(Conns::default());
+        let limits = ConnLimits {
+            max: 5,
+            per_ip: 2,
+            header_timeout: Duration::from_secs(1),
+        };
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let a = conns.admit(ip("100.64.0.1"), &limits).unwrap();
+        let _a2 = conns.admit(ip("100.64.0.1"), &limits).unwrap();
+        assert!(conns.admit(ip("100.64.0.1"), &limits).is_none(), "per address");
+        let local = [conns.admit(ip("127.0.0.1"), &limits), conns.admit(ip("::1"), &limits), conns.admit(ip("127.0.0.1"), &limits)];
+        assert!(local.iter().all(Option::is_some), "loopback isn't capped per address");
+        assert!(conns.admit(ip("100.64.0.2"), &limits).is_none(), "in total");
+        drop(a);
+        assert!(conns.admit(ip("100.64.0.1"), &limits).is_some(), "a closed connection frees its slot");
+    }
+
+    #[test]
     fn default_names() {
         assert_eq!(default_agent("alice@example.com", "claude-code/2.1"), "alice-claude");
         assert_eq!(default_agent("bob.smith@github", "codex_cli_rs/0.160"), "bob-smith-codex");
