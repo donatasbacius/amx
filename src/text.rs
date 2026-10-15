@@ -292,18 +292,6 @@ fn split_rates(f: &Finding) -> Option<[(String, &'static str); 2]> {
     })
 }
 
-/// How the two supporters of a finding disputed on severity alone rate it.
-pub fn severity_split(f: &Finding) -> Option<String> {
-    if !f.outcome.as_ref().is_some_and(|o| o.severity_split && o.status == Status::Disputed) {
-        return None;
-    }
-    let [(a, ra), (b, rb)] = split_rates(f)?;
-    Some(match &f.by {
-        Some(_) => format!("raised as {ra} by {a}; {b} agrees it's real but rates it {rb}"),
-        None => format!("{a} rates it {ra}; {b} rates it {rb}"),
-    })
-}
-
 /// "blocking/major" for a finding confirmed at the lower of its two supporters' severities.
 pub fn split_range(f: &Finding) -> Option<String> {
     if !f.outcome.as_ref().is_some_and(|o| o.severity_split && o.status == Status::Confirmed) {
@@ -326,8 +314,6 @@ fn outcome_line(f: &Finding, carried_label: bool) -> String {
     let mut s = format!("- {} [{}", f.id, o.severity.as_str());
     if let Some(split) = split_note(f) {
         let _ = write!(s, ", {split}");
-    } else if let Some(split) = severity_split(f) {
-        let _ = write!(s, ", disputed: {split}");
     } else if o.downgraded {
         s.push_str(", downgraded from blocking: not unanimous");
     } else if o.severity != f.severity {
@@ -429,9 +415,10 @@ pub fn result(r: &Review, web: &str) -> String {
     let unverified = by_status(&|s| *s == Status::Unverified);
     let unverified_ids: Vec<&str> = unverified.iter().map(|f| f.id.as_str()).collect();
     if !unverified.is_empty() {
-        s.push_str("\nNot cross-examined (their reviewers dropped out before anyone else voted on them; they don't decide the verdict, use your judgement):\n");
+        s.push_str("\nNot cross-examined (nobody else voted on them as they stand; they don't decide the verdict, use your judgement):\n");
         for f in unverified {
             let _ = writeln!(s, "{}", outcome_line(f, true));
+            s.push_str(&votes_lines(f));
             s.push_str(&merged(f));
         }
     }
