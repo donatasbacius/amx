@@ -134,14 +134,17 @@ pub fn finding_line(f: &Finding) -> String {
 
 /// An agree vote with no severity of its own backs the finding's.
 pub fn vote_label(f: &Finding, v: &Vote) -> String {
-    match &v.choice {
+    let stale = v.revision < f.revision;
+    let what = match &v.choice {
         Choice::Agree => match v.severity {
             Some(s) => format!("agree, as {}", s.as_str()),
+            None if stale => "agree".to_string(),
             None => format!("agree ({})", f.severity.as_str()),
         },
         Choice::Disagree => "disagree".to_string(),
         Choice::Duplicate(t) => format!("duplicate of {t}"),
-    }
+    };
+    if stale { format!("{what} on an earlier revision, not counted") } else { what }
 }
 
 fn votes_lines(f: &Finding) -> String {
@@ -251,7 +254,7 @@ pub fn reply_task(r: &Review, agent: &str, left: &str) -> String {
 
 fn split_rates(f: &Finding) -> Option<[(String, &'static str); 2]> {
     let rates = |v: &Vote| v.severity.unwrap_or(f.severity).as_str();
-    let mut voters = f.votes.iter().filter(|(_, v)| v.choice != Choice::Disagree);
+    let mut voters = f.current_votes().filter(|(_, v)| v.choice != Choice::Disagree);
     let (a, va) = voters.next()?;
     Some(match &f.by {
         Some(by) => [(by.clone(), f.severity.as_str()), (a.clone(), rates(va))],
@@ -351,12 +354,19 @@ pub fn result(r: &Review, web: &str) -> String {
             .filter(|f| f.outcome.as_ref().is_some_and(|o| pred(&o.status)))
             .collect()
     };
+    let merged = |f: &Finding| -> String {
+        by_status(&|st| *st == Status::Duplicate(f.id.clone()))
+            .into_iter()
+            .map(|d| format!("    merged duplicate {} by {}: {}\n", d.id, d.by.as_deref().unwrap_or("?"), d.text.lines().next().unwrap_or("")))
+            .collect()
+    };
     let (new_confirmed, carried_open): (Vec<&Finding>, Vec<&Finding>) =
         by_status(&|s| *s == Status::Confirmed).into_iter().partition(|f| f.by.is_some());
     if !carried_open.is_empty() {
         s.push_str("\nPreviously raised and STILL PRESENT:\n");
         for f in &carried_open {
             let _ = writeln!(s, "{}", outcome_line(f, true));
+            s.push_str(&merged(f));
         }
     }
     let resolved: Vec<&Finding> = by_status(&|s| *s == Status::Rejected).into_iter().filter(|f| f.by.is_none()).collect();
@@ -364,6 +374,7 @@ pub fn result(r: &Review, web: &str) -> String {
         s.push_str("\nPreviously raised and now resolved:\n");
         for f in resolved {
             let _ = writeln!(s, "- {} {}", f.id, f.text.lines().next().unwrap_or(""));
+            s.push_str(&merged(f));
         }
     }
     if new_confirmed.is_empty() && carried_open.is_empty() {
@@ -375,9 +386,7 @@ pub fn result(r: &Review, web: &str) -> String {
             if f.outcome.as_ref().is_some_and(|o| o.severity != f.severity) {
                 s.push_str(&votes_lines(f));
             }
-            for d in by_status(&|st| *st == Status::Duplicate(f.id.clone())) {
-                let _ = writeln!(s, "    merged duplicate {} by {}: {}", d.id, d.by.as_deref().unwrap_or("?"), d.text.lines().next().unwrap_or(""));
-            }
+            s.push_str(&merged(f));
         }
     }
     let disputed = by_status(&|s| *s == Status::Disputed);
@@ -387,6 +396,16 @@ pub fn result(r: &Review, web: &str) -> String {
         for f in disputed {
             let _ = writeln!(s, "{}", outcome_line(f, true));
             s.push_str(&votes_lines(f));
+            s.push_str(&merged(f));
+        }
+    }
+    let unverified = by_status(&|s| *s == Status::Unverified);
+    let unverified_ids: Vec<&str> = unverified.iter().map(|f| f.id.as_str()).collect();
+    if !unverified.is_empty() {
+        s.push_str("\nNot cross-examined (their reviewers dropped out before anyone else voted on them; they don't decide the verdict, use your judgement):\n");
+        for f in unverified {
+            let _ = writeln!(s, "{}", outcome_line(f, true));
+            s.push_str(&merged(f));
         }
     }
     let rejected: Vec<&Finding> = by_status(&|s| *s == Status::Rejected).into_iter().filter(|f| f.by.is_some()).collect();
@@ -395,6 +414,7 @@ pub fn result(r: &Review, web: &str) -> String {
         for f in rejected {
             let _ = writeln!(s, "{}", outcome_line(f, false));
             s.push_str(&votes_lines(f));
+            s.push_str(&merged(f));
         }
     }
     let withdrawn = by_status(&|s| *s == Status::Withdrawn);
@@ -415,11 +435,18 @@ pub fn result(r: &Review, web: &str) -> String {
                 r.id, r.id
             );
         }
-        Verdict::Approve if !disputed_ids.is_empty() => {
+        Verdict::Approve if !disputed_ids.is_empty() || !unverified_ids.is_empty() => {
+            let mut open = Vec::new();
+            if !disputed_ids.is_empty() {
+                open.push(format!("the reviewers could not agree on {}", disputed_ids.join(", ")));
+            }
+            if !unverified_ids.is_empty() {
+                open.push(format!("{} were not cross-examined", unverified_ids.join(", ")));
+            }
             let _ = write!(
                 s,
-                "NEXT: the verdict does not require changes, but the reviewers could not agree on {}: read both sides above and decide whether to fix them (ask your human if unsure). Address minor findings or nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
-                disputed_ids.join(", "),
+                "NEXT: the verdict does not require changes, but {}: read them above and decide whether to fix them (ask your human if unsure). Address minor findings or nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                open.join(", and "),
                 r.id
             );
         }

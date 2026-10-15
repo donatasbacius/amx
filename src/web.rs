@@ -125,6 +125,7 @@ fn outcome(f: &Finding) -> Option<(&'static str, String)> {
         Status::Rejected => ("closed", "rejected".to_string()),
         Status::Disputed if o.severity_split => ("stale", "disputed severity".to_string()),
         Status::Disputed => ("stale", "disputed".to_string()),
+        Status::Unverified => ("stale", "unverified".to_string()),
         Status::Duplicate(t) => ("closed", format!("duplicate of {t}")),
         Status::Withdrawn => ("closed", "withdrawn".to_string()),
     })
@@ -134,8 +135,8 @@ fn votes(f: &Finding) -> (usize, usize) {
     match &f.outcome {
         Some(o) => (o.agree, o.disagree),
         None => (
-            f.votes.values().filter(|v| v.choice != Choice::Disagree).count(),
-            f.votes.values().filter(|v| v.choice == Choice::Disagree).count(),
+            f.current_votes().filter(|(_, v)| v.choice != Choice::Disagree).count(),
+            f.current_votes().filter(|(_, v)| v.choice == Choice::Disagree).count(),
         ),
     }
 }
@@ -349,7 +350,7 @@ pub fn render_index(st: &State, now: Ms) -> String {
 fn rank(f: &Finding) -> u8 {
     match f.outcome.as_ref().map(|o| &o.status) {
         Some(Status::Confirmed) => 0,
-        Some(Status::Disputed) => 1,
+        Some(Status::Disputed | Status::Unverified) => 1,
         None if f.withdrawn.is_none() => 2,
         Some(Status::Rejected) => 3,
         Some(Status::Duplicate(_)) => 4,
@@ -363,7 +364,7 @@ fn severity(f: &Finding) -> Severity {
 
 fn severity_note(f: &Finding) -> Option<String> {
     let o = f.outcome.as_ref()?;
-    let rater = f.votes.iter().find(|(_, v)| v.choice == Choice::Agree && v.severity.is_some_and(|s| s != f.severity));
+    let rater = f.current_votes().find(|(_, v)| v.choice == Choice::Agree && v.severity.is_some_and(|s| s != f.severity));
     if let (Some(_), Some((who, v)), true) = (&f.by, rater, split_range(f).is_some()) {
         let rated = v.severity.unwrap_or(f.severity).as_str();
         return Some(format!("Raised as {}; {who} rated it {rated}, so the lower ({}) stands.", f.severity.as_str(), o.severity.as_str()));
@@ -472,6 +473,7 @@ fn render_finding(out: &mut String, r: &Review, f: &Finding, open: bool) {
                 Choice::Disagree => ("disagree", "disagrees".to_string()),
                 Choice::Duplicate(t) => ("dup", format!("duplicate of {t}")),
             };
+            let what = if v.revision < f.revision { format!("{what} (on an earlier revision, not counted)") } else { what };
             let round = if rounds { format!(" <span class=\"muted\">· round {}</span>", v.round) } else { String::new() };
             let reason = v.reason.as_deref().map(|r| format!("<div class=\"md prose\">{}</div>", markdown(r))).unwrap_or_default();
             let _ = write!(out, "<li class=\"v-{cls}\"><b>{}</b> {}{round}{reason}</li>", esc(who), esc(&what));
