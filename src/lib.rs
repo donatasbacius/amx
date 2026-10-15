@@ -148,6 +148,25 @@ async fn persist_loop(hub: Arc<Hub>) {
     }
 }
 
+async fn alive_loop(hub: Arc<Hub>, path: std::path::PathBuf) {
+    let mut down = hub.shutdown.subscribe();
+    let mut failing = false;
+    loop {
+        match persist::mark_alive(&path, relay::now_ms()) {
+            Ok(()) => failing = false,
+            Err(e) if !failing => {
+                tracing::error!("{e:#}");
+                failing = true;
+            }
+            Err(_) => {}
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = down.wait_for(|d| *d) => return,
+        }
+    }
+}
+
 pub async fn start(cfg: Config) -> Result<Running> {
     if let Some(u) = &cfg.public_url
         && server::url_host(u).is_none()
@@ -177,8 +196,9 @@ pub async fn start(cfg: Config) -> Result<Running> {
     hub.set_web_url(hub.cfg.public_url.as_deref().unwrap_or(&format!("http://{local_addr}")));
     tracing::info!("amx relay listening on http://{local_addr} (this machine's owner)");
     let mut tasks = vec![spawn_server(&hub, local, Listener::Local), tokio::spawn(tick_loop(hub.clone()))];
-    if hub.cfg.state.is_some() {
+    if let Some(path) = hub.cfg.state.clone() {
         tasks.push(tokio::spawn(persist_loop(hub.clone())));
+        tasks.push(tokio::spawn(alive_loop(hub.clone(), path)));
     }
     if hub.cfg.tailnet || hub.cfg.tailnet_listen.is_some() {
         tasks.push(tokio::spawn(tailnet_listener_loop(hub.clone())));

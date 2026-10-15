@@ -476,3 +476,105 @@ async fn wait_points_to_tasks_instead_of_repeating_them() {
     assert!(finished.contains("Review finished"), "{finished}");
     relay.running.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closing_reply_window_wakes_waiting_reviewers() {
+    let mut cfg = Config {
+        port: 0,
+        tailnet: false,
+        ..Config::default()
+    };
+    cfg.timing.reply_secs = 1;
+    let running = amx::start(cfg).await.unwrap();
+    let base = format!("http://{}", running.local_addr);
+    for rev in ["rev-a", "rev-b"] {
+        ok_tool(&base, rev, "hello", json!({"role":"reviewer"})).await;
+    }
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev-a", "rev-b"]})).await;
+    for (rev, text) in [("rev-a", "race on shutdown"), ("rev-b", "leaks a file handle")] {
+        ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
+        let findings = json!([{"severity":"major","text":text}]);
+        ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","findings":findings})).await;
+    }
+    ok_tool(&base, "rev-a", "vote", json!({"review_id":"r1","votes":[{"finding":"F2","vote":"disagree","reason":"no"}]})).await;
+    let reply = ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"disagree","reason":"no"}]})).await;
+    assert!(reply.contains("contested"), "{reply}");
+    let started = std::time::Instant::now();
+    let wait = ok_tool(&base, "rev-b", "wait", json!({"timeout_seconds": 20})).await;
+    assert!(started.elapsed() < Duration::from_secs(10), "woken when the window closed: {wait}");
+    assert!(wait.contains("You must vote on: F1.") && !wait.contains("contested"), "{wait}");
+    running.stop().await;
+}
+
+fn agent_in(path: &Path, name: &str) -> Value {
+    let v: Value = serde_json::from_slice(&std::fs::read(path).unwrap_or_default()).unwrap_or_default();
+    v["agents"].as_array().into_iter().flatten().find(|a| a["name"] == name).cloned().unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delivered_events_are_saved_before_wait_returns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.json");
+    let cfg = Config {
+        port: 0,
+        tailnet: false,
+        state: Some(path.clone()),
+        ..Config::default()
+    };
+    let running = amx::start(cfg).await.unwrap();
+    let base = format!("http://{}", running.local_addr);
+    ok_tool(&base, "rev", "hello", json!({"role":"reviewer"})).await;
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev"]})).await;
+    for _ in 0..50 {
+        if agent_in(&path, "rev")["next_seq"] == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(agent_in(&path, "rev")["delivered"], 0);
+    let offer = ok_tool(&base, "rev", "wait", json!({"timeout_seconds": 5})).await;
+    assert!(offer.contains("Review offer"), "{offer}");
+    assert_eq!(agent_in(&path, "rev")["delivered"], 1, "a crash now must not deliver the offer again");
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn downtime_after_a_crash_is_counted_from_the_last_heartbeat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.json");
+    let alive = path.with_file_name("state.json.alive");
+    let cfg = Config {
+        port: 0,
+        tailnet: false,
+        state: Some(path.clone()),
+        ..Config::default()
+    };
+    let running = amx::start(cfg.clone()).await.unwrap();
+    let base = format!("http://{}", running.local_addr);
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": 1})).await;
+    assert!(alive.exists(), "the relay records that it is alive");
+    running.stop().await;
+
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let saved = v["saved_at"].as_u64().unwrap();
+    v["saved_at"] = json!(saved - 600_000);
+    std::fs::write(&path, v.to_string()).unwrap();
+    std::fs::write(&alive, saved.to_string()).unwrap();
+    let again = amx::start(cfg).await.unwrap();
+    let r: Value = reqwest::get(format!("http://{}/api/reviews/r1", again.local_addr)).await.unwrap().json().await.unwrap();
+    let left = r["deadline_left_ms"].as_u64().unwrap();
+    assert!(left <= 120_000, "a quiet spell before the crash is not downtime: {left}");
+    again.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_without_a_method_are_invalid() {
+    let relay = start(None, vec![]).await;
+    for body in [json!({"jsonrpc":"2.0","id":1}), json!({"jsonrpc":"2.0","id":2,"method":5})] {
+        let (status, v) = rpc(&relay.local, "someone", body.clone()).await;
+        assert_eq!((status, v["error"]["code"].as_i64()), (200, Some(-32600)), "{body} -> {v}");
+    }
+    let (status, _) = rpc(&relay.local, "someone", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await;
+    assert_eq!(status, 202);
+    relay.running.stop().await;
+}
