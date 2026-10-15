@@ -55,9 +55,17 @@ fn spawn_server(hub: &Arc<Hub>, listener: tokio::net::TcpListener, kind: Listene
     })
 }
 
-async fn tailnet_addr(hub: &Hub) -> Result<SocketAddr> {
+/// Where links to the web page point when `public_url` isn't set.
+pub fn tailnet_url(addr: SocketAddr, dns_name: Option<&str>) -> String {
+    match dns_name {
+        Some(name) => format!("http://{name}:{}", addr.port()),
+        None => format!("http://{addr}"),
+    }
+}
+
+async fn tailnet_addr(hub: &Hub) -> Result<(SocketAddr, Option<String>)> {
     if let Some(a) = hub.cfg.tailnet_listen {
-        return Ok(a);
+        return Ok((a, None));
     }
     let status = hub.ts.status().await?;
     let ip = status
@@ -66,7 +74,7 @@ async fn tailnet_addr(hub: &Hub) -> Result<SocketAddr> {
         .find(|ip| matches!(ip, IpAddr::V4(_)))
         .copied()
         .context("no Tailscale IPv4 address")?;
-    Ok(SocketAddr::new(ip, hub.cfg.port))
+    Ok((SocketAddr::new(ip, hub.cfg.port), status.dns_name))
 }
 
 /// Binds the tailnet listener, retrying until Tailscale is up (e.g. at boot).
@@ -74,12 +82,14 @@ async fn tailnet_listener_loop(hub: Arc<Hub>) {
     let mut warned = false;
     loop {
         match tailnet_addr(&hub).await {
-            Ok(addr) => match tokio::net::TcpListener::bind(addr).await {
+            Ok((addr, dns_name)) => match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => {
                     tracing::info!("listening on http://{addr} (tailnet, callers identified with tailscale whois)");
                     hub.listening.lock().unwrap().push(format!("http://{addr}"));
                     if hub.cfg.tailnet_listen.is_none() {
-                        hub.set_web_url(&format!("http://{addr}"));
+                        if hub.cfg.public_url.is_none() {
+                            hub.set_web_url(&tailnet_url(addr, dns_name.as_deref()));
+                        }
                         match hub.ts.whois(addr.ip()).await {
                             Some(id) => {
                                 tracing::info!("relay owner (loopback callers): {} on {}", id.login, id.node);
@@ -139,6 +149,11 @@ async fn persist_loop(hub: Arc<Hub>) {
 }
 
 pub async fn start(cfg: Config) -> Result<Running> {
+    if let Some(u) = &cfg.public_url
+        && server::url_host(u).is_none()
+    {
+        anyhow::bail!("public_url must be an http:// or https:// URL, got {u}");
+    }
     let ts = tailscale::Tailscale::new(if cfg.tailnet || cfg.tailnet_listen.is_some() {
         tailscale::find_bin(cfg.tailscale_bin.as_deref())
     } else {
@@ -159,7 +174,7 @@ pub async fn start(cfg: Config) -> Result<Running> {
         .with_context(|| format!("binding {local_addr}"))?;
     let local_addr = local.local_addr()?;
     hub.listening.lock().unwrap().push(format!("http://{local_addr}"));
-    hub.set_web_url(&format!("http://{local_addr}"));
+    hub.set_web_url(hub.cfg.public_url.as_deref().unwrap_or(&format!("http://{local_addr}")));
     tracing::info!("amx relay listening on http://{local_addr} (this machine's owner)");
     let mut tasks = vec![spawn_server(&hub, local, Listener::Local), tokio::spawn(tick_loop(hub.clone()))];
     if hub.cfg.state.is_some() {

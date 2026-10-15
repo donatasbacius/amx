@@ -12,6 +12,8 @@ pub struct Config {
     /// Also listen on this machine's Tailscale IPv4 address.
     pub tailnet: bool,
     pub tailscale_bin: Option<PathBuf>,
+    /// Base URL for links to the web page; default the MagicDNS name, else the Tailscale IP.
+    pub public_url: Option<String>,
     /// Tailscale logins allowed to connect over the tailnet. Empty allows any identified caller.
     pub allow_logins: Vec<String>,
     /// Testing only: listen here with tailnet (whois) identity rules instead of the Tailscale IP.
@@ -77,6 +79,7 @@ impl Default for Config {
             port: DEFAULT_PORT,
             tailnet: true,
             tailscale_bin: None,
+            public_url: None,
             allow_logins: Vec::new(),
             tailnet_listen: None,
             timing: Timing::default(),

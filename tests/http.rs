@@ -309,3 +309,65 @@ async fn state_is_saved_while_running_and_restored() {
     again.stop().await;
     running.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_calls_do_not_register_the_caller() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    for body in [
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    ] {
+        rpc(&base, "probe", body).await;
+    }
+    let online = ok_tool(&base, "probe", "online", json!({})).await;
+    assert!(online.contains("No agents online.") && online.contains("You (`probe`) are not online"), "{online}");
+    ok_tool(&base, "probe", "review_status", json!({})).await;
+    assert!(relay.running.hub.read(|s, _| s.agents.get("probe").is_none()));
+
+    rpc(&base, "probe", json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{}})).await;
+    let online = ok_tool(&base, "probe", "online", json!({})).await;
+    assert!(online.contains("probe (you) (author,") && !online.contains("not online"), "{online}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authors_name_reviewers_and_links_use_the_public_url() {
+    let cfg = Config {
+        port: 0,
+        tailnet: false,
+        public_url: Some("http://amx.example.com:7341/".into()),
+        ..Config::default()
+    };
+    let running = amx::start(cfg).await.unwrap();
+    let base = format!("http://{}", running.local_addr);
+    for rev in ["rev-a", "rev-b"] {
+        ok_tool(&base, rev, "hello", json!({"role":"reviewer"})).await;
+    }
+    let (err, text) = tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev-a", "nobody"]})).await;
+    assert!(err && text.contains("nobody (unknown agent)"), "{text}");
+    let req = ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev-b"]})).await;
+    assert!(req.contains("Review r1 requested from rev-b; 1 of them idle now"), "{req}");
+    let (err, text) = tool(&base, "rev-a", "accept_review", json!({"review_id":"r1"})).await;
+    assert!(err && text.contains("picked"), "{text}");
+    ok_tool(&base, "rev-b", "accept_review", json!({"review_id":"r1"})).await;
+
+    let status = ok_tool(&base, "author", "review_status", json!({"review_id":"r1"})).await;
+    assert!(status.contains("http://amx.example.com:7341/r/r1"), "{status}");
+    let page = reqwest::Client::new()
+        .get(format!("{base}/"))
+        .header("Host", "amx.example.com:7341")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200, "the public name passes the host check");
+    running.stop().await;
+}
+
+#[test]
+fn tailnet_links_prefer_the_magicdns_name() {
+    let addr = "192.0.2.7:7341".parse().unwrap();
+    assert_eq!(amx::tailnet_url(addr, Some("relay.example.ts.net")), "http://relay.example.ts.net:7341");
+    assert_eq!(amx::tailnet_url(addr, None), "http://192.0.2.7:7341");
+}

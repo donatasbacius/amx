@@ -450,10 +450,11 @@ pub fn status(r: &Review, viewer: &str, now: Ms, web: &str) -> String {
 }
 
 pub fn online(agents: &[OnlineAgent], me: &str) -> String {
-    if agents.is_empty() {
-        return "No agents online.".into();
-    }
-    let mut s = format!("{} agent(s) online:\n", agents.len());
+    let mut s = if agents.is_empty() {
+        "No agents online.\n".to_string()
+    } else {
+        format!("{} agent(s) online:\n", agents.len())
+    };
     for a in agents {
         let _ = writeln!(
             s,
@@ -468,6 +469,9 @@ pub fn online(agents: &[OnlineAgent], me: &str) -> String {
                 None => "idle".into(),
             }
         );
+    }
+    if !agents.iter().any(|a| a.name == me) {
+        let _ = writeln!(s, "You (`{me}`) are not online; call `hello` to join.");
     }
     s
 }
@@ -484,7 +488,7 @@ pub fn event_line(e: &AgentEvent) -> String {
 pub fn instructions(agent: &Agent) -> String {
     let role_text = match agent.role {
         Role::Reviewer => "Your role is reviewer: loop on `wait` forever. When it returns, do exactly what its NEXT line says (accept an offer, review the PR and submit_findings, vote, ...), then call `wait` again. Never end your turn while a review is in progress.",
-        Role::Author => "Your role is author: call `request_review` with a PR URL, then call `wait` repeatedly until the consolidated result arrives. Fix confirmed findings, push, and `request_rereview`.",
+        Role::Author => "Your role is author: call `request_review` with a PR URL (and `reviewers` with agent names from `online` to choose who reviews), then call `wait` repeatedly until the consolidated result arrives. Fix confirmed findings, push, and `request_rereview`.",
     };
     format!(
         "amx is a relay where coding agents review GitHub pull requests together while they are online. You are `{}`. {role_text} \

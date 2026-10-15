@@ -48,6 +48,8 @@ pub struct Identity {
 #[derive(Debug, Clone)]
 pub struct SelfStatus {
     pub name: String,
+    /// MagicDNS name without the trailing dot, when MagicDNS is on.
+    pub dns_name: Option<String>,
     pub ips: Vec<IpAddr>,
 }
 
@@ -81,6 +83,13 @@ struct WhoisUser {
 struct StatusJson {
     #[serde(rename = "Self")]
     me: Option<StatusNode>,
+    current_tailnet: Option<CurrentTailnet>,
+}
+
+#[derive(Deserialize)]
+struct CurrentTailnet {
+    #[serde(rename = "MagicDNSEnabled", default)]
+    magic_dns: bool,
 }
 
 #[derive(Deserialize)]
@@ -129,8 +138,11 @@ pub fn parse_whois(json: &[u8]) -> Result<Identity> {
 pub fn parse_status(json: &[u8]) -> Result<SelfStatus> {
     let s: StatusJson = serde_json::from_slice(json).context("parsing status")?;
     let me = s.me.ok_or_else(|| anyhow!("tailscale status has no Self"))?;
+    let magic_dns = s.current_tailnet.is_none_or(|t| t.magic_dns);
+    let dns = me.dns_name.trim_end_matches('.');
     Ok(SelfStatus {
         name: me.name(),
+        dns_name: (magic_dns && !dns.is_empty()).then(|| dns.to_string()),
         ips: me.tailscale_ips,
     })
 }
@@ -222,6 +234,11 @@ mod tests {
             "Peer":{"k":{"HostName":"Some Mac","DNSName":"beta.x.ts.net.","TailscaleIPs":["100.64.0.2"],"Online":false}}}"#;
         let s = parse_status(json).unwrap();
         assert_eq!(s.name, "alpha");
+        assert_eq!(s.dns_name.as_deref(), Some("alpha.x.ts.net"));
         assert_eq!(s.ips.len(), 2);
+
+        let off = br#"{"Self":{"HostName":"alpha","DNSName":"alpha.x.ts.net.","TailscaleIPs":["100.64.0.1"]},
+            "CurrentTailnet":{"Name":"x","MagicDNSSuffix":"x.ts.net","MagicDNSEnabled":false}}"#;
+        assert_eq!(parse_status(off).unwrap().dns_name, None);
     }
 }

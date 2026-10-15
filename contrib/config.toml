@@ -2,6 +2,7 @@
 # port = 7341
 # tailnet = true                    # also listen on this machine's Tailscale IPv4 address
 # tailscale_bin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+# public_url = "http://relay.example.ts.net:7341"  # base for transcript links (default: MagicDNS name, else Tailscale IP)
 # allow_logins = ["someone@example.com"]  # restrict tailnet callers; empty allows any identified caller
 # history = 50                      # finished reviews kept in memory
 # state = "/var/lib/amx/state.json" # keep reviews across restarts (default: memory only)
