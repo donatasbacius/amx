@@ -291,6 +291,8 @@ pub enum Status {
     Disputed,
     Duplicate(String),
     Withdrawn,
+    /// Nobody still in the review stood by it and nobody voted on it.
+    Unverified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,6 +320,13 @@ pub struct Finding {
     pub open_round: u8,
     pub votes: BTreeMap<String, Vote>,
     pub outcome: Option<Outcome>,
+}
+
+impl Finding {
+    /// Votes cast on its current revision; an amendment needs fresh ones.
+    pub fn current_votes(&self) -> impl Iterator<Item = (&String, &Vote)> {
+        self.votes.iter().filter(|(_, v)| v.revision >= self.revision)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,16 +466,18 @@ impl Review {
     }
 }
 
-/// Merges duplicates, then applies the voting rule to every finding.
-pub fn decide(findings: &mut [Finding], c: &Consensus) {
+/// Merges duplicates, then applies the voting rule to every finding. `active` are the reviewers still in the review:
+/// only they stand by their own findings when nobody voted on them.
+pub fn decide(findings: &mut [Finding], c: &Consensus, active: &HashSet<String>) {
     let ids: Vec<String> = findings.iter().map(|f| f.id.clone()).collect();
+    let rating: BTreeMap<String, Severity> = findings.iter().map(|f| (f.id.clone(), f.severity)).collect();
     let mut merged: BTreeMap<String, String> = BTreeMap::new();
     for f in findings.iter() {
         if f.withdrawn.is_some() {
             continue;
         }
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-        for v in f.votes.values() {
+        for (_, v) in f.current_votes() {
             if let Choice::Duplicate(t) = &v.choice {
                 *counts.entry(t.as_str()).or_default() += 1;
             }
@@ -474,7 +485,7 @@ pub fn decide(findings: &mut [Finding], c: &Consensus) {
         let Some((target, n)) = counts.into_iter().max_by_key(|(_, n)| *n) else {
             continue;
         };
-        if n * 2 <= f.votes.len() {
+        if n * 2 <= f.current_votes().count() {
             continue;
         }
         let mut t = target.to_string();
@@ -504,13 +515,15 @@ pub fn decide(findings: &mut [Finding], c: &Consensus) {
         }
         let mut rated: Vec<Severity> = f.by.iter().map(|_| f.severity).collect();
         let mut disagree = 0;
-        for v in f.votes.values() {
-            match v.choice {
+        for (_, v) in f.current_votes() {
+            match &v.choice {
                 Choice::Disagree => disagree += 1,
-                _ => rated.push(v.severity.unwrap_or(f.severity)),
+                Choice::Agree => rated.push(v.severity.unwrap_or(f.severity)),
+                Choice::Duplicate(t) => rated.push(rating.get(t).copied().unwrap_or(f.severity)),
             }
         }
         let agree = rated.len();
+        let examined = f.current_votes().next().is_some() || f.by.as_ref().is_some_and(|b| active.contains(b));
         let total = (agree + disagree) as f64;
         let mut severity = f.severity;
         let mut downgraded = false;
@@ -518,6 +531,8 @@ pub fn decide(findings: &mut [Finding], c: &Consensus) {
         let severity_split = disagree == 0 && agree == 2 && rated[0] != rated[1];
         let status = if let Some(t) = merged.get(&f.id) {
             Status::Duplicate(t.clone())
+        } else if !examined {
+            Status::Unverified
         } else if total > 0.0 && agree as f64 > c.confirm_fraction * total {
             severity = rated[agree / 2];
             let unanimous = disagree == 0 && rated.iter().all(|s| *s == Severity::Blocking);
@@ -1577,7 +1592,7 @@ impl State {
         r.since_sha = reviewed;
         for f in prev.findings.iter() {
             let Some(o) = &f.outcome else { continue };
-            if !matches!(o.status, Status::Confirmed | Status::Disputed) {
+            if !matches!(o.status, Status::Confirmed | Status::Disputed | Status::Unverified) {
                 continue;
             }
             r.next_finding += 1;
@@ -1771,9 +1786,9 @@ impl State {
                         .iter()
                         .enumerate()
                         .filter(|(_, f)| {
-                            let disagree = f.votes.values().any(|v| v.choice == Choice::Disagree);
-                            let agree = f.by.is_some() || f.votes.values().any(|v| v.choice != Choice::Disagree);
-                            let rerated = f.votes.values().any(|v| v.severity.is_some());
+                            let disagree = f.current_votes().any(|(_, v)| v.choice == Choice::Disagree);
+                            let agree = f.by.is_some() || f.current_votes().any(|(_, v)| v.choice != Choice::Disagree);
+                            let rerated = f.current_votes().any(|(_, v)| v.severity.is_some());
                             f.withdrawn.is_none() && agree && (disagree || rerated)
                         })
                         .map(|(i, _)| i)
@@ -1903,7 +1918,8 @@ fn open_votes(r: &mut Review, agents: &mut Agents, replying: bool, now: Ms) {
 
 fn finish(r: &mut Review, agents: &mut Agents, web: &str, now: Ms) {
     let c = r.params.consensus;
-    decide(&mut r.findings, &c);
+    let active: HashSet<String> = r.active_slots().map(|s| s.agent.clone()).collect();
+    decide(&mut r.findings, &c, &active);
     let verdict = verdict_of(&r.findings);
     r.phase = Phase::Done;
     r.ended = Some(now);

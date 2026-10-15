@@ -1044,3 +1044,134 @@ fn transcript_shows_the_severity_an_agree_vote_backs() {
     assert!(r.log.iter().any(|e| e.text == "F1: agree (minor) — real, but overstated"), "{:?}", r.log);
     assert!(amx::web::render_review(r, sim.now).contains("agree (minor)"));
 }
+
+fn outcome(sim: &Sim, id: &str, f: &str) -> amx::relay::Outcome {
+    sim.s.review(id).unwrap().finding(f).unwrap().outcome.clone().unwrap()
+}
+
+#[test]
+fn votes_on_an_earlier_revision_do_not_count() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("minor", "small thing")]);
+    sim.submit("rev-b", &id, &[("nit", "typo")]);
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    let change = AmendIn {
+        severity: Some("blocking".into()),
+        text: Some("now a blocker".into()),
+        ..Default::default()
+    };
+    sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap();
+    sim.vote("rev-a", &id, &[("F2", "agree")]);
+    sim.advance(601);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    let o = outcome(&sim, &id, "F1");
+    assert_eq!((o.agree, o.disagree), (1, 0), "rev-b agreed with the minor version only");
+    let result = sim.events("alice-codex");
+    assert!(result.contains("now a blocker (https://github.com/rust-lang/rust/blob/0123456/src/lib.rs#L10) — by rev-a; 1 agree, 0 disagree"), "{result}");
+
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("minor", "small thing")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.submit("rev-c", &id, &[]);
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    sim.vote("rev-c", &id, &[("F1", "disagree")]);
+    assert_eq!(sim.phase(&id), Phase::Voting(2));
+    let change = AmendIn {
+        severity: Some("major".into()),
+        ..Default::default()
+    };
+    sim.s.amend("rev-a", &id, "F1", change, sim.now).unwrap();
+    sim.vote("rev-c", &id, &[("F1", "disagree")]);
+    sim.advance(601);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    let o = outcome(&sim, &id, "F1");
+    assert_eq!((o.status, o.agree, o.disagree), (Status::Disputed, 1, 1), "a plain agree doesn't follow the finding to major");
+    assert_eq!(sim.verdict(&id), Verdict::Approve);
+    let result = sim.events("alice-codex");
+    assert!(result.contains("rev-b: agree on an earlier revision, not counted (round 1)"), "{result}");
+}
+
+#[test]
+fn findings_nobody_cross_examined_are_unverified() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("blocking", "says blocker")]);
+    sim.submit("rev-b", &id, &[("major", "says major")]);
+    sim.leave("rev-a");
+    sim.leave("rev-b");
+    sim.advance(301);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    assert_eq!(sim.status(&id, "F1"), Status::Unverified);
+    assert_eq!(sim.status(&id, "F2"), Status::Unverified);
+    assert_eq!(sim.verdict(&id), Verdict::Approve, "unverified findings don't decide the verdict");
+    let result = sim.events("alice-codex");
+    assert!(!result.contains("Confirmed findings") && result.contains("Not cross-examined") && result.contains("says blocker"), "{result}");
+    assert!(result.contains("F1, F2 were not cross-examined"), "{result}");
+    assert!(amx::web::render_review(sim.s.review(&id).unwrap(), sim.now).contains("unverified"));
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    assert_eq!(sim.s.review(&id2).unwrap().findings.len(), 2, "unverified findings are re-checked");
+
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "still here")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.leave("rev-b");
+    sim.advance(301);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    assert_eq!(sim.status(&id, "F1"), Status::Confirmed, "a reviewer still present stands by its finding");
+}
+
+#[test]
+fn duplicates_of_a_finding_that_is_not_confirmed_stay_in_the_result() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("major", "unbounded cache growth")]);
+    sim.submit("rev-b", &id, &[("major", "same cache problem")]);
+    sim.submit("rev-c", &id, &[]);
+    sim.vote("rev-a", &id, &[("F2", "dup:F1")]);
+    sim.vote("rev-b", &id, &[("F1", "disagree")]);
+    sim.vote("rev-c", &id, &[("F1", "disagree"), ("F2", "dup:F1")]);
+    sim.skip_replies();
+    sim.vote("rev-b", &id, &[("F1", "disagree")]);
+    sim.vote("rev-c", &id, &[("F1", "disagree")]);
+    assert_eq!(sim.status(&id, "F1"), Status::Rejected);
+    assert_eq!(sim.status(&id, "F2"), Status::Duplicate("F1".into()));
+    let result = sim.events("alice-codex");
+    assert!(result.contains("merged duplicate F2 by rev-b: same cache problem"), "{result}");
+}
+
+#[test]
+fn an_unmerged_duplicate_vote_backs_the_target_severity() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("major", "slow path")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.submit("rev-c", &id, &[("minor", "slow path, a bit")]);
+    sim.vote("rev-a", &id, &[("F2", "agree")]);
+    sim.vote("rev-b", &id, &[("F1", "dup:F2"), ("F2", "agree")]);
+    sim.vote("rev-c", &id, &[("F1", "disagree")]);
+    sim.skip_replies();
+    sim.vote("rev-b", &id, &[("F1", "dup:F2")]);
+    sim.vote("rev-c", &id, &[("F1", "disagree")]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    let o = outcome(&sim, &id, "F1");
+    assert_eq!((o.status, o.severity), (Status::Confirmed, amx::relay::Severity::Minor), "rev-b only said it is the minor F2");
+    assert_eq!(sim.verdict(&id), Verdict::Approve);
+}
