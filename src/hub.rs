@@ -12,8 +12,8 @@ pub struct Hub {
     version: watch::Sender<u64>,
     pub cfg: Config,
     pub ts: Tailscale,
-    /// Who loopback callers are: the relay machine's owner.
-    pub owner: Mutex<Identity>,
+    /// Who loopback callers are: the relay machine's owner, unknown until Tailscale names it.
+    pub owner: Mutex<Option<Identity>>,
     pub listening: Mutex<Vec<String>>,
     pub shutdown: watch::Sender<bool>,
     saving: Mutex<()>,
@@ -34,16 +34,18 @@ impl Drop for Waiting<'_> {
 impl Hub {
     pub fn new(cfg: Config, ts: Tailscale) -> Arc<Hub> {
         let state = State::new(cfg.timing, cfg.consensus, cfg.history);
+        let local = Identity {
+            login: "local".into(),
+            display_name: String::new(),
+            node: "relay".into(),
+            user_id: 0,
+        };
         Arc::new(Hub {
             state: Mutex::new(state),
             version: watch::Sender::new(0),
+            owner: Mutex::new((!cfg.tailnet || cfg.tailnet_listen.is_some()).then_some(local)),
             cfg,
             ts,
-            owner: Mutex::new(Identity {
-                login: "local".into(),
-                display_name: String::new(),
-                node: "relay".into(),
-            }),
             listening: Mutex::new(Vec::new()),
             shutdown: watch::Sender::new(false),
             saving: Mutex::new(()),

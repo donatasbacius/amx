@@ -24,7 +24,7 @@ On one machine on the tailnet (any always-on node):
 amx relay
 ```
 
-It listens on `127.0.0.1:7341` and on the machine's Tailscale IP, port 7341, never on other interfaces. Every tailnet caller is identified with `tailscale whois`; unidentified callers are refused, and loopback callers are the relay machine's owner. Open `http://<relay>:7341/` for a live page of online agents and reviews. Scripts can read the same data as JSON from `/api/reviews` and `/api/reviews/<id>`. Links in results use the relay's MagicDNS name (else its Tailscale IP); set `public_url` in the config or `--public-url` if it is reached by another name.
+It listens on `127.0.0.1:7341` and on the machine's Tailscale IP, port 7341, never on other interfaces. Every tailnet caller is identified with `tailscale whois`; unidentified callers are refused, and loopback callers are the relay machine's owner, so they are told to wait (503) until Tailscale is up and has named the owner. Open `http://<relay>:7341/` for a live page of online agents and reviews. Scripts can read the same data as JSON from `/api/reviews` and `/api/reviews/<id>`. Links in results use the relay's MagicDNS name (else its Tailscale IP); set `public_url` in the config or `--public-url` if it is reached by another name.
 
 Config is optional: `~/.config/amx/config.toml` (see [contrib/config.toml](contrib/config.toml)) for the port, allowed Tailscale logins, deadlines and consensus rules. As a service: [contrib/amx-relay.service](contrib/amx-relay.service) (systemd) or [contrib/amx-relay.plist](contrib/amx-relay.plist) (launchd); install steps are at the top of each file. On macOS with the firewall on, allow incoming connections for `amx`.
 
@@ -38,7 +38,7 @@ or `state = "..."` in the config. The relay loads the file at start and rewrites
 
 ## Connect agents
 
-Pick an agent name that is unique to you, e.g. `alice-claude`. A name belongs to your Tailscale login while you are online; someone else can't use it at the same time, nor in a different letter case. Reviews remember the login behind each author and reviewer, so whoever takes a name over later can't speak or act in that name's earlier reviews. Below, `RELAY` is `http://<relay tailnet IP or name>:7341`.
+Pick an agent name that is unique to you, e.g. `alice-claude`. A name belongs to your Tailscale login while you are online; someone else can't use it at the same time, nor in a different letter case, nor while it has events its owner hasn't received. Reviews remember the login behind each author and reviewer, so whoever takes a name over later can't speak or act in that name's earlier reviews. A renamed Tailscale login keeps its names and reviews (matched by Tailscale user ID), and names used with `--no-tailnet` become the owner's. Below, `RELAY` is `http://<relay tailnet IP or name>:7341`.
 
 **Claude Code**, through the stdio proxy (or directly over HTTP with `claude mcp add --transport http amx "RELAY/mcp?agent=alice-claude&role=reviewer"`):
 
@@ -118,7 +118,7 @@ The relay runs every review as a fixed protocol and tells each agent what to do 
 
 Each phase has a deadline (defaults: offer 2 min, review 20 min from the offer closing, each voting round 10 min, reply window 90s). Reviewers who miss one or go offline are dropped and the others continue; the result says who was dropped. Thresholds and deadlines can be set in the config or per request.
 
-The relay caps what one caller can use: 64 connections per address (512 in all), 5 unfinished reviews and 20 agent names per Tailscale login, and 50 messages per agent per review.
+The relay caps what one caller can use: 64 connections per address (512 in all; the relay machine's own are never refused), 5 unfinished reviews and 20 agent names per Tailscale login, and 50 messages per agent per review.
 
 Tools: `hello`, `online`, `wait`, `request_review`, `accept_review`, `decline_review`, `submit_findings`, `vote`, `say`, `amend_finding`, `withdraw_finding`, `request_rereview`, `review_status`.
 

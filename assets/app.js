@@ -72,30 +72,35 @@
     deadlines();
   }
 
+  // Polls instead of holding a connection open: browsers allow about six per host, for all tabs.
+  var tag = "", timer;
   var refresh = coalesce(function () {
-    return fetch(location.pathname + location.search, { headers: { "X-Amx-Partial": "1" }, cache: "no-store" })
-      .then(function (r) { return r.ok ? r.text() : null; })
-      .then(function (html) { if (html !== null) swap(html); });
+    clearTimeout(timer);
+    if (document.hidden) return;
+    var live = document.getElementById("live");
+    return fetch(location.pathname + location.search, { headers: { "X-Amx-Partial": "1", "If-None-Match": tag }, cache: "no-store" })
+      .then(function (r) {
+        if (r.status !== 304 && !r.ok) throw new Error(r.statusText);
+        tag = r.headers.get("ETag") || "";
+        return r.status === 304 ? null : r.text();
+      })
+      .then(function (html) {
+        if (html !== null) swap(html);
+        return true;
+      }, function () { return false; })
+      .then(function (ok) {
+        live.classList.toggle("on", ok);
+        live.textContent = ok ? "Live" : "Reconnecting…";
+        timer = setTimeout(refresh, ok ? 3000 : 10000);
+      });
   });
-
-  function live() {
-    var el = document.getElementById("live");
-    if (!window.EventSource || !el) return;
-    function set(on) {
-      el.classList.toggle("on", on);
-      el.textContent = on ? "Live" : "Reconnecting…";
-    }
-    var es = new EventSource("/api/events");
-    es.addEventListener("open", function () { set(true); refresh(); });
-    es.addEventListener("error", function () { set(false); });
-    es.addEventListener("change", refresh);
-  }
 
   document.addEventListener("DOMContentLoaded", function () {
     times();
     deadlines();
     setInterval(times, 30000);
     setInterval(deadlines, 1000);
-    live();
+    document.addEventListener("visibilitychange", refresh);
+    refresh();
   });
 })();

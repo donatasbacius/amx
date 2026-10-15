@@ -260,7 +260,9 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     let r = get("/api/reviews/r1").await.unwrap();
     assert_eq!(r.headers()["cache-control"], "no-store");
     let body = r.text().await.unwrap();
-    assert!(!body.contains("SECRET") && !body.contains("PRIVATE"), "{body}");
+    assert!(!body.contains("SECRET") && !body.contains("PRIVATE") && !body.contains("changes_requested"), "{body}");
+    let page = get("/r/r1").await.unwrap().text().await.unwrap();
+    assert!(page.contains(">submitted<") && !page.contains("requests changes"), "{page}");
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!((v["phase"].as_str(), v["revealed"].as_bool(), v["hidden_findings"].as_u64()), (Some("reviewing"), Some(false), Some(1)));
     assert_eq!(v["timeline"][1]["state"], "active");
@@ -294,7 +296,10 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     assert!(page.contains("id=\"F1\"") && page.contains("Changes requested") && page.contains(">Result<") && !page.contains("<pre>"), "{page}");
     let partial = http.get(format!("{base}/r/r1")).header("X-Amx-Partial", "1").send().await.unwrap();
     assert_eq!(partial.headers()["cache-control"], "no-store");
+    let tag = partial.headers()["etag"].clone();
     assert!(!partial.text().await.unwrap().contains("<html"));
+    let unchanged = http.get(format!("{base}/r/r1")).header("X-Amx-Partial", "1").header("If-None-Match", tag).send().await.unwrap();
+    assert_eq!(unchanged.status(), 304, "the page's polls only fetch a changed page");
     relay.running.stop().await;
 }
 
@@ -579,7 +584,6 @@ async fn other_sites_cannot_register_or_keep_agents_alive() {
     let http = reqwest::Client::new();
     let url = format!("{base}/api/watch?agent=csrf-ghost&role=reviewer&timeout=1");
     let tries = [
-        http.get(&url),
         http.get(&url).header("Origin", "http://evil.example.com").header("X-Amx-Client", "x"),
         http.get(&url).header("Sec-Fetch-Site", "cross-site").header("X-Amx-Client", "x"),
         http.post(format!("{base}/api/heartbeat?agent=csrf-ghost&role=reviewer")).header("Sec-Fetch-Site", "cross-site"),
@@ -597,8 +601,10 @@ async fn other_sites_cannot_register_or_keep_agents_alive() {
     let watcher = amx::client::Client::new(&base, Some("cli-watch".into()), Some("reviewer".into()));
     let w = watcher.watch(0, 1).await.unwrap();
     assert_eq!(w["agent"], "cli-watch");
-    let same = http.get(format!("{base}/api/watch?agent=page&timeout=1")).header("Sec-Fetch-Site", "same-origin").header("X-Amx-Client", "x");
+    let same = http.get(format!("{base}/api/watch?agent=page&timeout=1")).header("Sec-Fetch-Site", "same-origin");
     assert_eq!(same.send().await.unwrap().status(), 200);
+    let old_cli = http.get(format!("{base}/api/watch?agent=old-watch&timeout=1")).send().await.unwrap();
+    assert_eq!(old_cli.status(), 200, "amx watch before 0.6.2 sends no headers of its own");
     relay.running.stop().await;
 }
 
@@ -618,14 +624,14 @@ async fn get_on(conn: &mut tokio::net::TcpStream, path: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn idle_and_excess_connections_are_cut_off_before_identification() {
+async fn idle_connections_are_cut_off_and_loopback_is_never_refused() {
     let mut cfg = Config {
         port: 0,
         tailnet: false,
         ..Config::default()
     };
     cfg.conn_limits = amx::server::ConnLimits {
-        max: 5,
+        max: 3,
         per_ip: 3,
         header_timeout: Duration::from_secs(2),
     };
@@ -636,10 +642,8 @@ async fn idle_and_excess_connections_are_cut_off_before_identification() {
     for _ in 0..5 {
         idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
     }
-    let mut over_all = tokio::net::TcpStream::connect(addr).await.unwrap();
-    assert!(closed(&mut over_all, Duration::from_secs(1)).await, "6th connection overall");
     for (i, c) in idle.iter_mut().enumerate() {
-        assert!(!closed(c, Duration::from_millis(20)).await, "connection {i} admitted (127.0.0.1 has no per-address cap)");
+        assert!(!closed(c, Duration::from_millis(20)).await, "connection {i} admitted (loopback is over no cap)");
     }
 
     assert!(get_on(&mut idle[0], "/api/reviews").await.starts_with("HTTP/1.1 200"), "admitted connections work");
@@ -650,15 +654,62 @@ async fn idle_and_excess_connections_are_cut_off_before_identification() {
         assert!(closed(c, Duration::from_secs(5)).await, "idle connection {i} (keep-alive after a request included)");
     }
     assert!(closed(&mut slow, Duration::from_secs(5)).await, "headers never finished");
+    running.stop().await;
+}
 
-    let mut fresh = None;
-    for _ in 0..50 {
-        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
-        if !closed(&mut c, Duration::from_millis(50)).await {
-            fresh = Some(c);
+#[tokio::test(flavor = "multi_thread")]
+async fn loopback_waits_for_the_owner_then_takes_over_local_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        port: 0,
+        tailnet: false,
+        state: Some(tmp.path().join("state.json")),
+        ..Config::default()
+    };
+    let running = amx::start(cfg.clone()).await.unwrap();
+    ok_tool(&format!("http://{}", running.local_addr), "own-au", "request_review", json!({"pr_url": PR, "reviewers": 1})).await;
+    running.stop().await;
+
+    let down = write_script(tmp.path(), "ts-down", "echo 'Tailscale is stopped.' >&2; exit 1");
+    let starting = amx::start(Config { tailnet: true, tailscale_bin: Some(down), ..cfg.clone() }).await.unwrap();
+    let (status, v) = rpc(&format!("http://{}", starting.local_addr), "own-au", json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await;
+    assert_eq!(status, 503);
+    assert!(v.as_str().unwrap().contains("waiting for Tailscale"), "{v}");
+    starting.stop().await;
+
+    let up = write_script(
+        tmp.path(),
+        "ts-up",
+        r#"case "$1" in
+status) echo '{"Self":{"HostName":"relaybox","TailscaleIPs":["127.0.0.1"]}}' ;;
+*) echo '{"Node":{"Name":"relaybox."},"UserProfile":{"ID":7,"LoginName":"owner@example.com"}}' ;;
+esac"#,
+    );
+    let running = amx::start(Config { tailnet: true, tailscale_bin: Some(up), ..cfg }).await.unwrap();
+    let base = format!("http://{}", running.local_addr);
+    for _ in 0..100 {
+        if rpc(&base, "own-au", json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await.0 == 200 {
             break;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(get_on(fresh.as_mut().expect("slots freed"), "/api/reviews").await.starts_with("HTTP/1.1 200"));
+    let online = ok_tool(&base, "own-au", "online", json!({})).await;
+    assert!(online.contains("own-au (you) (author, owner@example.com on"), "{online}");
+    assert!(running.hub.read(|s, _| s.reviews[0].author_login == "owner@example.com"), "local reviews are the owner's");
     running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_connection_is_reported_as_such() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((conn, _)) = listener.accept().await {
+            drop(conn);
+        }
+    });
+    let err = amx::client::Client::new(&url, Some("x".into()), None).heartbeat().await.unwrap_err().to_string();
+    assert!(err.contains("closed the connection"), "{err}");
+    let err = amx::client::Client::new("http://127.0.0.1:1", None, None).heartbeat().await.unwrap_err().to_string();
+    assert!(err.contains("cannot reach the amx relay"), "{err}");
 }

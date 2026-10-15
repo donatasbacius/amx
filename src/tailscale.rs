@@ -43,6 +43,8 @@ pub struct Identity {
     pub login: String,
     pub display_name: String,
     pub node: String,
+    /// Tailscale's user ID, which stays the same when the login is renamed; 0 when unknown.
+    pub user_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +74,8 @@ struct WhoisNode {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct WhoisUser {
+    #[serde(rename = "ID", default)]
+    id: u64,
     #[serde(default)]
     login_name: String,
     #[serde(default)]
@@ -132,6 +136,7 @@ pub fn parse_whois(json: &[u8]) -> Result<Identity> {
         login: w.user_profile.login_name,
         display_name: w.user_profile.display_name,
         node,
+        user_id: w.user_profile.id,
     })
 }
 
@@ -223,7 +228,7 @@ mod tests {
             "UserProfile":{"ID":2,"LoginName":"someone@example.com","DisplayName":"Some One"},"CapMap":{}}"#;
         let id = parse_whois(json).unwrap();
         assert_eq!(id.login, "someone@example.com");
-        assert_eq!(id.node, "alpha");
+        assert_eq!((id.node.as_str(), id.user_id), ("alpha", 2));
         assert!(parse_whois(br#"{"Node":{},"UserProfile":{}}"#).is_err());
         assert!(parse_whois(b"peer not found").is_err());
     }

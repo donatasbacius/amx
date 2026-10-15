@@ -32,15 +32,24 @@ struct Target {
 }
 
 impl Target {
-    fn client(&self) -> Client {
-        Client::new(&self.relay, self.agent.clone(), self.role.clone())
+    fn client(&self) -> Result<Client> {
+        if self.relay.contains('?') {
+            bail!("--relay takes the relay's address only, e.g. http://100.64.0.1:7341; name the agent with --agent");
+        }
+        if self.agent.as_deref().is_some_and(|a| !amx::server::valid_agent(a)) {
+            bail!("--agent: 1-64 letters, digits, - _ .");
+        }
+        if self.role.as_deref().is_some_and(|r| !r.is_empty() && amx::relay::Role::parse(r).is_none()) {
+            bail!("--role must be reviewer or author");
+        }
+        Ok(Client::new(&self.relay, self.agent.clone(), self.role.clone()))
     }
 
     fn named(&self) -> Result<Client> {
-        match &self.agent {
-            Some(a) if amx::server::valid_agent(a) => Ok(self.client()),
-            _ => bail!("--agent (or AMX_AGENT) is required: letters, digits, - _ ."),
+        if self.agent.is_none() {
+            bail!("--agent (or AMX_AGENT) is required: letters, digits, - _ .");
         }
+        self.client()
     }
 }
 
@@ -220,7 +229,7 @@ type Out = Arc<tokio::sync::Mutex<tokio::io::Stdout>>;
 async fn mcp_stdio(target: Target, wait_max: u64, wait_step: u64) -> Result<()> {
     let stdout: Out = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    let mut client = Arc::new(target.client());
+    let mut client = Arc::new(target.client()?);
     let mut beating = false;
     let waits: Arc<std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>> = Default::default();
     while let Some(line) = lines.next_line().await? {

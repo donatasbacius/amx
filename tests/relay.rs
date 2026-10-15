@@ -13,6 +13,7 @@ fn who(login: &str) -> Identity {
         login: login.into(),
         display_name: String::new(),
         node: "box".into(),
+        user_id: 0,
     }
 }
 
@@ -1332,6 +1333,9 @@ fn a_lapsed_name_does_not_inherit_its_reviews() {
     }
     sim.advance(91);
     let mallory = who("mallory@example.com");
+    let err = sim.s.touch("alice-codex", &mallory, None, sim.now).unwrap_err();
+    assert!(err.to_string().contains("in use by another tailnet user"), "held while its result is unread: {err}");
+    sim.events("alice-codex");
     sim.s.touch("alice-codex", &mallory, Some(Role::Author), sim.now).unwrap();
     sim.s.touch("rev-b", &mallory, Some(Role::Reviewer), sim.now).unwrap();
     let err = sim.s.say("alice-codex", &id, "I am alice", sim.now).unwrap_err();
@@ -1344,6 +1348,23 @@ fn a_lapsed_name_does_not_inherit_its_reviews() {
     sim.join("alice-codex", "alice@example.com", Role::Author);
     sim.s.say("alice-codex", &id, "Back, fixing it.", sim.now).unwrap();
     sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+}
+
+#[test]
+fn a_renamed_login_keeps_its_names_and_reviews() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-b", &id);
+    let alice = Identity { user_id: 7, ..who("alice@example.com") };
+    sim.s.touch("alice-codex", &alice, None, sim.now).unwrap();
+    let renamed = Identity { user_id: 7, ..who("alice.new@example.com") };
+    sim.s.touch("alice-codex", &renamed, None, sim.now).unwrap();
+    sim.s.touch("rev-a", &renamed, None, sim.now).unwrap();
+    sim.s.say("alice-codex", &id, "still me", sim.now).unwrap();
+    sim.accept("rev-a", &id);
+    assert_eq!(sim.s.review(&id).unwrap().author_login, "alice.new@example.com");
+    let other = Identity { user_id: 8, ..who("mallory@example.com") };
+    assert!(sim.s.touch("alice-codex", &other, None, sim.now).is_err());
 }
 
 #[test]
