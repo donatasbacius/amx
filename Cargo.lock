@@ -25,12 +25,13 @@ dependencies = [
 
 [[package]]
 name = "amx"
-version = "0.6.10"
+version = "0.7.0"
 dependencies = [
  "ammonia",
  "anyhow",
  "axum",
  "clap",
+ "futures-util",
  "hyper",
  "hyper-util",
  "pulldown-cmark",

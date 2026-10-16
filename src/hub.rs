@@ -18,9 +18,11 @@ pub struct Hub {
     pub shutdown: watch::Sender<bool>,
     saving: Mutex<()>,
     pub conns: Arc<crate::server::Conns>,
+    pub sessions: Mutex<std::collections::HashMap<String, crate::server::Session>>,
 }
 
-struct Waiting<'a> {
+/// Keeps an agent online while it lives.
+pub struct Waiting<'a> {
     hub: &'a Hub,
     name: String,
 }
@@ -50,6 +52,7 @@ impl Hub {
             shutdown: watch::Sender::new(false),
             saving: Mutex::new(()),
             conns: Arc::default(),
+            sessions: Mutex::default(),
         })
     }
 
@@ -122,24 +125,31 @@ impl Hub {
         self.state.lock().unwrap().check_name(name, who, now_ms())
     }
 
-    /// Blocks until `name` has new events or something it must act on, or the timeout passes.
-    /// Progress events are dropped unless `progress` is set. See `State::take_events` for `ack`.
-    pub async fn wait(&self, name: &str, timeout: Duration, progress: bool, ack: Option<u64>) -> (Vec<AgentEvent>, u64) {
-        let mut rx = self.subscribe();
-        let deadline = tokio::time::Instant::now() + timeout;
+    pub fn waiting(&self, name: &str) -> Waiting<'_> {
         self.state.lock().unwrap().set_waiting(name, 1, now_ms());
-        let _guard = Waiting {
+        Waiting {
             hub: self,
             name: name.to_string(),
-        };
+        }
+    }
+
+    /// Blocks until `name` has new events or something it must act on, or the timeout passes;
+    /// an author with nothing in progress isn't kept waiting. Progress events are dropped unless
+    /// `progress` is set. See `State::take_events` for `held`.
+    pub async fn wait(&self, name: &str, timeout: Duration, progress: bool, held: bool) -> (Vec<AgentEvent>, u64) {
+        let mut rx = self.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        let _guard = self.waiting(name);
         loop {
             rx.borrow_and_update();
-            let (taken, urgent) = {
+            let (taken, done) = {
                 let mut st = self.state.lock().unwrap();
                 let now = now_ms();
-                (st.take_events(name, progress, ack, now), st.next_actions(name, now).iter().any(|a| a.urgent))
+                let actions = st.next_actions(name, now);
+                let idle = actions.is_empty() && st.agents.get(name).is_some_and(|a| a.role == Role::Author);
+                (st.take_events(name, progress, held, now), idle || actions.iter().any(|a| a.urgent))
             };
-            if !taken.0.is_empty() || urgent {
+            if !taken.0.is_empty() || done {
                 return taken;
             }
             let mut down = self.shutdown.subscribe();
@@ -147,32 +157,6 @@ impl Hub {
                 _ = tokio::time::sleep_until(deadline) => return taken,
                 r = rx.changed() => if r.is_err() { return taken },
                 _ = down.wait_for(|d| *d) => return taken,
-            }
-        }
-    }
-
-    /// Events after `after` without consuming them, progress left out; keeps the agent online while it blocks.
-    pub async fn watch_events(&self, name: &str, after: u64, timeout: Duration) -> (Vec<AgentEvent>, u64) {
-        let mut rx = self.subscribe();
-        let deadline = tokio::time::Instant::now() + timeout;
-        self.state.lock().unwrap().set_waiting(name, 1, now_ms());
-        let _guard = Waiting {
-            hub: self,
-            name: name.to_string(),
-        };
-        loop {
-            rx.borrow_and_update();
-            let (events, last) = self.state.lock().unwrap().peek_events(name, after);
-            let now = now_ms();
-            let events: Vec<AgentEvent> = events.into_iter().filter(|e| !e.progress).map(|e| e.rendered(now)).collect();
-            if !events.is_empty() || last < after {
-                return (events, last);
-            }
-            let mut down = self.shutdown.subscribe();
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => return (events, last),
-                r = rx.changed() => if r.is_err() { return (events, last) },
-                _ = down.wait_for(|d| *d) => return (events, last),
             }
         }
     }

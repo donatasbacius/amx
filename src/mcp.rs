@@ -1,5 +1,5 @@
 use crate::hub::Hub;
-use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, Ms, NewReview, Role, State, SubmitIn, VoteIn};
+use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, Ms, NewReview, Phase, Role, State, SubmitIn, VoteIn};
 use crate::tailscale::Identity;
 use crate::text;
 use anyhow::{Result, anyhow};
@@ -9,11 +9,12 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-/// Codex's default MCP tool timeout and Claude Code's HTTP first-byte timer are both 60s.
-/// `amx mcp` repeats the wait to block longer (see `WAIT_PROXY_DEFAULT`).
+/// Claude Code gives up on a plain JSON reply after 60s, as does Codex on any tool call unless its
+/// `tool_timeout_sec` is raised. A session that takes the reply as an event stream waits
+/// `WAIT_STREAM`, kept alive by progress notifications.
 pub const WAIT_DEFAULT: u64 = 45;
 pub const WAIT_MAX: u64 = 50;
-pub const WAIT_PROXY_DEFAULT: u64 = 600;
+pub const WAIT_STREAM: u64 = 600;
 
 /// Tools that count as taking part, so they register the agent and keep it online.
 /// The rest (`online`, `review_status`) only read.
@@ -170,8 +171,19 @@ struct WaitArgs {
     timeout_seconds: Option<u64>,
     #[serde(default)]
     progress: bool,
-    /// From `amx mcp`: the last `amx/seq` its client received.
-    after: Option<u64>,
+}
+
+/// Who a message is from and how it arrived.
+pub struct Caller<'a> {
+    pub agent: &'a str,
+    pub who: &'a Identity,
+    pub role: Option<Role>,
+    /// In an MCP session, whose next request acknowledges what `wait` hands out.
+    pub session: bool,
+    /// The reply is an event stream, so `wait` may block for `WAIT_STREAM`.
+    pub stream: bool,
+    /// Added to the instructions at `initialize`, e.g. about the name it was given.
+    pub note: &'a str,
 }
 
 /// `reviewers` was the count before it could name agents; a number is still accepted.
@@ -306,10 +318,17 @@ fn owed_tasks(s: &State, agent: &str, now: Ms) -> Vec<String> {
 }
 
 /// Appends the NEXT lines. A task already owed `before` the call is only pointed to (`wait`
-/// gives it in full); one this call gives in full isn't queued again for `wait`.
+/// gives it in full); an urgent one this call gives in full isn't queued again for `wait`. A reply
+/// task's objections are only in its event, so that stays queued.
 fn with_next(hub: &Hub, agent: &str, before: &[String], head: String) -> String {
     let next = hub.quiet(|s, now| {
-        let new: Vec<String> = owed_tasks(s, agent, now).into_iter().filter(|t| !before.contains(t)).collect();
+        let new: Vec<String> = s
+            .next_actions(agent, now)
+            .into_iter()
+            .filter(|a| a.urgent)
+            .filter_map(|a| a.task)
+            .filter(|t| !before.contains(t))
+            .collect();
         s.forget_tasks(agent, &new);
         next_after(s, agent, &[], before, now).0
     });
@@ -317,7 +336,8 @@ fn with_next(hub: &Hub, agent: &str, before: &[String], head: String) -> String 
 }
 
 /// Runs one tool; `seq` is set when the result carries events to acknowledge.
-async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value, seq: &mut Option<u64>) -> Result<String> {
+async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Option<u64>) -> Result<String> {
+    let agent = c.agent;
     let before = hub.read(|s, now| owed_tasks(s, agent, now));
     match name {
         "hello" => {
@@ -335,9 +355,9 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value, seq: &mut Optio
         "online" => Ok(hub.read(|s, now| text::online(&s.online(now), agent))),
         "wait" => {
             let w: WaitArgs = args(a)?;
-            let secs = w.timeout_seconds.unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX);
-            let (events, reached) = hub.wait(agent, Duration::from_secs(secs), w.progress, w.after).await;
-            if w.after.is_some() {
+            let secs = if c.stream { WAIT_STREAM } else { w.timeout_seconds.unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX) };
+            let (events, reached) = hub.wait(agent, Duration::from_secs(secs), w.progress, c.session).await;
+            if c.session {
                 *seq = Some(reached);
             } else if !events.is_empty()
                 && let Err(e) = hub.save()
@@ -345,7 +365,18 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value, seq: &mut Optio
                 // Saved before replying, so a crash doesn't hand the same events out again.
                 tracing::error!("{e:#}");
             }
-            let (next, urgent) = hub.read(|s, now| next_after(s, agent, &events, &[], now));
+            let (next, urgent, idle) = hub.read(|s, now| {
+                let (next, urgent) = next_after(s, agent, &events, &[], now);
+                let author = s.agents.get(agent).is_some_and(|a| a.role == Role::Author);
+                let idle = (events.is_empty() && author && s.next_actions(agent, now).is_empty()).then(|| {
+                    let done = s.reviews.iter().rev().filter(|r| r.author == agent && r.phase == Phase::Done);
+                    text::nothing_pending(&done.map(|r| r.id.as_str()).take(2).collect::<Vec<_>>())
+                });
+                (next, urgent, idle)
+            });
+            if let Some(idle) = idle {
+                return Ok(idle);
+            }
             Ok(match (events.is_empty(), next.is_empty()) {
                 (true, _) if urgent => next,
                 (true, _) => format!("No new events.\n\n{next}"),
@@ -503,8 +534,9 @@ async fn call_tool(hub: &Hub, agent: &str, name: &str, a: Value, seq: &mut Optio
     }
 }
 
-/// Handles one JSON-RPC message for `agent`. Returns `None` for notifications and responses.
-pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, msg: Value) -> Option<Value> {
+/// Handles one JSON-RPC message. Returns `None` for notifications and responses.
+pub async fn handle(hub: &Hub, c: &Caller<'_>, msg: Value) -> Option<Value> {
+    let (agent, who, role) = (c.agent, c.who, c.role);
     if msg.is_array() {
         return Some(error_response(Value::Null, -32600, "batches are not supported"));
     }
@@ -545,7 +577,10 @@ pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, 
             } else {
                 PROTOCOL_VERSIONS[1]
             };
-            let instructions = hub.read(|s, _| s.agents.get(agent).map(text::instructions).unwrap_or_default());
+            let mut instructions = hub.read(|s, _| s.agents.get(agent).map(text::instructions).unwrap_or_default());
+            if !c.note.is_empty() {
+                instructions = format!("{instructions}\n\n{}", c.note);
+            }
             Some(ok(
                 id,
                 json!({
@@ -562,7 +597,7 @@ pub async fn handle(hub: &Hub, agent: &str, who: &Identity, role: Option<Role>, 
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
             let mut seq = None;
             let res = match touched {
-                Ok(()) => call_tool(hub, agent, tool, args, &mut seq).await,
+                Ok(()) => call_tool(hub, c, tool, args, &mut seq).await,
                 Err(e) => Err(e),
             };
             let (text, is_error) = match res {

@@ -1,67 +1,14 @@
-use amx::client::Client;
 use amx::config::Config;
-use anyhow::{Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
-use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::io::Read;
+use anyhow::Result;
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
 #[command(name = "amx", version, about = "Agent message exchange: a tailnet relay where coding agents review pull requests together")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-}
-
-#[derive(clap::Args, Clone)]
-struct Target {
-    /// Relay URL, e.g. http://100.64.0.1:7341
-    #[arg(long, env = "AMX_RELAY")]
-    relay: String,
-    /// Agent name, unique per person, e.g. alice-claude
-    #[arg(long, env = "AMX_AGENT")]
-    agent: Option<String>,
-    /// reviewer or author
-    #[arg(long, env = "AMX_ROLE")]
-    role: Option<String>,
-}
-
-impl Target {
-    fn client(&self) -> Result<Client> {
-        if self.relay.contains('?') {
-            bail!("--relay takes the relay's address only, e.g. http://100.64.0.1:7341; name the agent with --agent");
-        }
-        if self.agent.as_deref().is_some_and(|a| !amx::server::valid_agent(a)) {
-            bail!("--agent: 1-64 letters, digits, - _ .");
-        }
-        if self.role.as_deref().is_some_and(|r| !r.is_empty() && amx::relay::Role::parse(r).is_none()) {
-            bail!("--role must be reviewer or author");
-        }
-        Ok(Client::new(&self.relay, self.agent.clone(), self.role.clone()))
-    }
-
-    fn named(&self) -> Result<Client> {
-        if self.agent.is_none() {
-            bail!("--agent (or AMX_AGENT) is required: letters, digits, - _ .");
-        }
-        self.client()
-    }
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum HookClient {
-    Codex,
-    Claude,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum HookEvent {
-    Stop,
 }
 
 #[derive(Subcommand)]
@@ -87,33 +34,6 @@ enum Cmd {
         /// TESTING ONLY: extra listener that applies tailnet (whois) identity rules
         #[arg(long, hide = true)]
         tailnet_listen: Option<SocketAddr>,
-    },
-    /// MCP server on stdio that forwards to a relay (for clients that prefer stdio)
-    Mcp {
-        #[command(flatten)]
-        target: Target,
-        /// Seconds a `wait` may block, repeating the relay's 45s long-poll while nothing happens
-        /// (any timeout_seconds it passes is ignored); keep it under the client's tool timeout
-        #[arg(long, env = "AMX_WAIT_MAX", default_value_t = amx::mcp::WAIT_PROXY_DEFAULT)]
-        wait_max: u64,
-        /// TESTING ONLY: seconds per long-poll on the relay
-        #[arg(long, hide = true, default_value_t = amx::mcp::WAIT_DEFAULT)]
-        wait_step: u64,
-    },
-    /// Print one line per new relay event for an agent (for Claude Code's Monitor tool)
-    Watch {
-        #[command(flatten)]
-        target: Target,
-    },
-    /// Agent hook: `amx hook codex stop` blocks stopping while a review needs the agent
-    Hook {
-        client: HookClient,
-        event: HookEvent,
-        #[command(flatten)]
-        target: Target,
-        /// Reviewers: also block stopping when idle, so the agent keeps looping on `wait`
-        #[arg(long)]
-        keep_waiting: bool,
     },
 }
 
@@ -160,20 +80,6 @@ async fn run() -> Result<()> {
             tracing::info!("shutting down");
             running.stop().await;
         }
-        Cmd::Mcp { target, wait_max, wait_step } => mcp_stdio(target, wait_max, wait_step).await?,
-        Cmd::Watch { target } => watch(target.named()?).await,
-        Cmd::Hook {
-            client: _,
-            event: HookEvent::Stop,
-            target,
-            keep_waiting,
-        } => {
-            let mut stdin = String::new();
-            let _ = std::io::stdin().read_to_string(&mut stdin);
-            if let Some(out) = amx::hooks::stop(&target.named()?, keep_waiting).await {
-                println!("{out}");
-            }
-        }
     }
     Ok(())
 }
@@ -192,190 +98,4 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-}
-
-async fn watch(client: Client) {
-    let mut after = match client.watch(u64::MAX, 1).await {
-        Ok(v) => v["last"].as_u64().unwrap_or(0),
-        Err(_) => 0,
-    };
-    let mut down = false;
-    loop {
-        match client.watch(after, 50).await {
-            Ok(v) => {
-                if std::mem::take(&mut down) {
-                    eprintln!("amx watch: relay is back");
-                }
-                let last = v["last"].as_u64().unwrap_or(after);
-                for l in v["lines"].as_array().into_iter().flatten() {
-                    println!("{}", l.as_str().unwrap_or(""));
-                }
-                // A relay restart resets sequence numbers.
-                after = last;
-            }
-            Err(e) => {
-                if !down {
-                    eprintln!("amx watch: {e:#}; retrying");
-                    down = true;
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    }
-}
-
-type Out = Arc<tokio::sync::Mutex<tokio::io::Stdout>>;
-
-/// The long waits in flight, and how far the client has received the agent's events: `answered`
-/// holds the `amx/seq` of waits it was sent, and counts once its next request shows it read them.
-#[derive(Default)]
-struct Waits {
-    running: HashMap<String, tokio::sync::watch::Sender<bool>>,
-    answered: HashMap<String, u64>,
-    received: u64,
-}
-
-async fn mcp_stdio(target: Target, wait_max: u64, wait_step: u64) -> Result<()> {
-    let stdout: Out = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    let mut client = Arc::new(target.client()?);
-    let mut beating = false;
-    let waits: Arc<std::sync::Mutex<Waits>> = Default::default();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let msg: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                let err = amx::mcp::error_response(Value::Null, -32700, &e.to_string());
-                write_line(&stdout, &err).await;
-                continue;
-            }
-        };
-        let method = msg.get("method").and_then(|m| m.as_str());
-        if method == Some("initialize")
-            && let Some(name) = msg["params"]["clientInfo"]["name"].as_str()
-            && let Some(c) = Arc::get_mut(&mut client)
-        {
-            c.set_client_name(name);
-        }
-        {
-            let mut w = waits.lock().unwrap();
-            if method == Some("notifications/cancelled") {
-                let id = msg["params"]["requestId"].to_string();
-                w.answered.remove(&id);
-                if let Some(tx) = w.running.remove(&id) {
-                    let _ = tx.send(true);
-                }
-            } else if msg.get("id").is_some()
-                && let Some(seq) = w.answered.drain().map(|(_, s)| s).max()
-            {
-                w.received = seq;
-            }
-        }
-        if !beating {
-            beating = true;
-            let c = client.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Err(e) = c.heartbeat().await {
-                        eprintln!("amx mcp: heartbeat: {e:#}");
-                    }
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
-            });
-        }
-        let long = method == Some("tools/call") && msg["params"]["name"] == "wait" && wait_max > 0;
-        let cancel = long.then(|| {
-            let (tx, rx) = tokio::sync::watch::channel(false);
-            waits.lock().unwrap().running.insert(msg["id"].to_string(), tx);
-            rx
-        });
-        let (client, stdout, waits) = (client.clone(), stdout.clone(), waits.clone());
-        tokio::spawn(async move {
-            let id = msg.get("id").cloned();
-            let res = match cancel {
-                Some(rx) => {
-                    let r = long_wait(&client, msg, (wait_max, wait_step), rx, &stdout, &waits).await;
-                    let key = id.clone().unwrap_or_default().to_string();
-                    let mut w = waits.lock().unwrap();
-                    let seq = r.as_ref().ok().and_then(|r| r.as_ref()?["result"]["_meta"]["amx/seq"].as_u64());
-                    if let (Some(_), Some(seq)) = (w.running.remove(&key), seq) {
-                        w.answered.insert(key, seq);
-                    }
-                    r
-                }
-                None => client.mcp(&msg).await,
-            };
-            match res {
-                Ok(Some(resp)) => write_line(&stdout, &resp).await,
-                Ok(None) => {}
-                Err(e) => {
-                    if let Some(id) = id {
-                        write_line(&stdout, &amx::mcp::error_response(id, -32603, &format!("{e:#}"))).await;
-                    }
-                }
-            }
-        });
-    }
-    Ok(())
-}
-
-/// Repeats `wait` on the relay while it returns no events, up to `max` seconds in all, so an
-/// idle agent spends one tool call per real event. Returns `None` if the client cancelled it.
-async fn long_wait(
-    client: &Client,
-    mut msg: Value,
-    (max, step): (u64, u64),
-    mut cancel: tokio::sync::watch::Receiver<bool>,
-    out: &Out,
-    waits: &std::sync::Mutex<Waits>,
-) -> Result<Option<Value>> {
-    let start = std::time::Instant::now();
-    let token = msg["params"]["_meta"]["progressToken"].clone();
-    let mut reached = false;
-    loop {
-        let left = max.saturating_sub(start.elapsed().as_secs());
-        let round = std::time::Instant::now();
-        msg["params"]["arguments"]["timeout_seconds"] = json!(left.min(step).clamp(1, amx::mcp::WAIT_MAX));
-        msg["params"]["arguments"]["after"] = json!(waits.lock().unwrap().received);
-        let resp = tokio::select! {
-            r = client.mcp(&msg) => r,
-            _ = cancel.wait_for(|c| *c) => return Ok(None),
-        };
-        // A relay restart during the wait is ridden out; one that was never reached is reported.
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) if reached && e.to_string().contains("the amx relay at") && start.elapsed().as_secs() + 3 < max => {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        reached = true;
-        let idle = resp
-            .as_ref()
-            .and_then(|r| r["result"]["content"][0]["text"].as_str())
-            .is_some_and(|t| t.starts_with("No new events."));
-        if !idle || start.elapsed().as_secs() + 1 >= max {
-            return Ok(resp);
-        }
-        if round.elapsed() < Duration::from_secs(1) {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        if !token.is_null() {
-            let note = json!({"jsonrpc": "2.0", "method": "notifications/progress",
-                "params": {"progressToken": token, "progress": start.elapsed().as_secs(), "message": "waiting for the relay"}});
-            write_line(out, &note).await;
-        }
-    }
-}
-
-async fn write_line(out: &tokio::sync::Mutex<tokio::io::Stdout>, v: &Value) {
-    let mut line = v.to_string();
-    line.push('\n');
-    let mut out = out.lock().await;
-    let _ = out.write_all(line.as_bytes()).await;
-    let _ = out.flush().await;
 }

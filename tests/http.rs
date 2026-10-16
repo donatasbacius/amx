@@ -87,34 +87,23 @@ async fn ok_tool(base: &str, agent: &str, name: &str, args: Value) -> String {
     text
 }
 
+async fn rpc_as(base: &str, query: &str, body: Value) -> Value {
+    reqwest::Client::new().post(format!("{base}/mcp?{query}")).json(&body).send().await.unwrap().json().await.unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn configured_role_does_not_override_hello_on_requests_or_heartbeats() {
+async fn configured_role_does_not_override_hello_on_requests() {
     let relay = start(None, vec![]).await;
     for (initial, chosen) in [("author", "reviewer"), ("reviewer", "author")] {
         let agent = format!("initial-{initial}");
-        let client = amx::client::Client::new(&relay.local, Some(agent.clone()), Some(initial.into()));
-        let init = client
-            .mcp(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
-            .await
-            .unwrap()
-            .unwrap();
+        let q = format!("agent={agent}&role={initial}");
+        let init = rpc_as(&relay.local, &q, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})).await;
         assert!(init["result"]["instructions"].as_str().unwrap().contains(&format!("Your role is {initial}")));
-
-        let hello = client
-            .mcp(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hello","arguments":{"role":chosen}}}))
-            .await
-            .unwrap()
-            .unwrap();
+        let hello = rpc_as(&relay.local, &q, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hello","arguments":{"role":chosen}}})).await;
         assert_eq!(hello["result"]["isError"], false, "{hello}");
-
-        let online = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"online","arguments":{}}});
-        let response = client.mcp(&online).await.unwrap().unwrap();
-        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let online = rpc_as(&relay.local, &q, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"online","arguments":{}}})).await;
+        let text = online["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains(&format!("{agent} (you) ({chosen},")), "request reset role: {text}");
-
-        client.heartbeat().await.unwrap();
-        let text = ok_tool(&relay.local, &agent, "online", json!({})).await;
-        assert!(text.contains(&format!("{agent} (you) ({chosen},")), "heartbeat reset role: {text}");
     }
     relay.running.stop().await;
 }
@@ -123,12 +112,9 @@ async fn configured_role_does_not_override_hello_on_requests_or_heartbeats() {
 async fn configured_role_applies_to_a_new_session() {
     let relay = start(None, vec![]).await;
     let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
-    let first = amx::client::Client::new(&relay.local, Some("returning".into()), Some("author".into()));
-    let init = first.mcp(&initialize).await.unwrap().unwrap();
+    let init = rpc_as(&relay.local, "agent=returning&role=author", initialize.clone()).await;
     assert!(init["result"]["instructions"].as_str().unwrap().contains("Your role is author"));
-
-    let second = amx::client::Client::new(&relay.local, Some("returning".into()), Some("reviewer".into()));
-    let init = second.mcp(&initialize).await.unwrap().unwrap();
+    let init = rpc_as(&relay.local, "agent=returning&role=reviewer", initialize).await;
     assert!(init["result"]["instructions"].as_str().unwrap().contains("Your role is reviewer"), "{init}");
     let text = ok_tool(&relay.local, "returning", "online", json!({})).await;
     assert!(text.contains("returning (you) (reviewer,"), "{text}");
@@ -145,8 +131,8 @@ async fn unidentified_tailnet_callers_are_refused() {
     assert_eq!(page.status(), 403);
     let (status, _) = rpc(&relay.tailnet, "x", json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await;
     assert_eq!(status, 403);
-    let hb = http.post(format!("{}/api/heartbeat?agent=x", relay.tailnet)).send().await.unwrap();
-    assert_eq!(hb.status(), 403);
+    let hook = http.get(format!("{}/api/hook/stop?agent=x", relay.tailnet)).send().await.unwrap();
+    assert_eq!(hook.status(), 403);
     let api = http.get(format!("{}/api/reviews", relay.tailnet)).send().await.unwrap();
     assert_eq!(api.status(), 403);
     let local = http.get(format!("{}/", relay.local)).send().await.unwrap();
@@ -319,36 +305,37 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_heartbeat_and_obligation() {
+async fn stop_hook_and_setup() {
     let relay = start(None, vec![]).await;
     let base = relay.local.clone();
-    let http = reqwest::Client::new();
-    let hb: Value = http
-        .post(format!("{base}/api/heartbeat?agent=rev&role=reviewer"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(hb["agent"], "rev");
-    let ob: Value = http.get(format!("{base}/api/obligation?agent=rev")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(ob["active"], false);
-    assert_eq!(ob["role"], "reviewer");
-
-    let watch = tokio::spawn({
-        let client = amx::client::Client::new(&base, Some("rev".into()), None);
-        async move { client.watch(0, 10).await.unwrap() }
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let hook = |agent: &str, extra: &str| reqwest::get(format!("{base}/api/hook/stop?agent={agent}{extra}"));
+    ok_tool(&base, "rev", "hello", json!({"role":"reviewer"})).await;
+    let idle = hook("rev", "").await.unwrap();
+    assert_eq!((idle.status().as_u16(), idle.text().await.unwrap()), (204, String::new()), "an idle reviewer may stop");
+    let looping: Value = hook("rev", "&keep_waiting=1").await.unwrap().json().await.unwrap();
+    assert_eq!(looping["decision"], "block");
     ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": 1})).await;
-    let w = watch.await.unwrap();
-    assert!(w["lines"][0].as_str().unwrap().starts_with("amx r1 [r1] Review offer"), "{w}");
-    let ob: Value = http.get(format!("{base}/api/obligation?agent=rev")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(ob["active"], true);
-    assert!(ob["text"].as_str().unwrap().contains("accept_review"));
-    let ob: Value = http.get(format!("{base}/api/obligation?agent=author")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(ob["active"], true, "author waits for the result");
+    let owed: Value = hook("rev", "").await.unwrap().json().await.unwrap();
+    assert!(owed["reason"].as_str().unwrap().contains("accept_review"), "{owed}");
+    let author: Value = hook("author", "").await.unwrap().json().await.unwrap();
+    assert_eq!(author["decision"], "block", "author waits for the result");
+
+    let setup = reqwest::get(format!("{base}/setup")).await.unwrap().text().await.unwrap();
+    for line in [
+        format!("claude mcp add --scope user --transport http amx {base}/mcp"),
+        format!("curl -fsS {base}/setup/codex.toml >> ~/.codex/config.toml"),
+        "local-claude, local-codex".into(),
+        format!("{base}/api/hook/stop?agent=local-codex&keep_waiting=1"),
+    ] {
+        assert!(setup.contains(&line), "{line} in {setup}");
+    }
+    let toml = reqwest::get(format!("{base}/setup/codex.toml")).await.unwrap().text().await.unwrap();
+    assert_eq!(
+        toml,
+        format!("\n[mcp_servers.amx]\nurl = \"{base}/mcp\"\ndefault_tools_approval_mode = \"approve\"\ntool_timeout_sec = 660\n")
+    );
+    let page = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
+    assert!(page.contains("<summary>Connect an agent</summary>") && page.contains("claude mcp add"), "{page}");
     relay.running.stop().await;
 }
 
@@ -516,9 +503,11 @@ async fn a_closing_reply_window_wakes_waiting_reviewers() {
         let findings = json!([{"severity":"major","text":text}]);
         ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","findings":findings})).await;
     }
-    ok_tool(&base, "rev-a", "vote", json!({"review_id":"r1","votes":[{"finding":"F2","vote":"disagree","reason":"no"}]})).await;
+    ok_tool(&base, "rev-a", "vote", json!({"review_id":"r1","votes":[{"finding":"F2","vote":"disagree","reason":"closed in Drop"}]})).await;
     let reply = ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"disagree","reason":"no"}]})).await;
-    assert!(reply.contains("contested"), "{reply}");
+    assert!(reply.contains("your findings F2 drew objections; call `wait` to read them"), "{reply}");
+    let objections = ok_tool(&base, "rev-b", "wait", json!({"timeout_seconds": 20})).await;
+    assert!(objections.contains("closed in Drop"), "the reviewer whose vote opened the window sees the objections: {objections}");
     let started = std::time::Instant::now();
     let wait = ok_tool(&base, "rev-b", "wait", json!({"timeout_seconds": 20})).await;
     assert!(started.elapsed() < Duration::from_secs(10), "woken when the window closed: {wait}");
@@ -558,25 +547,209 @@ async fn delivered_events_are_saved_before_wait_returns() {
     running.stop().await;
 }
 
+/// Starts an MCP session as Claude Code would; returns its id and the instructions.
+async fn initialize(base: &str, query: &str) -> (String, String) {
+    let r = reqwest::Client::new()
+        .post(format!("{base}/mcp?{query}"))
+        .header("User-Agent", "claude-code/2.1")
+        .json(&json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    let sid = r.headers()["mcp-session-id"].to_str().unwrap().to_string();
+    let v: Value = r.json().await.unwrap();
+    (sid, v["result"]["instructions"].as_str().unwrap().to_string())
+}
+
+/// One request in a session; the reply's last message, whether it came as JSON or an event stream.
+async fn session_rpc(base: &str, sid: &str, body: Value, stream: bool) -> Value {
+    let accept = if stream { "application/json, text/event-stream" } else { "application/json" };
+    let r = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("User-Agent", "claude-code/2.1")
+        .header("Mcp-Session-Id", sid)
+        .header("Accept", accept)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let text = r.text().await.unwrap();
+    let data = text.lines().filter_map(|l| l.strip_prefix("data: ")).next_back().map(String::from).unwrap_or(text);
+    serde_json::from_str(&data).unwrap_or(Value::Null)
+}
+
+fn call(id: u64, name: &str, args: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":args}})
+}
+
+fn text_of(v: &Value) -> String {
+    v["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn events_stay_until_a_later_wait_acknowledges_them() {
+async fn events_stay_until_the_session_acknowledges_them() {
     let relay = start(None, vec![]).await;
     let base = relay.local.clone();
+    let (sid, _) = initialize(&base, "agent=rev").await;
     ok_tool(&base, "rev", "hello", json!({"role":"reviewer"})).await;
     ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev"]})).await;
     ok_tool(&base, "rev", "accept_review", json!({"review_id":"r1"})).await;
     ok_tool(&base, "author", "say", json!({"review_id":"r1","text":"Mind the cache."})).await;
-    let wait = |after: u64| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait","arguments":{"timeout_seconds":1,"after":after}}});
-    let text = |v: &Value| v["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
-    let (_, first) = rpc(&base, "rev", wait(0)).await;
-    assert!(text(&first).contains("Mind the cache."), "{first}");
-    let seq = first["result"]["_meta"]["amx/seq"].as_u64().expect("the seq to acknowledge");
-    let ob: Value = reqwest::get(format!("{base}/api/obligation?agent=rev")).await.unwrap().json().await.unwrap();
-    assert!(!ob["text"].as_str().unwrap().contains("undelivered"), "handed out is enough for the Stop hook: {ob}");
-    let (_, again) = rpc(&base, "rev", wait(0)).await;
-    assert!(text(&again).contains("Mind the cache."), "not acknowledged, so delivered again: {again}");
-    let (_, next) = rpc(&base, "rev", wait(seq)).await;
-    assert!(!text(&next).contains("Mind the cache.") && text(&next).contains("submit_findings"), "{next}");
+    let cancel = |id: u64| json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}});
+    let hook = || async { reqwest::get(format!("{base}/api/hook/stop?agent=rev")).await.unwrap().text().await.unwrap() };
+    let first = session_rpc(&base, &sid, call(1, "wait", json!({})), true).await;
+    assert!(text_of(&first).contains("Mind the cache."), "{first}");
+    assert!(hook().await.contains("undelivered"), "handed out is not yet received");
+    session_rpc(&base, &sid, cancel(1), false).await;
+    let again = session_rpc(&base, &sid, call(2, "wait", json!({})), true).await;
+    assert!(text_of(&again).contains("Mind the cache."), "cancelled, so delivered again: {again}");
+    let next = session_rpc(&base, &sid, call(3, "wait", json!({})), false).await;
+    assert!(!text_of(&next).contains("Mind the cache.") && text_of(&next).contains("submit_findings"), "{next}");
+    assert!(!hook().await.contains("undelivered"), "acknowledged by the next request");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_cancelled_while_it_runs_is_not_taken_as_received() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    let (sid, _) = initialize(&base, "agent=rev&role=reviewer").await;
+    let running = tokio::spawn({
+        let (base, sid) = (base.clone(), sid.clone());
+        async move { session_rpc(&base, &sid, call(1, "wait", json!({"timeout_seconds": 5})), false).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    session_rpc(&base, &sid, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}), false).await;
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev"]})).await;
+    assert!(text_of(&running.await.unwrap()).contains("Review offer"), "answered after the client gave up on it");
+    let next = session_rpc(&base, &sid, call(2, "wait", json!({})), false).await;
+    assert!(text_of(&next).contains("Review offer"), "so it comes again: {next}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_stream_returns_its_events() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    let (sid, _) = initialize(&base, "agent=rev&role=reviewer").await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Mcp-Session-Id", &sid)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&call(1, "wait", json!({})))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(resp);
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev"]})).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let next = session_rpc(&base, &sid, call(2, "wait", json!({})), true).await;
+    assert!(text_of(&next).contains("Review offer"), "{next}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_wait_sends_progress_until_an_event() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    let (sid, _) = initialize(&base, "agent=rev&role=reviewer").await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Mcp-Session-Id", &sid)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"wait","arguments":{"timeout_seconds":1},"_meta":{"progressToken":7}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()["content-type"], "text/event-stream");
+    tokio::time::sleep(Duration::from_secs(21)).await;
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": 1})).await;
+    let body = tokio::time::timeout(Duration::from_secs(5), resp.text()).await.unwrap().unwrap();
+    assert!(body.contains("notifications/progress") && body.contains("Review offer"), "outlasts timeout_seconds: {body}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_get_their_own_default_names() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    let (unused, _) = initialize(&base, "").await;
+    let (first, intro) = initialize(&base, "").await;
+    assert!(intro.contains("You are `local-claude`.") && first.ends_with("-local-claude"), "a session never used holds no name: {unused} {intro}");
+    session_rpc(&base, &first, call(1, "online", json!({})), false).await;
+    let (second, intro) = initialize(&base, "").await;
+    assert!(intro.contains("You are `local-claude-2`.") && intro.contains("Another session holds `local-claude`, so you are `local-claude-2`."), "{intro}");
+    let online = text_of(&session_rpc(&base, &second, call(1, "online", json!({})), false).await);
+    assert!(online.contains("local-claude-2 (you)") && online.contains("- local-claude ("), "{online}");
+
+    let ended = reqwest::Client::new().delete(format!("{base}/mcp")).header("Mcp-Session-Id", &first).send().await.unwrap();
+    assert_eq!(ended.status(), 200);
+    let (_, intro) = initialize(&base, "").await;
+    assert!(intro.contains("You are `local-claude`.") && !intro.contains("Another session"), "an ended session frees its name: {intro}");
+    let (streaming, _) = initialize(&base, "").await;
+    let stream = reqwest::Client::new()
+        .get(format!("{base}/mcp"))
+        .header("Mcp-Session-Id", &streaming)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let (_, intro) = initialize(&base, "").await;
+    assert!(intro.contains("You are `local-claude-3`."), "an open event stream holds the name: {intro}");
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_, intro) = initialize(&base, "").await;
+    assert!(intro.contains("You are `local-claude`."), "and frees it as soon as it closes: {intro}");
+
+    let (pair, intro) = initialize(&base, "agent=pair").await;
+    assert!(!intro.contains("Another session"), "{intro}");
+    session_rpc(&base, &pair, call(1, "online", json!({})), false).await;
+    let (_, intro) = initialize(&base, "agent=pair").await;
+    assert!(intro.contains("Another session is also connected as `pair`"), "a chosen name is shared, with a warning: {intro}");
+
+    let after_restart = "0123456789abcdef0123456789abcdef-local-claude-7";
+    let hello = text_of(&session_rpc(&base, after_restart, call(1, "hello", json!({"role":"author"})), false).await);
+    assert!(hello.contains("You are `local-claude-7`."), "a session the relay doesn't know keeps its name: {hello}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_author_with_nothing_in_progress_is_answered_at_once() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    let started = std::time::Instant::now();
+    let idle = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 20})).await;
+    assert!(idle.starts_with("Nothing in progress.") && idle.contains("call `request_review`"), "{idle}");
+    ok_tool(&base, "rev", "hello", json!({"role":"reviewer"})).await;
+    ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev"]})).await;
+    ok_tool(&base, "rev", "accept_review", json!({"review_id":"r1"})).await;
+    ok_tool(&base, "rev", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+    let result = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 20})).await;
+    assert!(result.contains("Review result"), "{result}");
+    let idle = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 20})).await;
+    assert!(idle.contains("to check fixes for r1, call `request_rereview`"), "{idle}");
+    assert!(started.elapsed() < Duration::from_secs(5), "never long-polled");
+    let started = std::time::Instant::now();
+    ok_tool(&base, "rev", "wait", json!({"timeout_seconds": 2})).await;
+    assert!(started.elapsed() >= Duration::from_secs(2), "reviewers wait for offers");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgement_from_before_a_restart_acknowledges_nothing() {
+    let relay = start(None, vec![]).await;
+    let (sid, _) = initialize(&relay.local, "agent=rev&role=reviewer").await;
+    ok_tool(&relay.local, "author", "request_review", json!({"pr_url": PR, "reviewers": ["rev"]})).await;
+    let offer = session_rpc(&relay.local, &sid, call(1, "wait", json!({})), false).await;
+    assert!(text_of(&offer).contains("Review offer"), "{offer}");
+    relay.running.stop().await;
+
+    let relay = start(None, vec![]).await;
+    ok_tool(&relay.local, "rev", "hello", json!({"role":"reviewer"})).await;
+    ok_tool(&relay.local, "author", "request_review", json!({"pr_url": format!("{PR}0"), "reviewers": ["rev"]})).await;
+    let after = session_rpc(&relay.local, &sid, call(2, "wait", json!({})), false).await;
+    assert!(text_of(&after).contains(&format!("{PR}0")), "the new relay's offer is not taken as received: {after}");
     relay.running.stop().await;
 }
 
@@ -644,11 +817,10 @@ async fn other_sites_cannot_register_or_keep_agents_alive() {
     let relay = start(None, vec![]).await;
     let base = relay.local.clone();
     let http = reqwest::Client::new();
-    let url = format!("{base}/api/watch?agent=csrf-ghost&role=reviewer&timeout=1");
+    let url = format!("{base}/mcp?agent=csrf-ghost&role=reviewer");
     let tries = [
-        http.get(&url).header("Origin", "http://evil.example.com").header("X-Amx-Client", "x"),
-        http.get(&url).header("Sec-Fetch-Site", "cross-site").header("X-Amx-Client", "x"),
-        http.post(format!("{base}/api/heartbeat?agent=csrf-ghost&role=reviewer")).header("Sec-Fetch-Site", "cross-site"),
+        http.get(&url).header("Origin", "http://evil.example.com").header("Mcp-Session-Id", "x").header("Accept", "text/event-stream"),
+        http.get(&url).header("Sec-Fetch-Site", "cross-site").header("Mcp-Session-Id", "x").header("Accept", "text/event-stream"),
         http.post(format!("{base}/mcp?agent=csrf-ghost"))
             .header("Sec-Fetch-Site", "same-site")
             .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})),
@@ -659,14 +831,6 @@ async fn other_sites_cannot_register_or_keep_agents_alive() {
     assert!(relay.running.hub.read(|s, _| s.agents.get("csrf-ghost").is_none()));
     let link = http.get(format!("{base}/")).header("Sec-Fetch-Site", "cross-site").send().await.unwrap();
     assert_eq!(link.status(), 200, "links from elsewhere still open the page");
-
-    let watcher = amx::client::Client::new(&base, Some("cli-watch".into()), Some("reviewer".into()));
-    let w = watcher.watch(0, 1).await.unwrap();
-    assert_eq!(w["agent"], "cli-watch");
-    let same = http.get(format!("{base}/api/watch?agent=page&timeout=1")).header("Sec-Fetch-Site", "same-origin");
-    assert_eq!(same.send().await.unwrap().status(), 200);
-    let old_cli = http.get(format!("{base}/api/watch?agent=old-watch&timeout=1")).send().await.unwrap();
-    assert_eq!(old_cli.status(), 200, "amx watch before 0.6.2 sends no headers of its own");
     relay.running.stop().await;
 }
 
@@ -747,7 +911,7 @@ async fn loopback_waits_for_the_owner_then_takes_over_local_names() {
     for path in ["/", "/r/r1", "/api/reviews", "/static/app.js"] {
         assert_eq!(reqwest::get(format!("{early}{path}")).await.unwrap().status(), 200, "{path} is read-only");
     }
-    assert_eq!(reqwest::get(format!("{early}/api/obligation?agent=own-au")).await.unwrap().status(), 503);
+    assert_eq!(reqwest::get(format!("{early}/api/hook/stop?agent=own-au")).await.unwrap().status(), 503);
     starting.stop().await;
 
     let up = write_script(
@@ -770,21 +934,6 @@ esac"#,
     assert!(online.contains("own-au (you) (author, owner@example.com on"), "{online}");
     assert!(running.hub.read(|s, _| s.reviews[0].author_login == "owner@example.com"), "local reviews are the owner's");
     running.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_dropped_connection_is_reported_as_such() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        while let Ok((conn, _)) = listener.accept().await {
-            drop(conn);
-        }
-    });
-    let err = amx::client::Client::new(&url, Some("x".into()), None).heartbeat().await.unwrap_err().to_string();
-    assert!(err.contains("closed the connection"), "{err}");
-    let err = amx::client::Client::new("http://127.0.0.1:1", None, None).heartbeat().await.unwrap_err().to_string();
-    assert!(err.contains("cannot reach the amx relay"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

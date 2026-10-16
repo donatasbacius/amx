@@ -156,6 +156,11 @@ impl AgentEvent {
         }
     }
 
+    /// A result is for the author role and a task for the reviewer role; the rest for either.
+    fn for_role(&self, role: Role) -> bool {
+        !(self.result && role == Role::Reviewer || self.task.is_some() && role == Role::Author)
+    }
+
     pub fn rendered(mut self, now: Ms) -> AgentEvent {
         if let Some(due) = self.due {
             self.text = self.text.replace(text::LEFT, &text::dur(due.saturating_sub(now)));
@@ -174,16 +179,13 @@ pub struct Agent {
     pub role: Role,
     pub first_seen: Ms,
     pub last_seen: Ms,
-    /// Requests currently blocked in `wait` (or a watcher) for this agent.
+    /// Requests blocked in `wait`, and open session streams, for this agent.
     #[serde(skip)]
     pub waiting: u32,
     events: VecDeque<AgentEvent>,
     next_seq: u64,
-    /// Events up to here were received: handed out, or acknowledged by a later `wait`.
+    /// Events up to here were received: handed out outside a session, or acknowledged by it.
     delivered: u64,
-    /// Events up to here were handed out, received or not.
-    #[serde(skip)]
-    sent: u64,
 }
 
 pub struct Agents {
@@ -933,7 +935,6 @@ impl State {
             events: VecDeque::new(),
             next_seq: 0,
             delivered: 0,
-            sent: 0,
         });
         if now.saturating_sub(a.last_seen) >= timing.online_secs * 1000 && a.waiting == 0 {
             a.first_seen = now;
@@ -1047,22 +1048,21 @@ impl State {
     }
 
     /// Undelivered events for `name`, minus tasks it has already done and, unless asked for,
-    /// progress, and the seq they reach. With `ack`, the caller has received everything up to it,
-    /// and what is handed out now counts as delivered only once a later call acknowledges it;
-    /// without, at once.
-    pub fn take_events(&mut self, name: &str, progress: bool, ack: Option<u64>, now: Ms) -> (Vec<AgentEvent>, u64) {
+    /// progress, and the seq they reach. They count as delivered at once unless `held`, in which
+    /// case only once `ack` is called with that seq.
+    pub fn take_events(&mut self, name: &str, progress: bool, held: bool, now: Ms) -> (Vec<AgentEvent>, u64) {
         let open = self.open_tasks(name);
         let Some(a) = self.agents.map.get_mut(name) else {
             return (Vec::new(), 0);
         };
-        if let Some(n) = ack.filter(|&n| n <= a.next_seq) {
-            a.delivered = a.delivered.max(n);
-        }
         let mut fresh = Vec::new();
         let mut bytes = 0;
         let mut reached = a.next_seq;
+        let mut other = Vec::new();
         for e in a.events.iter().filter(|e| e.seq > a.delivered) {
-            if (progress || !e.progress) && e.task.as_ref().is_none_or(|t| open.contains(t)) {
+            if !e.for_role(a.role) {
+                other.push(e.seq);
+            } else if (progress || !e.progress) && e.task.as_ref().is_none_or(|t| open.contains(t)) {
                 if !fresh.is_empty() && bytes + e.text.len() > MAX_WAIT_BYTES {
                     reached = e.seq - 1;
                     break;
@@ -1071,21 +1071,34 @@ impl State {
                 fresh.push(e.clone().rendered(now));
             }
         }
-        if ack.is_none() {
+        // Kept for a session in the role they are meant for, behind what this one is handed.
+        for seq in other.into_iter().filter(|&n| n <= reached) {
+            if let Some(i) = a.events.iter().position(|e| e.seq == seq) {
+                let mut e = a.events.remove(i).expect("found");
+                a.next_seq += 1;
+                e.seq = a.next_seq;
+                a.events.push_back(e);
+            }
+        }
+        if !held {
             a.delivered = reached;
         }
-        a.sent = a.sent.max(reached);
         (fresh, reached)
     }
 
-    /// Events not yet handed out that need the agent; talk on finished reviews doesn't.
+    /// The agent's client has received its events up to `seq`.
+    pub fn ack(&mut self, name: &str, seq: u64) {
+        if let Some(a) = self.agents.map.get_mut(name).filter(|a| seq <= a.next_seq) {
+            a.delivered = a.delivered.max(seq);
+        }
+    }
+
+    /// Events not yet received that need the agent; talk on finished reviews doesn't.
     pub fn has_undelivered(&self, name: &str) -> bool {
         let open = self.open_tasks(name);
-        self.agents.get(name).is_some_and(|a| {
-            a.events
-                .iter()
-                .any(|e| e.seq > a.delivered.max(a.sent) && !e.progress && self.live(name, e, &open))
-        })
+        self.agents
+            .get(name)
+            .is_some_and(|a| a.events.iter().any(|e| e.seq > a.delivered && !e.progress && e.for_role(a.role) && self.live(name, e, &open)))
     }
 
     /// An open task, its author's result, or anything about an unfinished review `name` is in.
@@ -1127,7 +1140,7 @@ impl State {
         }
     }
 
-    /// Events after `after` without marking them delivered (for watchers).
+    /// Events after `after` without marking them delivered.
     pub fn peek_events(&self, name: &str, after: u64) -> (Vec<AgentEvent>, u64) {
         match self.agents.get(name) {
             Some(a) => (
@@ -1179,7 +1192,7 @@ impl State {
                                 review: id.clone(),
                                 urgent: false,
                                 text: format!(
-                                    "{id}: your findings {} are contested. Before round {round} votes open (in {left}), `amend_finding`, `withdraw_finding`, or `say` why they stand. Then call `wait`.",
+                                    "{id}: your findings {} drew objections; call `wait` to read them, then within {left} `amend_finding`, `withdraw_finding`, or `say` why they stand.",
                                     mine.join(", ")
                                 ),
                                 task: Some(reply_task(r)),

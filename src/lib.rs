@@ -1,6 +1,4 @@
-pub mod client;
 pub mod config;
-pub mod hooks;
 pub mod hub;
 pub mod mcp;
 pub mod persist;

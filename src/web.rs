@@ -4,7 +4,8 @@ use crate::text::{bidi, dur, iso, phase_badge, short_sha, split_note, split_rang
 use axum::extract::{Path, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
+use crate::tailscale::Identity;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -835,8 +836,12 @@ fn no_store(mut r: Response) -> Response {
     r
 }
 
-pub async fn index(AxState(hub): AxState<Arc<Hub>>, headers: HeaderMap) -> Response {
-    let main = hub.read(render_index);
+pub async fn index(AxState(hub): AxState<Arc<Hub>>, who: Option<Extension<Identity>>, headers: HeaderMap) -> Response {
+    let mut main = hub.read(render_index);
+    if let Some(Extension(who)) = who {
+        let setup = crate::text::setup(&hub.web_url(), &who.login);
+        let _ = write!(main, "<details id=\"connect\"><summary>Connect an agent</summary><pre>{}</pre></details>", esc(&setup));
+    }
     if partial(&headers) {
         return fragment(&headers, main);
     }

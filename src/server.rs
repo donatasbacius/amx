@@ -6,14 +6,15 @@ use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Listener {
@@ -151,10 +152,10 @@ pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
         .route("/static/app.js", get(static_js))
         .route("/api/reviews", get(crate::web::api_reviews))
         .route("/api/reviews/{id}", get(crate::web::api_review))
-        .route("/api/heartbeat", post(heartbeat))
-        .route("/api/watch", get(watch))
-        .route("/api/obligation", get(obligation))
-        .route("/mcp", post(mcp).get(mcp_get).delete(mcp_get))
+        .route("/api/hook/stop", get(stop_hook))
+        .route("/setup", get(setup))
+        .route("/setup/codex.toml", get(codex_toml))
+        .route("/mcp", get(mcp_get).post(mcp).delete(mcp_delete))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .layer(middleware::from_fn_with_state((hub.clone(), listener), identify))
         .with_state(hub)
@@ -221,7 +222,7 @@ async fn identify(
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
     let path = req.uri().path();
-    let agent_api = matches!(path, "/mcp" | "/api/watch" | "/api/heartbeat");
+    let agent_api = path == "/mcp";
     if (req.method() != axum::http::Method::GET || agent_api) && !origin_matches(headers) {
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
     }
@@ -273,8 +274,7 @@ async fn static_js() -> impl IntoResponse {
 pub struct AgentQuery {
     agent: Option<String>,
     role: Option<String>,
-    after: Option<u64>,
-    timeout: Option<u64>,
+    keep_waiting: Option<String>,
 }
 
 pub fn valid_agent(s: &str) -> bool {
@@ -306,24 +306,21 @@ pub fn default_agent(login: &str, client: &str) -> String {
 
 type Reject = (StatusCode, String);
 
-fn agent_of(q: &AgentQuery, headers: &HeaderMap, who: &Identity) -> Result<String, Reject> {
-    let given = q
-        .agent
-        .clone()
-        .or_else(|| headers.get("x-amx-agent").and_then(|v| v.to_str().ok()).map(String::from))
-        .map(|s| s.trim().to_string());
-    match given {
-        Some(n) if valid_agent(&n) => Ok(n),
-        Some(_) => Err((StatusCode::BAD_REQUEST, "agent name: 1-64 letters, digits, - _ .".into())),
-        None => {
-            let ua = headers
-                .get("x-amx-client")
-                .or_else(|| headers.get(header::USER_AGENT))
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            Ok(default_agent(&who.login, ua))
-        }
+/// The agent name the caller chose, if any.
+fn chosen(q: &AgentQuery, headers: &HeaderMap) -> Result<Option<String>, Reject> {
+    let given = q.agent.clone().or_else(|| headers.get("x-amx-agent").and_then(|v| v.to_str().ok()).map(String::from));
+    match given.map(|s| s.trim().to_string()) {
+        Some(n) if !valid_agent(&n) => Err((StatusCode::BAD_REQUEST, "agent name: 1-64 letters, digits, - _ .".into())),
+        n => Ok(n),
     }
+}
+
+fn default_for(headers: &HeaderMap, who: &Identity) -> String {
+    default_agent(&who.login, headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or(""))
+}
+
+fn agent_of(q: &AgentQuery, headers: &HeaderMap, who: &Identity) -> Result<String, Reject> {
+    Ok(chosen(q, headers)?.unwrap_or_else(|| default_for(headers, who)))
 }
 
 fn role_of(q: &AgentQuery) -> Result<Option<Role>, Reject> {
@@ -335,6 +332,163 @@ fn role_of(q: &AgentQuery) -> Result<Option<Role>, Reject> {
     }
 }
 
+/// An MCP session: the agent name it was given, and its waits by request id: running, or answered
+/// with the `amx/seq` it has received once it sends its next request.
+pub struct Session {
+    agent: String,
+    waits: HashMap<String, Option<u64>>,
+    streams: usize,
+    streamed: bool,
+    /// Has called a tool; a client reconnecting may initialize sessions it never uses.
+    called: bool,
+    used: Instant,
+}
+
+impl Session {
+    /// Whether it still holds its name: while its event stream is open, or for a client that
+    /// never opened one, while it keeps calling.
+    fn live(&self, online: Duration) -> bool {
+        self.streams > 0 || (self.called && !self.streamed && self.used.elapsed() < online)
+    }
+}
+
+const MAX_SESSIONS: usize = 4096;
+const SESSION_IDLE: Duration = Duration::from_secs(3600);
+const KEEPALIVE: Duration = Duration::from_secs(20);
+
+fn session_id(headers: &HeaderMap) -> Option<&str> {
+    let id = headers.get("mcp-session-id")?.to_str().ok()?;
+    (!id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_graphic())).then_some(id)
+}
+
+/// Random, then the agent name, so a session keeps its name when the relay restarts.
+fn new_session_id(agent: &str) -> String {
+    use std::hash::{BuildHasher, RandomState};
+    let n = || RandomState::new().hash_one(Instant::now());
+    format!("{:016x}{:016x}-{agent}", n(), n())
+}
+
+/// Scoped to the caller, so nobody else can act in its session.
+fn session_key(who: &Identity, id: &str) -> String {
+    format!("{}\0{}\0{id}", who.user_id, who.login)
+}
+
+/// The session `id` of the caller and its agent, recreated if the relay doesn't know it.
+fn session(hub: &Hub, who: &Identity, id: &str, chosen: Option<&str>, default: &str) -> Result<(String, String), Reject> {
+    let key = session_key(who, id);
+    let mut all = hub.sessions.lock().unwrap();
+    if !all.contains_key(&key) && all.len() >= MAX_SESSIONS {
+        all.retain(|_, s| s.streams > 0 || s.used.elapsed() < SESSION_IDLE);
+        if all.len() >= MAX_SESSIONS {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "too many MCP sessions; try again later".into()));
+        }
+    }
+    let named = id.get(33..).filter(|n| valid_agent(n));
+    let s = all.entry(key.clone()).or_insert_with(|| Session {
+        agent: chosen.or(named).unwrap_or(default).to_string(),
+        waits: HashMap::new(),
+        streams: 0,
+        streamed: false,
+        called: false,
+        used: Instant::now(),
+    });
+    s.used = Instant::now();
+    Ok((key, s.agent.clone()))
+}
+
+/// A new session's name and what to tell it about that: a default name another live session
+/// holds gets the next free suffix, and a chosen one is shared, with a warning.
+fn name_session(hub: &Hub, who: &Identity, chosen: Option<String>, default: String) -> (String, String) {
+    let online = Duration::from_secs(hub.cfg.timing.online_secs);
+    let taken = |name: &str| {
+        hub.sessions.lock().unwrap().values().any(|s| s.live(online) && s.agent.eq_ignore_ascii_case(name))
+    };
+    if let Some(name) = chosen {
+        let note = if taken(&name) {
+            format!("Another session is also connected as `{name}`: you share its events and tasks. To work apart, connect with a different `?agent=` name.")
+        } else {
+            String::new()
+        };
+        return (name, note);
+    }
+    let free = (1..=20)
+        .map(|n| if n == 1 { default.clone() } else { format!("{default}-{n}") })
+        .find(|n| !taken(n) && hub.check_name(n, who).is_ok());
+    match free {
+        Some(name) if name != default => {
+            let note = format!("Another session holds `{default}`, so you are `{name}`.");
+            (name, note)
+        }
+        _ => (default, String::new()),
+    }
+}
+
+/// Acknowledges what the session's earlier waits handed out when its client sends a request, and
+/// notes a wait it starts; a cancelled wait's events stay queued, even if it is answered later.
+fn session_seen(hub: &Hub, key: &str, agent: &str, msg: &Value) {
+    let acked = {
+        let mut all = hub.sessions.lock().unwrap();
+        let Some(s) = all.get_mut(key) else { return };
+        if msg["method"] == "notifications/cancelled" {
+            s.waits.remove(&msg["params"]["requestId"].to_string());
+            None
+        } else if let Some(id) = msg.get("id") {
+            s.called |= msg["method"] == "tools/call";
+            let acked = s.waits.values().flatten().copied().max();
+            s.waits.retain(|_, n| n.is_none());
+            if msg["method"] == "tools/call" && msg["params"]["name"] == "wait" {
+                s.waits.insert(id.to_string(), None);
+            }
+            acked
+        } else {
+            None
+        }
+    };
+    if let Some(n) = acked {
+        hub.write(|s, _| s.ack(agent, n));
+    }
+}
+
+/// Records the events the reply to wait `id` handed out, to be acknowledged later, unless the
+/// client has cancelled it.
+fn answered(hub: &Hub, key: &str, id: &str, seq: u64) {
+    if let Some(wait) = hub.sessions.lock().unwrap().get_mut(key).and_then(|s| s.waits.get_mut(id)) {
+        *wait = Some(seq);
+    }
+}
+
+fn wants_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"))
+}
+
+fn sse_message(v: &Value) -> String {
+    format!("event: message\ndata: {v}\n\n")
+}
+
+/// An event stream of what `rx` sends; `done` gets the first seq sent along once the client has
+/// taken all of it, and is never called if the stream breaks first.
+fn sse(rx: mpsc::Receiver<(String, Option<u64>)>, done: impl FnOnce(u64) + Send + 'static) -> Response {
+    let body = futures_util::stream::unfold((rx, None, Some(done)), |(mut rx, seq, mut done)| async move {
+        match rx.recv().await {
+            Some((s, n)) => Some((Ok::<_, std::convert::Infallible>(Bytes::from(s)), (rx, seq.or(n), done))),
+            None => {
+                if let (Some(n), Some(f)) = (seq, done.take()) {
+                    f(n);
+                }
+                None
+            }
+        }
+    });
+    (
+        [(header::CONTENT_TYPE, "text/event-stream"), (header::CACHE_CONTROL, "no-store")],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response()
+}
+
 async fn mcp(
     State(hub): St,
     Extension(who): Extension<Identity>,
@@ -342,89 +496,178 @@ async fn mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let agent = match agent_of(&q, &headers, &who) {
-        Ok(a) => a,
-        Err(r) => return r.into_response(),
+    let (chosen, role) = match (chosen(&q, &headers), role_of(&q)) {
+        (Ok(c), Ok(r)) => (c, r),
+        (Err(e), _) | (_, Err(e)) => return e.into_response(),
     };
-    let role = match role_of(&q) {
-        Ok(r) => r,
-        Err(r) => return r.into_response(),
-    };
-    let value: serde_json::Value = match serde_json::from_slice(&body) {
+    let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => {
-            return Json(crate::mcp::error_response(serde_json::Value::Null, -32700, &format!("parse error: {e}")))
-                .into_response();
-        }
+        Err(e) => return Json(crate::mcp::error_response(Value::Null, -32700, &format!("parse error: {e}"))).into_response(),
     };
-    match crate::mcp::handle(&hub, &agent, &who, role, value).await {
+    let default = default_for(&headers, &who);
+    let initialize = value["method"] == "initialize";
+    let (agent, key, note, new_id) = if initialize {
+        let (agent, note) = name_session(&hub, &who, chosen, default);
+        let id = new_session_id(&agent);
+        match session(&hub, &who, &id, Some(&agent), &agent) {
+            Ok((key, _)) => (agent, Some(key), note, Some(id)),
+            Err(e) => return e.into_response(),
+        }
+    } else if let Some(id) = session_id(&headers) {
+        match session(&hub, &who, id, chosen.as_deref(), &default) {
+            Ok((key, agent)) => (agent, Some(key), String::new(), None),
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        (chosen.unwrap_or(default), None, String::new(), None)
+    };
+    if let Some(key) = &key {
+        session_seen(&hub, key, &agent, &value);
+    }
+    let id = value.get("id").map(Value::to_string).unwrap_or_default();
+    let stream = key.is_some() && value["method"] == "tools/call" && value["params"]["name"] == "wait" && wants_stream(&headers);
+    let seq_of = |resp: &Value| resp["result"]["_meta"]["amx/seq"].as_u64();
+    if stream {
+        let token = value["params"]["_meta"]["progressToken"].clone();
+        let (tx, rx) = mpsc::channel(4);
+        let key = key.unwrap_or_default();
+        let done = {
+            let (hub, id) = (hub.clone(), id.clone());
+            move |n| answered(&hub, &key, &id, n)
+        };
+        tokio::spawn(async move {
+            let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: true, stream: true, note: "" };
+            let call = crate::mcp::handle(&hub, &c, value);
+            tokio::pin!(call);
+            let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
+            let mut n = 0;
+            let resp = loop {
+                tokio::select! {
+                    r = &mut call => break r,
+                    _ = tx.closed() => return,
+                    _ = beat.tick() => {
+                        n += 1;
+                        let note = if token.is_null() {
+                            ": waiting\n\n".to_string()
+                        } else {
+                            sse_message(&json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                                "params": {"progressToken": token, "progress": n, "message": "waiting for the relay"}}))
+                        };
+                        // A client that has gone away drops the wait; what it was handed stays queued.
+                        if tx.send((note, None)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            };
+            if let Some(resp) = resp {
+                let _ = tx.send((sse_message(&resp), seq_of(&resp))).await;
+            }
+        });
+        return sse(rx, done);
+    }
+    let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: key.is_some(), stream: false, note: &note };
+    match crate::mcp::handle(&hub, &c, value).await {
         Some(resp) => {
+            if let (Some(key), Some(n)) = (&key, seq_of(&resp)) {
+                answered(&hub, key, &id, n);
+            }
             let mut r = Json(resp).into_response();
             r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            if let Some(v) = new_id.and_then(|id| HeaderValue::from_str(&id).ok()) {
+                r.headers_mut().insert("mcp-session-id", v);
+            }
             r
         }
         None => StatusCode::ACCEPTED.into_response(),
     }
 }
 
-async fn mcp_get() -> impl IntoResponse {
-    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")])
-}
-
-fn named(hub: &Hub, q: &AgentQuery, headers: &HeaderMap, who: &Identity, touch: bool) -> Result<String, Reject> {
-    let agent = agent_of(q, headers, who)?;
-    if touch {
-        let role = role_of(q)?;
-        hub.touch(&agent, who, role)
-            .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
-    }
-    Ok(agent)
-}
-
-async fn heartbeat(State(hub): St, Extension(who): Extension<Identity>, Query(q): Query<AgentQuery>, headers: HeaderMap) -> Response {
-    match named(&hub, &q, &headers, &who, true) {
-        Ok(agent) => Json(json!({ "agent": agent })).into_response(),
-        Err(r) => r.into_response(),
-    }
-}
-
-/// Long-polls an agent's events without consuming them, for `amx watch`.
-async fn watch(State(hub): St, Extension(who): Extension<Identity>, Query(q): Query<AgentQuery>, headers: HeaderMap) -> Response {
-    let agent = match named(&hub, &q, &headers, &who, true) {
-        Ok(a) => a,
-        Err(r) => return r.into_response(),
+/// A session's event stream. Clients keep it open while they run, so it keeps the agent online
+/// while it reads code between calls; the relay sends nothing on it but keepalives.
+async fn mcp_get(State(hub): St, Extension(who): Extension<Identity>, Query(q): Query<AgentQuery>, headers: HeaderMap) -> Response {
+    let Some(id) = session_id(&headers).filter(|_| wants_stream(&headers)) else {
+        return (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response();
     };
-    let timeout = Duration::from_secs(q.timeout.unwrap_or(50).clamp(1, 300));
-    let (events, last) = hub.watch_events(&agent, q.after.unwrap_or(0), timeout).await;
-    let lines: Vec<String> = events.iter().map(crate::text::event_line).collect();
-    Json(json!({ "agent": agent, "last": last, "lines": lines })).into_response()
-}
-
-/// What the agent still owes, for the Codex Stop hook. Does not count as activity.
-async fn obligation(State(hub): St, Extension(who): Extension<Identity>, Query(q): Query<AgentQuery>, headers: HeaderMap) -> Response {
-    let agent = match named(&hub, &q, &headers, &who, false) {
-        Ok(a) => a,
-        Err(r) => return r.into_response(),
+    let chosen = match chosen(&q, &headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
     };
-    let (actions, pending, role) = hub.read(|s, now| {
-        (
-            s.next_actions(&agent, now),
-            s.has_undelivered(&agent),
-            s.agents.get(&agent).map(|a| a.role),
-        )
+    let (key, agent) = match session(&hub, &who, id, chosen.as_deref(), &default_for(&headers, &who)) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = hub.touch(&agent, &who, None) {
+        return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
+    }
+    if let Some(s) = hub.sessions.lock().unwrap().get_mut(&key) {
+        s.streams += 1;
+        s.streamed = true;
+    }
+    let (tx, rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        {
+            let _online = hub.waiting(&agent);
+            let mut down = hub.shutdown.subscribe();
+            while tx.send((": alive\n\n".into(), None)).await.is_ok() {
+                tokio::select! {
+                    _ = tokio::time::sleep(KEEPALIVE) => {}
+                    _ = tx.closed() => break,
+                    _ = down.wait_for(|d| *d) => break,
+                }
+            }
+        }
+        if let Some(s) = hub.sessions.lock().unwrap().get_mut(&key) {
+            s.streams -= 1;
+            s.used = Instant::now();
+        }
     });
-    let role = role.unwrap_or(Role::Author);
-    let mut text = crate::mcp::next_text(&actions, role, &[], &[]);
-    if pending {
-        text = format!("You have undelivered amx events: call `wait` now.\n\n{text}");
+    sse(rx, |_| {})
+}
+
+/// Ends a session, which frees its name.
+async fn mcp_delete(State(hub): St, Extension(who): Extension<Identity>, headers: HeaderMap) -> StatusCode {
+    if let Some(id) = session_id(&headers) {
+        hub.sessions.lock().unwrap().remove(&session_key(&who, id));
     }
-    Json(json!({
-        "agent": agent,
-        "active": !actions.is_empty() || pending,
-        "role": role.as_str(),
-        "text": text,
-    }))
-    .into_response()
+    StatusCode::OK
+}
+
+/// A Stop hook for Codex or Claude Code, run with curl: blocks stopping while the agent owes the
+/// relay something (or always for a looping reviewer with `keep_waiting`), else says nothing.
+async fn stop_hook(State(hub): St, Extension(who): Extension<Identity>, Query(q): Query<AgentQuery>, headers: HeaderMap) -> Response {
+    let agent = match agent_of(&q, &headers, &who) {
+        Ok(a) => a,
+        Err(r) => return r.into_response(),
+    };
+    if let Err(e) = hub.check_name(&agent, &who) {
+        return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
+    }
+    let (actions, pending, role) =
+        hub.read(|s, now| (s.next_actions(&agent, now), s.has_undelivered(&agent), s.agents.get(&agent).map(|a| a.role)));
+    let role = role.unwrap_or(Role::Author);
+    let reason = if !actions.is_empty() || pending {
+        let mut text = crate::mcp::next_text(&actions, role, &[], &[]);
+        if pending {
+            text = format!("You have undelivered amx events: call `wait` now.\n\n{text}");
+        }
+        format!("[amx] You still have an active review obligation on the relay; do not stop.\n{text}")
+    } else if q.keep_waiting.is_some() && role == Role::Reviewer {
+        "[amx] You are a looping reviewer: call the amx `wait` tool again and handle what it returns.".into()
+    } else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let reason: String = reason.chars().take(6000).collect();
+    Json(json!({ "decision": "block", "reason": reason })).into_response()
+}
+
+/// How to connect each client, with this relay's address and the caller's default names.
+async fn setup(State(hub): St, Extension(who): Extension<Identity>) -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], crate::text::setup(&hub.web_url(), &who.login))
+}
+
+async fn codex_toml(State(hub): St) -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], crate::text::codex_toml(&hub.web_url()))
 }
 
 #[cfg(test)]

@@ -6,6 +6,8 @@ One machine runs `amx relay`. Agents connect to its MCP endpoint. An author agen
 
 ## Install
 
+Only the machine that runs the relay needs `amx`; agents connect over HTTP with nothing installed.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/donatasbacius/amx/main/install.sh | sh
 ```
@@ -34,33 +36,33 @@ By default a restart starts empty. To keep reviews across restarts, give the rel
 amx relay --state ~/.local/state/amx/state.json
 ```
 
-or `state = "..."` in the config. The relay loads the file at start and rewrites it (atomically, at most once a second) as reviews change, and again on shutdown. It keeps reviews, their findings, votes and transcripts, and which login owns each agent name, with the agent's role and any events it has not yet received. Unfinished reviews resume with the time they had left when the relay stopped; reviewers that don't come back are dropped after the usual 5 minutes of silence. While running, the relay also writes the time to `<state file>.alive` every 5 seconds, so after a crash the downtime is counted from then rather than from the last change saved. Events handed out by `wait` over HTTP are saved before it replies, so a crash doesn't deliver them twice. Through `amx mcp` an event counts as delivered only once the client's next request shows it got the reply, so a `wait` cancelled as an event arrives loses nothing. The relay refuses to start if the file can't be read or parsed.
+or `state = "..."` in the config. The relay loads the file at start and rewrites it (atomically, at most once a second) as reviews change, and again on shutdown. It keeps reviews, their findings, votes and transcripts, and which login owns each agent name, with the agent's role and any events it has not yet received. Unfinished reviews resume with the time they had left when the relay stopped; reviewers that don't come back are dropped after the usual 5 minutes of silence. While running, the relay also writes the time to `<state file>.alive` every 5 seconds, so after a crash the downtime is counted from then rather than from the last change saved. Events handed out by `wait` over HTTP are saved before it replies, so a crash doesn't deliver them twice. Within an MCP session (the `Mcp-Session-Id` header Claude Code and Codex send), an event counts as delivered only once the client's next request shows it got the reply, so a `wait` that is cancelled, or whose connection drops, as an event arrives loses nothing. Sessions live in memory: after a restart, a client's next request carries on in a new one under the same name. The relay refuses to start if the file can't be read or parsed.
 
 ## Connect agents
 
-Pick an agent name that is unique to you, e.g. `alice-claude`. A name belongs to your Tailscale login while you are online; someone else can't use it at the same time, nor in a different letter case, nor while it has events its owner hasn't received. Reviews remember the login behind each author and reviewer, so whoever takes a name over later can't speak or act in that name's earlier reviews. A renamed Tailscale login keeps its names and reviews (matched by Tailscale user ID), and names used with `--no-tailnet` become the owner's. Below, `RELAY` is `http://<relay tailnet IP or name>:7341`.
+`http://<relay>:7341/setup` (and the web page, under "Connect an agent") prints these lines with the relay's address filled in. Below, `RELAY` is `http://<relay tailnet name or IP>:7341`.
 
-**Claude Code**, through the stdio proxy (or directly over HTTP with `claude mcp add --transport http amx "RELAY/mcp?agent=alice-claude&role=reviewer"`):
+**Claude Code:**
 
 ```sh
-claude mcp add amx -- amx mcp --relay RELAY --agent alice-claude --role reviewer
+claude mcp add --scope user --transport http amx RELAY/mcp
 ```
 
-**Codex** (`~/.codex/config.toml`), through the stdio proxy:
+**Codex:**
 
-```toml
-[mcp_servers.amx]
-command = "amx"
-args = ["mcp", "--relay", "RELAY", "--agent", "alice-codex", "--role", "author"]
-default_tools_approval_mode = "approve"
-tool_timeout_sec = 660
+```sh
+curl -fsS RELAY/setup/codex.toml >> ~/.codex/config.toml
 ```
 
-The configured role (`--role` or `role=` in the HTTP URL) is applied at the start of each session (MCP `initialize`). `hello` changes it for the rest of that session; requests and heartbeats don't reset it. A new session also drops events still queued for the name about reviews it is no longer in (finished ones, or ones it was dropped from), except an author's undelivered result. Events for reviews it is still in are kept, and tasks it owes are given in full again, so a reviewer that restarts mid-review picks up where it was.
+which adds `[mcp_servers.amx]` with `url = "RELAY/mcp"`, `default_tools_approval_mode = "approve"` (Codex otherwise asks before every amx call, and `codex exec` refuses them) and `tool_timeout_sec = 660`. To set it up for everyone working on a repo, commit the same server to the repo's `.mcp.json` (Claude Code) or `.codex/config.toml` (Codex, trusted projects) instead.
 
-`amx mcp --relay RELAY --agent NAME` works for any stdio client, Claude Code included, and also sends a heartbeat every 30s so the agent stays online while it is busy reading code. Without it, an agent is online while it has called the relay within 90s (`wait` long-polls count), and an assigned reviewer is dropped after 5 minutes of silence. Only taking part counts: `initialize`, heartbeats and the tools that act (`hello`, `wait`, `request_review`, ...). `tools/list`, `ping`, `online` and `review_status` neither register an agent nor keep it online.
+An agent is named after your Tailscale login and its client, e.g. `alice-claude` or `alice-codex`. While one session holds that name, another session of the same client gets the next free one (`alice-claude-2`, ...) and is told so when it connects; a session that ends (its client exits) frees its name. To choose a name, connect to `RELAY/mcp?agent=alice-reviewer`; a chosen name can be shared by several sessions on purpose, and each newcomer is told it is. A name belongs to your Tailscale login while you are online; someone else can't use it at the same time, nor in a different letter case, nor while it has events its owner hasn't received. Reviews remember the login behind each author and reviewer, so whoever takes a name over later can't speak or act in that name's earlier reviews. A renamed Tailscale login keeps its names and reviews (matched by Tailscale user ID), and names used with `--no-tailnet` become the owner's.
 
-**Waiting.** `wait` wakes an agent only for what needs it: an offer, a review or vote task, a message, the result. Progress (phase changes, dropped reviewers, withdrawn findings, closing remarks on a finished review) stays on the web page and in `review_status`; pass `progress: true` to be woken for it too. A task the agent owes is given in full by every `wait` and by the call that creates it; other calls point to it in one line, and a `wait` with nothing new returns a short "No new events." A finished review's result stays queued until its author receives it. Time left in a task is counted from when it is delivered, and a waiting agent is woken as soon as a phase changes on a deadline. Text from other agents (notes, messages, findings, reasons) is quoted with `>`, so it can't pass for the relay's own lines. Over HTTP a `wait` lasts 45s (at most 50s with `timeout_seconds`), because clients time out at 60s. Through `amx mcp`, every `wait` keeps polling the relay for up to `--wait-max` seconds (default 600) while nothing happens, whatever `timeout_seconds` it passes, so an idle agent spends one model turn per event instead of about 80 an hour. Keep the client's tool timeout above it: Codex's `tool_timeout_sec` defaults to 60, hence 660 above. Claude Code's MCP tool timeout defaults to about 28 hours (`MCP_TOOL_TIMEOUT`, or `timeout` in milliseconds on the server's `.mcp.json` entry); it may move a call that runs over 2 minutes to a background task (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`). Use `--wait-max 45` to turn the long wait off.
+A new agent is an author until it calls `hello` with role `reviewer` (or connects with `?role=reviewer`). A role given in the URL is applied at the start of each session (MCP `initialize`); `hello` changes it for the rest of that session. A new session also drops events still queued for the name about reviews it is no longer in (finished ones, or ones it was dropped from), except an author's undelivered result. Events for reviews it is still in are kept, and tasks it owes are given in full again, so a reviewer that restarts mid-review picks up where it was.
+
+An agent is online while its client holds the session's event stream open (both clients do while they run) or has called the relay within 90s; an assigned reviewer is dropped after 5 minutes of silence. Only taking part counts: `initialize`, the open stream and the tools that act (`hello`, `wait`, `request_review`, ...). `tools/list`, `ping`, `online` and `review_status` neither register an agent nor keep it online.
+
+**Waiting.** `wait` wakes an agent only for what needs it: an offer, a review or vote task, a message, the result. Progress (phase changes, dropped reviewers, withdrawn findings, closing remarks on a finished review) stays on the web page and in `review_status`; pass `progress: true` to be woken for it too. A task the agent owes is given in full by every `wait` and by the call that creates it; other calls point to it in one line, and a `wait` with nothing new returns a short "No new events." An author with nothing in progress is answered at once, with what it can do next. A finished review's result stays queued until its author receives it. Time left in a task is counted from when it is delivered, and a waiting agent is woken as soon as a phase changes on a deadline. Text from other agents (notes, messages, findings, reasons) is quoted with `>`, so it can't pass for the relay's own lines. In a session whose client accepts an event stream (Claude Code and Codex do), `wait` blocks for up to 10 minutes, with a progress notification every 20s so neither client times it out, and an idle agent spends one model turn per event instead of about 80 an hour. A client that takes only JSON gets at most 50s. In an interactive Claude Code session a call that runs over 2 minutes may move to a background task (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`).
 
 ## Reviewer agents
 
@@ -86,11 +88,11 @@ To keep a Codex reviewer from ending its turn, add a Stop hook that sends it bac
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
-command = "amx hook codex stop --relay RELAY --agent alice-codex --keep-waiting"
+command = "curl -fsS -m 8 'RELAY/api/hook/stop?agent=alice-codex&keep_waiting=1' || true"
 timeout = 10
 ```
 
-Without `--keep-waiting` the hook only blocks stopping while the agent owes the relay something (an offer to answer, findings, votes, or an author's pending result). Closing remarks on a finished review don't count; they stay on the web page and in `review_status`. Claude Code can instead watch for events with its Monitor tool: ask it to run `amx watch --relay RELAY --agent alice-claude` and to call `wait` whenever a line appears.
+Without `keep_waiting` the hook only blocks stopping while the agent owes the relay something (an offer to answer, findings, votes, or an author's result it hasn't received). Closing remarks on a finished review don't count; they stay on the web page and in `review_status`. The same command works as a Claude Code Stop hook.
 
 ## Author agents
 
