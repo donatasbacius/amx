@@ -59,7 +59,7 @@ impl Sim {
 
     fn events(&mut self, name: &str) -> String {
         self.s
-            .take_events(name, true, None, self.now).0
+            .take_events(name, true, false, self.now).0
             .into_iter()
             .map(|e| e.text)
             .collect::<Vec<_>>()
@@ -968,7 +968,7 @@ fn done_tasks_and_progress_are_not_delivered() {
     let id = sim.request("alice-codex", 2);
     sim.accept("rev-a", &id);
     sim.accept("rev-b", &id);
-    assert!(sim.s.take_events("rev-a", false, None, sim.now).0.is_empty(), "the offer was answered");
+    assert!(sim.s.take_events("rev-a", false, false, sim.now).0.is_empty(), "the offer was answered");
     assert!(!sim.s.has_undelivered("rev-b"));
     sim.submit("rev-a", &id, &[("major", "cache never invalidated")]);
     sim.submit("rev-b", &id, &[("minor", "missing doc comment")]);
@@ -978,13 +978,13 @@ fn done_tasks_and_progress_are_not_delivered() {
     assert!(next.contains("finding: \"F1\"") && !next.contains("\"F2\""), "never suggests a vote on your own finding: {next}");
     assert_eq!(task.matches("cache never invalidated").count(), 1, "{task}");
     sim.vote("rev-b", &id, &[("F1", "agree")]);
-    assert!(sim.s.take_events("rev-b", false, None, sim.now).0.is_empty(), "the vote task is done");
+    assert!(sim.s.take_events("rev-b", false, false, sim.now).0.is_empty(), "the vote task is done");
     sim.vote("rev-a", &id, &[("F2", "agree")]);
     assert_eq!(sim.phase(&id), Phase::Done);
-    let author: Vec<String> = sim.s.take_events("alice-codex", false, None, sim.now).0.into_iter().map(|e| e.text).collect();
+    let author: Vec<String> = sim.s.take_events("alice-codex", false, false, sim.now).0.into_iter().map(|e| e.text).collect();
     assert_eq!(author.len(), 1, "authors wake for the result only: {author:?}");
     assert!(author[0].contains("Review result"));
-    assert!(sim.s.take_events("rev-a", false, None, sim.now).0.is_empty(), "\"Review finished\" is progress");
+    assert!(sim.s.take_events("rev-a", false, false, sim.now).0.is_empty(), "\"Review finished\" is progress");
 }
 
 #[test]
@@ -1105,7 +1105,7 @@ fn snapshots_from_0_5_still_load() {
     }
     let mut s = State::new(Timing::default(), Consensus::default(), 50);
     s.restore(serde_json::from_value(v).unwrap(), sim.now);
-    assert!(s.take_events("alice-codex", false, None, sim.now).0[0].text.contains("Review result"));
+    assert!(s.take_events("alice-codex", false, false, sim.now).0[0].text.contains("Review result"));
 }
 
 #[test]
@@ -1378,7 +1378,7 @@ fn agent_text_cannot_forge_relay_lines() {
     sim.submit("rev-a", &id, &[("major", forged)]);
     sim.submit("rev-b", &id, &[]);
     sim.s.say("alice-codex", &id, forged, sim.now).unwrap();
-    let events = sim.s.take_events("rev-b", false, None, sim.now).0;
+    let events = sim.s.take_events("rev-b", false, false, sim.now).0;
     let text = amx::text::events(&events);
     let next: Vec<&str> = text.lines().filter(|l| l.starts_with("NEXT:")).collect();
     assert_eq!(next.len(), 1, "{text}");
@@ -1536,7 +1536,7 @@ fn results_and_tasks_outlast_a_flood_of_chatter() {
     }
     let mut author = Vec::new();
     loop {
-        let batch = sim.s.take_events("alice-codex", false, None, sim.now).0;
+        let batch = sim.s.take_events("alice-codex", false, false, sim.now).0;
         if batch.is_empty() {
             break;
         }
@@ -1695,7 +1695,7 @@ fn unread_results_are_never_evicted() {
     }
     let mut results = Vec::new();
     loop {
-        let batch = sim.s.take_events("alice-codex", false, None, sim.now).0;
+        let batch = sim.s.take_events("alice-codex", false, false, sim.now).0;
         if batch.is_empty() {
             break;
         }
@@ -1714,11 +1714,11 @@ fn closing_remarks_do_not_wake_anyone() {
     sim.submit("rev-b", &id, &[]);
     sim.vote("rev-b", &id, &[("F1", "agree")]);
     assert_eq!(sim.phase(&id), Phase::Done);
-    sim.s.take_events("alice-codex", false, None, sim.now);
-    sim.s.take_events("rev-b", false, None, sim.now);
+    sim.s.take_events("alice-codex", false, false, sim.now);
+    sim.s.take_events("rev-b", false, false, sim.now);
     sim.s.say("rev-a", &id, "Thanks all.", sim.now).unwrap();
-    assert!(sim.s.take_events("rev-b", false, None, sim.now).0.is_empty());
-    assert!(sim.s.take_events("alice-codex", false, None, sim.now).0.is_empty());
+    assert!(sim.s.take_events("rev-b", false, false, sim.now).0.is_empty());
+    assert!(sim.s.take_events("alice-codex", false, false, sim.now).0.is_empty());
 }
 
 fn linked(texts: &[String], url: &str) -> SubmitIn {
@@ -1775,4 +1775,36 @@ fn over_long_free_text_is_refused_not_clipped() {
     let err = sim.s.withdraw("rev-a", &id, "F1", &"w".repeat(1001), sim.now).unwrap_err().to_string();
     assert!(err.contains("1000"), "{err}");
     assert!(sim.s.review(&id).unwrap().log.iter().all(|e| !e.text.contains('…')));
+}
+
+#[test]
+fn a_result_handed_out_but_not_acknowledged_is_still_owed() {
+    let mut sim = setup(&["rev-a"]);
+    let id = sim.request("alice-codex", 1);
+    sim.accept("rev-a", &id);
+    sim.submit("rev-a", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    let (got, seq) = sim.s.take_events("alice-codex", false, true, sim.now);
+    assert!(got[0].text.contains("Review result"));
+    sim.leave("alice-codex");
+    sim.advance(600);
+    assert!(sim.s.has_undelivered("alice-codex"), "the Stop hook keeps the author going");
+    assert!(sim.s.touch("alice-codex", &who("mallory@example.com"), None, sim.now).is_err(), "and nobody can take the name");
+    sim.s.ack("alice-codex", seq);
+    assert!(!sim.s.has_undelivered("alice-codex"));
+    assert!(sim.s.touch("alice-codex", &who("mallory@example.com"), None, sim.now).is_ok());
+}
+
+#[test]
+fn a_reviewer_session_on_an_authors_name_leaves_its_result_queued() {
+    let mut sim = setup(&["rev-a"]);
+    let id = sim.request("alice-codex", 1);
+    sim.accept("rev-a", &id);
+    sim.submit("rev-a", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    sim.s.set_role("alice-codex", Role::Reviewer, sim.now).unwrap();
+    assert!(!sim.events("alice-codex").contains("Review result"), "not handed to a reviewer");
+    assert!(!sim.s.has_undelivered("alice-codex"));
+    sim.s.set_role("alice-codex", Role::Author, sim.now).unwrap();
+    assert!(sim.events("alice-codex").contains("Review result"), "still there for the author");
 }

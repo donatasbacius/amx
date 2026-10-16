@@ -12,7 +12,7 @@ ExecStart=%h/.local/bin/amx relay
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 LimitNOFILE=65536
-RestartSec=5
+RestartSec=1
 
 [Install]
 WantedBy=default.target
