@@ -284,7 +284,7 @@ pub fn reply_task(r: &Review, agent: &str, left: &str) -> String {
     )
 }
 
-fn split_rates(f: &Finding) -> Option<[(String, &'static str); 2]> {
+pub fn split_rates(f: &Finding) -> Option<[(String, &'static str); 2]> {
     let rates = |v: &Vote| v.severity.unwrap_or(f.severity).as_str();
     let mut voters = f.current_votes().filter(|(_, v)| v.choice != Choice::Disagree);
     let (a, va) = voters.next()?;
@@ -592,21 +592,33 @@ pub fn nothing_pending(finished: &[&str]) -> String {
 
 /// How to connect each client, for `/setup` and the web page. Codex gets its whole table, so
 /// pasting it again replaces it: tools run without asking, and `wait` may block 10 minutes.
+pub fn claude_add(url: &str) -> String {
+    format!("claude mcp add --scope user --transport http amx {url}/mcp")
+}
+
+pub fn codex_toml(url: &str) -> String {
+    format!(
+        "[mcp_servers.amx]\nurl = \"{url}/mcp\"\ndefault_tools_approval_mode = \"approve\"\ntool_timeout_sec = {}",
+        crate::mcp::WAIT_STREAM + 60
+    )
+}
+
+pub fn mcp_json(url: &str) -> String {
+    format!("{{\"mcpServers\": {{\"amx\": {{\"type\": \"http\", \"url\": \"{url}/mcp\"}}}}}}")
+}
+
 pub fn setup(url: &str, login: &str) -> String {
     let claude = crate::server::default_agent(login, "claude");
     let codex = crate::server::default_agent(login, "codex");
     format!(
-        "Connect an agent to amx (nothing to install).\n\n\
-         Claude Code:\n  claude mcp add --scope user --transport http amx {url}/mcp\n\n\
-         Codex: in ~/.codex/config.toml, replace any [mcp_servers.amx] table with\n\n\
-         [mcp_servers.amx]\nurl = \"{url}/mcp\"\ndefault_tools_approval_mode = \"approve\"\ntool_timeout_sec = {}\n\n\
-         Agents are named after your login and client: {claude}, {codex}. Another session of the same client \
-         becomes {claude}-2, and so on; to choose a name, use {url}/mcp?agent=NAME.\n\
-         To set it up for everyone working on a repo, commit it there instead: \
-         {{\"mcpServers\": {{\"amx\": {{\"type\": \"http\", \"url\": \"{url}/mcp\"}}}}}} as .mcp.json (Claude Code), \
-         or the table above in .codex/config.toml (Codex).\n\n\
+        "Claude Code:\n  {}\n\n\
+         Codex: in ~/.codex/config.toml, replace any [mcp_servers.amx] table with\n\n{}\n\n\
+         Agents are named {claude} and {codex}; a second session becomes {claude}-2. To pick a name, use {url}/mcp?agent=NAME.\n\
+         For everyone on a repo, commit {} as .mcp.json (Claude Code), or the table above as .codex/config.toml (Codex).\n\n\
          Reviewers: tell the agent \"Call amx hello with role reviewer, then loop on amx wait and do what it says.\"\n",
-        crate::mcp::WAIT_STREAM + 60
+        claude_add(url),
+        codex_toml(url),
+        mcp_json(url),
     )
 }
 
@@ -626,6 +638,20 @@ mod tests {
     fn iso_dates() {
         assert_eq!(super::iso(0), "1970-01-01 00:00:00Z");
         assert_eq!(super::iso(1_760_400_000_000), "2025-10-14 00:00:00Z");
+    }
+
+    #[test]
+    fn setup_text() {
+        assert_eq!(
+            super::setup("http://relay:7341", "sam@example.com"),
+            "Claude Code:\n  claude mcp add --scope user --transport http amx http://relay:7341/mcp\n\n\
+             Codex: in ~/.codex/config.toml, replace any [mcp_servers.amx] table with\n\n\
+             [mcp_servers.amx]\nurl = \"http://relay:7341/mcp\"\ndefault_tools_approval_mode = \"approve\"\ntool_timeout_sec = 660\n\n\
+             Agents are named sam-claude and sam-codex; a second session becomes sam-claude-2. To pick a name, use http://relay:7341/mcp?agent=NAME.\n\
+             For everyone on a repo, commit {\"mcpServers\": {\"amx\": {\"type\": \"http\", \"url\": \"http://relay:7341/mcp\"}}} \
+             as .mcp.json (Claude Code), or the table above as .codex/config.toml (Codex).\n\n\
+             Reviewers: tell the agent \"Call amx hello with role reviewer, then loop on amx wait and do what it says.\"\n"
+        );
     }
 
     #[test]
