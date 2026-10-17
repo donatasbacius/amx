@@ -18,7 +18,7 @@ pub const WAIT_STREAM: u64 = 600;
 
 /// Tools that count as taking part, so they register the agent and keep it online.
 /// The rest (`online`, `review_status`) only read.
-const ACTIVE_TOOLS: &[&str] = &[
+pub const ACTIVE_TOOLS: &[&str] = &[
     "hello",
     "wait",
     "request_review",
@@ -41,47 +41,47 @@ fn ok(id: Value, result: Value) -> Value {
 }
 
 pub fn tools() -> Value {
-    let rid = json!({ "type": "string", "description": "Review id from the relay, e.g. \"r3\"." });
+    let rid = json!({ "type": "string", "description": "Review id, e.g. \"r3\"." });
     json!([
         {
             "name": "hello",
-            "description": "Declare your role on the relay. role \"reviewer\": you will be offered other agents' PRs to review and must then loop on `wait`. role \"author\": you only request reviews of your own PRs. Returns the protocol rules and who is online.",
+            "description": "Set your role: \"reviewer\" (you are offered other agents' PRs and loop on `wait`) or \"author\" (you request reviews of your own PRs). Returns the protocol and who is online.",
             "inputSchema": { "type": "object", "properties": {
                 "role": { "type": "string", "enum": ["reviewer", "author"] }
             }, "required": ["role"] }
         },
         {
             "name": "online",
-            "description": "List agents currently online on the relay with their role (reviewer/author), owner and whether they are busy with a review or idle.",
+            "description": "Agents online now: role, owner, and whether busy with a review.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "wait",
-            "description": "Block until something needs you (a review offer, a review or vote task, a message, the result), then return the new events and a NEXT line telling you exactly what to do. If nothing happens for a while it returns \"No new events.\"; just call it again. Returns immediately if you already owe an action. Reviewers: call this in a loop forever. Authors: call it after request_review until the result arrives. Also keeps you marked online.",
+            "description": "Block until something needs you (an offer, a review or vote task, a message, the result), then return it with a NEXT line saying what to do. Returns at once if you owe an action; after \"No new events.\" call it again. Reviewers: loop on it forever. Authors: call it after request_review until the result arrives.",
             "inputSchema": { "type": "object", "properties": {
-                "progress": { "type": "boolean", "description": "Also wake for progress that needs no action from you (phase changes, dropped reviewers, withdrawn findings, a finished review). Default false." }
+                "progress": { "type": "boolean", "description": "Also wake for progress needing no action (phase changes, dropped reviewers, withdrawn findings, a finished review). Default false." }
             } }
         },
         {
             "name": "request_review",
-            "description": "Ask other online reviewer agents to review a GitHub pull request and reach a consensus. The relay offers it to idle reviewers (or only to the ones you name), runs an independent review round, then cross-examination votes, and sends you one consolidated result (call `wait` to receive it). Push your branch and open the PR first.",
+            "description": "Have online reviewer agents review a GitHub PR and reach a consensus: independent reviews, cross-examination votes, then one consolidated result (call `wait` for it). Push and open the PR first.",
             "inputSchema": { "type": "object", "properties": {
                 "pr_url": { "type": "string", "description": "e.g. https://github.com/owner/repo/pull/123" },
-                "reviewers": { "type": "array", "items": { "type": "string" }, "description": "Offer it only to these agents (names from `online`; they must be online reviewers). Default: every idle reviewer." },
-                "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "How many reviewers (default 2, or as many as you name). With fewer available, it proceeds with whoever accepted." },
+                "reviewers": { "type": "array", "items": { "type": "string" }, "description": "Only these agents (online reviewers, names from `online`). Default: any idle reviewer." },
+                "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "How many (default 2, or as many as named); proceeds with whoever accepts." },
                 "note": { "type": "string", "description": "What the PR does and what reviewers should focus on." },
-                "head_sha": { "type": "string", "description": "Commit SHA you want reviewed (optional)." },
-                "confirm_fraction": { "type": "number", "description": "Advanced: a finding is confirmed when more than this fraction of voters agree (default 0.5)." },
-                "blocking_unanimous": { "type": "boolean", "description": "Advanced: blocking findings need unanimous agreement to stay blocking (default true)." },
-                "vote_rounds": { "type": "integer", "minimum": 1, "maximum": 3, "description": "Advanced: voting rounds (default 2)." },
-                "offer_seconds": { "type": "integer", "description": "Advanced: how long to wait for reviewers to accept (default 120)." },
-                "review_seconds": { "type": "integer", "description": "Advanced: independent review deadline (default 1200)." },
-                "vote_seconds": { "type": "integer", "description": "Advanced: deadline per voting round (default 600)." }
+                "head_sha": { "type": "string", "description": "Commit to review." },
+                "confirm_fraction": { "type": "number", "description": "Advanced (default 0.5): agreeing fraction that confirms a finding." },
+                "blocking_unanimous": { "type": "boolean", "description": "Advanced (default true): blocking needs unanimous agreement." },
+                "vote_rounds": { "type": "integer", "minimum": 1, "maximum": 3, "description": "Advanced (default 2)." },
+                "offer_seconds": { "type": "integer", "description": "Advanced (default 120): time to accept." },
+                "review_seconds": { "type": "integer", "description": "Advanced (default 1200)." },
+                "vote_seconds": { "type": "integer", "description": "Advanced (default 600), per round." }
             }, "required": ["pr_url"] }
         },
         {
             "name": "accept_review",
-            "description": "Take a review you were offered (reviewers only, one review at a time). The first N to accept are assigned; the result is your review task: start at once.",
+            "description": "Take an offered review (reviewers, one at a time; the first N to accept get it). Returns your review task: start at once.",
             "inputSchema": { "type": "object", "properties": { "review_id": rid }, "required": ["review_id"] }
         },
         {
@@ -91,11 +91,11 @@ pub fn tools() -> Value {
         },
         {
             "name": "submit_findings",
-            "description": "Submit your independent review once, after reading the PR read-only with `gh pr view` / `gh pr diff`. Other reviewers' findings stay hidden from you until everyone has submitted. Each finding: severity (blocking = must not merge: bugs, data loss, security; major = fix before merge; minor = worth fixing; nit = taste), url linking the exact line (https://github.com/<owner>/<repo>/blob/<head_sha>/<path>#L<line>), and text explaining the problem and the fix. Use an empty list if the PR is fine.",
+            "description": "Submit your review once, after reading the PR read-only (`gh pr view`, `gh pr diff`); others' findings stay hidden until all have submitted. Each finding: severity (blocking = must not merge: bugs, data loss, security; major = fix before merge; minor = worth fixing; nit = taste), url of the exact line (https://github.com/<owner>/<repo>/blob/<head_sha>/<path>#L<line>), and text with the problem and the fix. Empty list if the PR is fine.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "head_sha": { "type": "string", "description": "The PR head commit you reviewed (headRefOid)." },
-                "verdict": { "type": "string", "enum": ["approve", "changes_requested"], "description": "Your own suggestion; the final verdict comes from the consensus." },
+                "verdict": { "type": "string", "enum": ["approve", "changes_requested"], "description": "Your suggestion; the consensus decides." },
                 "summary": { "type": "string", "description": "One or two sentences on the PR overall." },
                 "findings": { "type": "array", "items": { "type": "object", "properties": {
                     "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"] },
@@ -106,13 +106,13 @@ pub fn tools() -> Value {
         },
         {
             "name": "vote",
-            "description": "Cross-examination: vote on other reviewers' findings (you must vote on every one the relay lists for you). agree = the problem is real; if you think its severity is wrong, still agree and give the severity you think is fair (a confirmed finding takes the severity most of its supporters back; if only the finding's author and you take part and you rate it differently, it is confirmed at the lower severity with both shown); disagree = wrong or not a problem at all (reason required, be specific); duplicate = same issue as another finding (give duplicate_of). Verify against the code before agreeing. You can send several votes in one call and change a vote until the round ends; votes on withdrawn findings are ignored.",
+            "description": "Vote on every finding the relay lists for you. agree = the problem is real (if its severity is wrong, still agree and give the fair one; most supporters' severity wins, and with only you and its author, the lower one); disagree = wrong or not a problem (specific reason required); duplicate = same issue as another (give duplicate_of). Check the code before agreeing. Several votes per call; change a vote until the round ends; votes on withdrawn findings are ignored.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "votes": { "type": "array", "items": { "type": "object", "properties": {
                     "finding": { "type": "string", "description": "Finding id, e.g. F2 (or C1 for carried-over findings)." },
                     "vote": { "type": "string", "enum": ["agree", "disagree", "duplicate"] },
-                    "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"], "description": "With agree: the severity you think is fair, if it differs from the finding's." },
+                    "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"], "description": "With agree: the fair severity, if different." },
                     "reason": { "type": "string" },
                     "duplicate_of": { "type": "string" }
                 }, "required": ["finding", "vote"] } }
@@ -120,12 +120,12 @@ pub fn tools() -> Value {
         },
         {
             "name": "say",
-            "description": "Post a message to everyone in a review (its author and reviewers), e.g. to argue for or against a finding or answer a question. Reviewers can talk once findings are revealed; the author can talk any time. After the review has finished, messages are closing remarks: they are recorded in the transcript but do not change the result.",
+            "description": "Message everyone in a review (author and reviewers), e.g. to argue a finding or answer a question. Reviewers can talk once findings are revealed, the author any time. After the review ends, messages are closing remarks that don't change the result.",
             "inputSchema": { "type": "object", "properties": { "review_id": rid, "text": { "type": "string" } }, "required": ["review_id", "text"] }
         },
         {
             "name": "amend_finding",
-            "description": "In the reply window before a later cross-examination round's votes open, change one of your own findings (text, severity and/or url) in response to objections. Everyone votes on it again.",
+            "description": "In the reply window before a later round's votes, change your own finding (text, severity, url) to answer objections; everyone votes on it again.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "finding": { "type": "string" },
@@ -141,7 +141,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "request_rereview",
-            "description": "After fixing a finished review's findings and pushing, ask for a re-review. The same reviewers are reused when online (else new ones); they re-check the previous confirmed and disputed findings plus what changed since the reviewed commit, with the same consensus rules.",
+            "description": "After fixing a finished review's findings and pushing, ask for a re-review: the same reviewers when online (else new ones) re-check the previous findings and what changed since.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "new_head_sha": { "type": "string", "description": "The commit you pushed." },
@@ -150,7 +150,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "review_status",
-            "description": "Show one review (phase, deadline, reviewers, findings you are allowed to see, votes, transcript, result), or with no review_id, your reviews in progress and what you must do next.",
+            "description": "One review's phase, deadline, reviewers, visible findings, votes, transcript and result; or, with no review_id, your reviews in progress and what to do next.",
             "inputSchema": { "type": "object", "properties": { "review_id": rid } }
         }
     ])
@@ -182,7 +182,8 @@ pub struct Caller<'a> {
     pub session: bool,
     /// The reply is an event stream, so `wait` may block for `WAIT_STREAM`.
     pub stream: bool,
-    /// Added to the instructions at `initialize`, e.g. about the name it was given.
+    /// About the name it was given: added to the instructions at `initialize`, or to the result
+    /// of the call that names it.
     pub note: &'a str,
 }
 
@@ -343,14 +344,9 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
         "hello" => {
             let r: RoleArgs = args(a)?;
             let role = Role::parse(&r.role).ok_or_else(|| anyhow!("role must be reviewer or author"))?;
-            hub.write(|s, now| s.set_role(agent, role, now))?;
-            let (intro, online) = hub.read(|s, now| {
-                (
-                    s.agents.get(agent).map(text::instructions).unwrap_or_default(),
-                    text::online(&s.online(now), agent),
-                )
-            });
-            Ok(with_next(hub, agent, &before, format!("{intro}\n\n{online}")))
+            let (role, online) = hub.read(|s, now| (s.agents.get(agent).map_or(role, |a| a.role), text::online(&s.online(now), agent)));
+            let intro = text::instructions(Some(role));
+            Ok(with_next(hub, agent, &before, format!("You are `{agent}`. {intro}\n\n{online}")))
         }
         "online" => Ok(hub.read(|s, now| text::online(&s.online(now), agent))),
         "wait" => {
@@ -555,29 +551,20 @@ pub async fn handle(hub: &Hub, c: &Caller<'_>, msg: Value) -> Option<Value> {
     };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let touched = if method == "initialize" || (method == "tools/call" && ACTIVE_TOOLS.contains(&tool)) {
+    let touched = if method == "tools/call" && ACTIVE_TOOLS.contains(&tool) {
         hub.touch(agent, who, role)
     } else {
         hub.check_name(agent, who)
     };
     match method {
         "initialize" => {
-            if let Err(e) = touched {
-                return Some(error_response(id, -32000, &format!("{e:#}")));
-            }
-            if let Some(r) = role
-                && let Err(e) = hub.write(|s, now| s.set_role(agent, r, now))
-            {
-                return Some(error_response(id, -32000, &format!("{e:#}")));
-            }
-            hub.write(|s, _| s.new_session(agent));
             let requested = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
             let version = if PROTOCOL_VERSIONS.contains(&requested) {
                 requested
             } else {
                 PROTOCOL_VERSIONS[1]
             };
-            let mut instructions = hub.read(|s, _| s.agents.get(agent).map(text::instructions).unwrap_or_default());
+            let mut instructions = text::instructions(role);
             if !c.note.is_empty() {
                 instructions = format!("{instructions}\n\n{}", c.note);
             }
@@ -600,10 +587,13 @@ pub async fn handle(hub: &Hub, c: &Caller<'_>, msg: Value) -> Option<Value> {
                 Ok(()) => call_tool(hub, c, tool, args, &mut seq).await,
                 Err(e) => Err(e),
             };
-            let (text, is_error) = match res {
+            let (mut text, is_error) = match res {
                 Ok(t) => (t, false),
                 Err(e) => (format!("Error: {e:#}"), true),
             };
+            if !c.note.is_empty() && tool != "hello" {
+                text = format!("{}\n\n{text}", c.note);
+            }
             let mut result = json!({ "content": [{ "type": "text", "text": text }], "isError": is_error });
             if let Some(n) = seq {
                 result["_meta"] = json!({ "amx/seq": n });

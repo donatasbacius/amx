@@ -156,11 +156,6 @@ impl AgentEvent {
         }
     }
 
-    /// A result is for the author role and a task for the reviewer role; the rest for either.
-    fn for_role(&self, role: Role) -> bool {
-        !(self.result && role == Role::Reviewer || self.task.is_some() && role == Role::Author)
-    }
-
     pub fn rendered(mut self, now: Ms) -> AgentEvent {
         if let Some(due) = self.due {
             self.text = self.text.replace(text::LEFT, &text::dur(due.saturating_sub(now)));
@@ -179,7 +174,7 @@ pub struct Agent {
     pub role: Role,
     pub first_seen: Ms,
     pub last_seen: Ms,
-    /// Requests blocked in `wait`, and open session streams, for this agent.
+    /// Requests blocked in `wait` for this agent.
     #[serde(skip)]
     pub waiting: u32,
     events: VecDeque<AgentEvent>,
@@ -190,6 +185,8 @@ pub struct Agent {
 
 pub struct Agents {
     map: BTreeMap<String, Agent>,
+    /// Open session event streams per name, which count as activity like a `wait`.
+    streams: BTreeMap<String, u32>,
     timing: Timing,
 }
 
@@ -204,7 +201,7 @@ impl Agents {
 
     pub fn silent_ms(&self, name: &str, now: Ms) -> Ms {
         match self.map.get(name) {
-            Some(a) if a.waiting > 0 => 0,
+            Some(a) if a.waiting > 0 || self.streams.contains_key(name) => 0,
             Some(a) => now.saturating_sub(a.last_seen),
             None => Ms::MAX,
         }
@@ -212,6 +209,17 @@ impl Agents {
 
     pub fn online(&self, name: &str, now: Ms) -> bool {
         self.silent_ms(name, now) < self.timing.online_secs * 1000
+    }
+
+    pub fn stream(&mut self, name: &str, delta: i32, now: Ms) {
+        let n = self.streams.entry(name.to_string()).or_default();
+        *n = n.saturating_add_signed(delta);
+        if *n == 0 {
+            self.streams.remove(name);
+        }
+        if let Some(a) = self.map.get_mut(name) {
+            a.last_seen = now;
+        }
     }
 
     fn notify(&mut self, name: &str, review: &str, text: String, now: Ms) {
@@ -840,6 +848,7 @@ impl State {
         State {
             agents: Agents {
                 map: BTreeMap::new(),
+                streams: BTreeMap::new(),
                 timing,
             },
             reviews: Vec::new(),
@@ -857,7 +866,7 @@ impl State {
             .all()
             .map(|a| {
                 let mut a = a.clone();
-                if a.waiting > 0 {
+                if a.waiting > 0 || self.agents.streams.contains_key(&a.name) {
                     a.last_seen = now;
                 }
                 a
@@ -904,8 +913,8 @@ impl State {
             .ok_or_else(|| anyhow!("no review {id} (the relay may have restarted)"))
     }
 
-    /// Records that `name` is alive and binds the name to the caller's Tailscale login.
-    /// The supplied role is an initial default; only `set_role` changes an existing agent's role.
+    /// Records that `name` is alive and binds the name to the caller's Tailscale login, with the
+    /// role its caller has, if known.
     pub fn touch(&mut self, name: &str, who: &Identity, role: Option<Role>, now: Ms) -> Result<()> {
         if let Some(old) = self
             .agents
@@ -938,6 +947,9 @@ impl State {
         });
         if now.saturating_sub(a.last_seen) >= timing.online_secs * 1000 && a.waiting == 0 {
             a.first_seen = now;
+        }
+        if let Some(r) = role {
+            a.role = r;
         }
         a.last_seen = now;
         a.node = who.node.clone();
@@ -1040,13 +1052,6 @@ impl State {
             .collect()
     }
 
-    pub fn set_role(&mut self, name: &str, role: Role, now: Ms) -> Result<()> {
-        let a = self.agents.map.get_mut(name).ok_or_else(|| anyhow!("unknown agent {name}"))?;
-        a.role = role;
-        self.advance(now);
-        Ok(())
-    }
-
     /// Undelivered events for `name`, minus tasks it has already done and, unless asked for,
     /// progress, and the seq they reach. They count as delivered at once unless `held`, in which
     /// case only once `ack` is called with that seq.
@@ -1058,26 +1063,14 @@ impl State {
         let mut fresh = Vec::new();
         let mut bytes = 0;
         let mut reached = a.next_seq;
-        let mut other = Vec::new();
         for e in a.events.iter().filter(|e| e.seq > a.delivered) {
-            if !e.for_role(a.role) {
-                other.push(e.seq);
-            } else if (progress || !e.progress) && e.task.as_ref().is_none_or(|t| open.contains(t)) {
+            if (progress || !e.progress) && e.task.as_ref().is_none_or(|t| open.contains(t)) {
                 if !fresh.is_empty() && bytes + e.text.len() > MAX_WAIT_BYTES {
                     reached = e.seq - 1;
                     break;
                 }
                 bytes += e.text.len();
                 fresh.push(e.clone().rendered(now));
-            }
-        }
-        // Kept for a session in the role they are meant for, behind what this one is handed.
-        for seq in other.into_iter().filter(|&n| n <= reached) {
-            if let Some(i) = a.events.iter().position(|e| e.seq == seq) {
-                let mut e = a.events.remove(i).expect("found");
-                a.next_seq += 1;
-                e.seq = a.next_seq;
-                a.events.push_back(e);
             }
         }
         if !held {
@@ -1098,7 +1091,7 @@ impl State {
         let open = self.open_tasks(name);
         self.agents
             .get(name)
-            .is_some_and(|a| a.events.iter().any(|e| e.seq > a.delivered && !e.progress && e.for_role(a.role) && self.live(name, e, &open)))
+            .is_some_and(|a| a.events.iter().any(|e| e.seq > a.delivered && !e.progress && self.live(name, e, &open)))
     }
 
     /// An open task, its author's result, or anything about an unfinished review `name` is in.
@@ -1866,8 +1859,9 @@ impl State {
             .filter(|r| r.phase.active())
             .flat_map(|r| std::iter::once(r.author.clone()).chain(r.slots.iter().map(|s| s.agent.clone())))
             .collect();
+        let streams = &self.agents.streams;
         self.agents.map.retain(|name, a| {
-            engaged.contains(name) || a.waiting > 0 || now.saturating_sub(a.last_seen) < FORGET_AGENT_MS
+            engaged.contains(name) || a.waiting > 0 || streams.contains_key(name) || now.saturating_sub(a.last_seen) < FORGET_AGENT_MS
         });
         stepped || before != self.fingerprint(now)
     }

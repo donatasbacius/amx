@@ -398,6 +398,10 @@ fn reviewer_going_offline_is_dropped() {
     sim.accept("rev-a", &id);
     sim.accept("rev-b", &id);
     sim.leave("rev-b");
+    sim.s.agents.stream("rev-b", 1, sim.now);
+    sim.advance(400);
+    assert!(sim.s.review(&id).unwrap().slot("rev-b").unwrap().active(), "an open event stream keeps it working");
+    sim.s.agents.stream("rev-b", -1, sim.now);
     sim.advance(200);
     assert!(sim.s.review(&id).unwrap().slot("rev-b").unwrap().active(), "silent while working is fine");
     sim.advance(120);
@@ -1788,7 +1792,7 @@ fn a_result_handed_out_but_not_acknowledged_is_still_owed() {
     assert!(got[0].text.contains("Review result"));
     sim.leave("alice-codex");
     sim.advance(600);
-    assert!(sim.s.has_undelivered("alice-codex"), "the Stop hook keeps the author going");
+    assert!(sim.s.has_undelivered("alice-codex"), "still owed");
     assert!(sim.s.touch("alice-codex", &who("mallory@example.com"), None, sim.now).is_err(), "and nobody can take the name");
     sim.s.ack("alice-codex", seq);
     assert!(!sim.s.has_undelivered("alice-codex"));
@@ -1796,15 +1800,13 @@ fn a_result_handed_out_but_not_acknowledged_is_still_owed() {
 }
 
 #[test]
-fn a_reviewer_session_on_an_authors_name_leaves_its_result_queued() {
+fn a_result_reaches_its_author_whatever_role_the_name_has_now() {
     let mut sim = setup(&["rev-a"]);
     let id = sim.request("alice-codex", 1);
     sim.accept("rev-a", &id);
     sim.submit("rev-a", &id, &[]);
     assert_eq!(sim.phase(&id), Phase::Done);
-    sim.s.set_role("alice-codex", Role::Reviewer, sim.now).unwrap();
-    assert!(!sim.events("alice-codex").contains("Review result"), "not handed to a reviewer");
-    assert!(!sim.s.has_undelivered("alice-codex"));
-    sim.s.set_role("alice-codex", Role::Author, sim.now).unwrap();
-    assert!(sim.events("alice-codex").contains("Review result"), "still there for the author");
+    sim.s.touch("alice-codex", &who("alice@example.com"), Some(Role::Reviewer), sim.now).unwrap();
+    assert!(sim.s.has_undelivered("alice-codex"));
+    assert!(sim.events("alice-codex").contains("Review result"));
 }

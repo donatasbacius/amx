@@ -129,7 +129,7 @@ fn a_crash_during_a_long_wait_loses_nothing() {
 
     let wait = |id: u32| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"wait","arguments":{{}},"_meta":{{"progressToken":{id}}}}}}}"#);
     let first = curl(&url, &headers, &wait(2)).stdout(Stdio::piped()).spawn().unwrap();
-    std::thread::sleep(Duration::from_millis(1000));
+    std::thread::sleep(Duration::from_millis(1500));
     drop(relay);
     let cut = String::from_utf8(first.wait_with_output().unwrap().stdout).unwrap();
     assert!(!cut.contains("\"result\""), "a crash ends the wait without an answer for the client to take as one: {cut}");
