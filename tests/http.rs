@@ -3,6 +3,7 @@
 use amx::Running;
 use amx::config::Config;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -243,6 +244,8 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     for rev in ["rev-a", "rev-b"] {
         ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
     }
+    let index = get("/").await.unwrap().text().await.unwrap();
+    assert!(index.contains("<span>2 reviewing ·</span> <span>1 author</span></summary>") && index.contains("on <a href=\"/r/r1\">rust#1</a>"), "{index}");
     let finding = json!([{"severity":"major","text":"SECRET until revealed\nsecond line"}]);
     ok_tool(&base, "rev-a", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","summary":"PRIVATE","findings":finding})).await;
 
@@ -280,14 +283,32 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     assert_eq!(list["reviews"][1]["verdict"], "changes_requested");
     ok_tool(&base, "author", "request_review", json!({"pr_url": PR, "reviewers": 1})).await;
     let page = get("/r/r1").await.unwrap().text().await.unwrap();
-    assert!(page.contains("other reviews of this PR: <a href=\"/r/r3\">r3</a> (finding reviewers)"), "{page}");
+    assert!(page.contains("<p class=\"newer\">Newer review: <a href=\"/r/r3\">r3</a> (waiting for reviewers)&nbsp;· last result: changes requested</p>"), "{page}");
+    assert!(page.contains("<li aria-current=\"page\"><span class=\"h-id\"><b>r1</b>") && page.contains("<a href=\"/r/r3\">r3</a></span>"), "{page}");
     let index = get("/").await.unwrap().text().await.unwrap();
-    assert!(index.contains("r3 · author · offered to 2 · 2 reviews") && !index.contains("href=\"/r/r1\""), "one row per PR: {index}");
+    assert!(page.contains("<span class=\"h-gist\">0 of 1 accepted</span>"), "the history says what the index row says: {page}");
+    assert!(index.contains("<span>0 of 1 accepted ·</span> <span>last: changes requested ·</span> <span>author</span>") && !index.contains("href=\"/r/r1\""), "one row per PR: {index}");
+    assert!(index.contains("<title>amx · 2 running</title>") && index.contains("#2<span class=\"sr\">, Waiting for reviewers</span></a>"), "{index}");
+    assert!(index.contains("<span>2 reviewers idle ·</span> <span>1 author</span></summary>"), "zero counts left out: {index}");
 
     let missing = get("/api/reviews/r9").await.unwrap();
     assert_eq!(missing.status(), 404);
+    let gone = get("/r/r9").await.unwrap();
+    assert_eq!(gone.status(), 404);
+    let gone = gone.text().await.unwrap();
+    assert!(gone.contains("<a href=\"/\">All reviews</a>"), "{gone}");
+    assert!(!gone.contains("app.js") && !gone.contains("data-etag") && !gone.contains("id=\"live\""), "a page that can't change doesn't poll: {gone}");
+    let polled = http.get(format!("{base}/r/r9")).header("X-Amx-Partial", "1").send().await.unwrap();
+    assert_eq!(polled.status(), 404);
+    let polled = polled.text().await.unwrap();
+    assert!(polled.contains("No review r9") && !polled.contains("<html"), "an open page whose review is gone shows so: {polled}");
     let page = get("/r/r1").await.unwrap().text().await.unwrap();
-    assert!(page.contains("id=\"F1\"") && page.contains("Changes requested") && page.contains(">Result<") && !page.contains("<pre>"), "{page}");
+    assert!(page.contains("<title>Changes requested · rust-lang/rust#1</title>"), "{page}");
+    assert!(page.contains("id=\"F1\"") && page.contains("Changes requested") && !page.contains("<pre>"), "{page}");
+    assert!(page.contains("<h2 class=\"sr\">Transcript</h2><details class=\"more\" id=\"transcript\">"), "{page}");
+    for page in [&page, &index] {
+        well_formed_for_screen_readers(page);
+    }
     let partial = http.get(format!("{base}/r/r1")).header("X-Amx-Partial", "1").send().await.unwrap();
     assert_eq!(partial.headers()["cache-control"], "no-store");
     let tag = partial.headers()["etag"].clone();
@@ -300,11 +321,24 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
         let first = http.get(format!("{base}{path}")).header("X-Amx-Partial", "1").send().await.unwrap();
         let tag = first.headers()["etag"].to_str().unwrap().to_string();
         assert!(full.contains(&format!("data-etag='{tag}'")), "the page seeds its first poll's tag: {full}");
+        assert!(full.contains("<span class=\"live\" role=\"status\" aria-atomic=\"false\"><span id=\"live\"></span><span id=\"said\" class=\"sr\"></span></span>"), "silent while live: {full}");
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let again = http.get(format!("{base}{path}")).header("X-Amx-Partial", "1").header("If-None-Match", &tag).send().await.unwrap();
         assert_eq!(again.status(), 304, "{path}: countdowns tick in the browser, not in the page");
     }
     relay.running.stop().await;
+}
+
+/// No heading inside a disclosure's summary, where screen readers drop it, and no id used twice,
+/// as the page script keeps each finding's open state and focus by id.
+fn well_formed_for_screen_readers(page: &str) {
+    for s in page.split("<summary").skip(1) {
+        let s = &s[..s.find("</summary>").expect("closed summary")];
+        assert!(!["<h1", "<h2", "<h3", "<h4"].iter().any(|h| s.contains(h)), "heading in a summary: {s}");
+    }
+    let ids: Vec<&str> = page.split(" id=\"").skip(1).map(|s| &s[..s.find('"').unwrap()]).collect();
+    assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len(), "{ids:?}");
+    assert!(page.split("<details class=\"f").skip(1).all(|d| d.split('>').next().unwrap().contains(" id=\"")), "{page}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -315,14 +349,15 @@ async fn setup() {
     for line in [
         format!("claude mcp add --scope user --transport http amx {base}/mcp"),
         format!("replace any [mcp_servers.amx] table with\n\n[mcp_servers.amx]\nurl = \"{base}/mcp\"\ndefault_tools_approval_mode = \"approve\"\ntool_timeout_sec = 660\n"),
-        "local-claude, local-codex".into(),
+        "local-claude and local-codex".into(),
     ] {
         assert!(setup.contains(&line), "{line} in {setup}");
     }
     assert!(!setup.contains("hook"), "{setup}");
     assert_eq!(reqwest::get(format!("{base}/api/hook/stop?agent=rev")).await.unwrap().status(), 404);
     let page = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
-    assert!(page.contains("<summary>Connect an agent</summary>") && page.contains("claude mcp add"), "{page}");
+    assert!(page.contains("Connect an agent</summary>") && page.contains("claude mcp add"), "{page}");
+    assert!(page.contains("No agents online") && page.contains("<details id=\"connect\" class=\"connect\" open>"), "open while nobody is online: {page}");
     relay.running.stop().await;
 }
 
