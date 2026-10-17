@@ -152,9 +152,7 @@ pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
         .route("/static/app.js", get(static_js))
         .route("/api/reviews", get(crate::web::api_reviews))
         .route("/api/reviews/{id}", get(crate::web::api_review))
-        .route("/api/hook/stop", get(stop_hook))
         .route("/setup", get(setup))
-        .route("/setup/codex.toml", get(codex_toml))
         .route("/mcp", get(mcp_get).post(mcp).delete(mcp_delete))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .layer(middleware::from_fn_with_state((hub.clone(), listener), identify))
@@ -274,7 +272,6 @@ async fn static_js() -> impl IntoResponse {
 pub struct AgentQuery {
     agent: Option<String>,
     role: Option<String>,
-    keep_waiting: Option<String>,
 }
 
 pub fn valid_agent(s: &str) -> bool {
@@ -306,12 +303,16 @@ pub fn default_agent(login: &str, client: &str) -> String {
 
 type Reject = (StatusCode, String);
 
-/// The agent name the caller chose, if any.
-fn chosen(q: &AgentQuery, headers: &HeaderMap) -> Result<Option<String>, Reject> {
+/// The agent name and role the caller chose, if any.
+fn chosen(q: &AgentQuery, headers: &HeaderMap) -> Result<(Option<String>, Option<Role>), Reject> {
     let given = q.agent.clone().or_else(|| headers.get("x-amx-agent").and_then(|v| v.to_str().ok()).map(String::from));
+    let role = match q.role.as_deref().filter(|r| !r.is_empty()) {
+        None => None,
+        Some(r) => Some(Role::parse(r).ok_or_else(|| (StatusCode::BAD_REQUEST, "role must be reviewer or author".into()))?),
+    };
     match given.map(|s| s.trim().to_string()) {
         Some(n) if !valid_agent(&n) => Err((StatusCode::BAD_REQUEST, "agent name: 1-64 letters, digits, - _ .".into())),
-        n => Ok(n),
+        n => Ok((n, role)),
     }
 }
 
@@ -319,28 +320,15 @@ fn default_for(headers: &HeaderMap, who: &Identity) -> String {
     default_agent(&who.login, headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or(""))
 }
 
-fn agent_of(q: &AgentQuery, headers: &HeaderMap, who: &Identity) -> Result<String, Reject> {
-    Ok(chosen(q, headers)?.unwrap_or_else(|| default_for(headers, who)))
-}
-
-fn role_of(q: &AgentQuery) -> Result<Option<Role>, Reject> {
-    match q.role.as_deref().filter(|r| !r.is_empty()) {
-        None => Ok(None),
-        Some(r) => Role::parse(r)
-            .map(Some)
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, "role must be reviewer or author".into())),
-    }
-}
-
-/// An MCP session: the agent name it was given, and its waits by request id: running, or answered
+/// An MCP session: its agent name and role, and its waits by request id: running, or answered
 /// with the `amx/seq` it has received once it sends its next request.
 pub struct Session {
-    agent: String,
+    /// A chosen name from the start; a default one from its first call that acts.
+    agent: Option<String>,
+    role: Option<Role>,
     waits: HashMap<String, Option<u64>>,
     streams: usize,
     streamed: bool,
-    /// Has called a tool; a client reconnecting may initialize sessions it never uses.
-    called: bool,
     used: Instant,
 }
 
@@ -348,12 +336,11 @@ impl Session {
     /// Whether it still holds its name: while its event stream is open, or for a client that
     /// never opened one, while it keeps calling.
     fn live(&self, online: Duration) -> bool {
-        self.streams > 0 || (self.called && !self.streamed && self.used.elapsed() < online)
+        self.streams > 0 || (!self.streamed && self.used.elapsed() < online)
     }
 }
 
-const MAX_SESSIONS: usize = 4096;
-const SESSION_IDLE: Duration = Duration::from_secs(3600);
+const SESSIONS_PER_LOGIN: usize = 64;
 const KEEPALIVE: Duration = Duration::from_secs(20);
 
 fn session_id(headers: &HeaderMap) -> Option<&str> {
@@ -361,11 +348,10 @@ fn session_id(headers: &HeaderMap) -> Option<&str> {
     (!id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_graphic())).then_some(id)
 }
 
-/// Random, then the agent name, so a session keeps its name when the relay restarts.
-fn new_session_id(agent: &str) -> String {
+fn new_session_id() -> String {
     use std::hash::{BuildHasher, RandomState};
     let n = || RandomState::new().hash_one(Instant::now());
-    format!("{:016x}{:016x}-{agent}", n(), n())
+    format!("{:016x}{:016x}", n(), n())
 }
 
 /// Scoped to the caller, so nobody else can act in its session.
@@ -373,54 +359,130 @@ fn session_key(who: &Identity, id: &str) -> String {
     format!("{}\0{}\0{id}", who.user_id, who.login)
 }
 
-/// The session `id` of the caller and its agent, recreated if the relay doesn't know it.
-fn session(hub: &Hub, who: &Identity, id: &str, chosen: Option<&str>, default: &str) -> Result<(String, String), Reject> {
+/// Moves `agent`'s count of open event streams.
+fn streams(hub: &Hub, agent: Option<&str>, delta: i32) {
+    if let Some(a) = agent.filter(|_| delta != 0) {
+        hub.write(|s, now| s.agents.stream(a, delta, now));
+    }
+}
+
+/// The caller's session `id`, recreated if the relay doesn't know it. Over the cap, the login's
+/// least recently used session ends.
+fn session(hub: &Hub, who: &Identity, id: &str, chosen: Option<&str>, role: Option<Role>) -> String {
     let key = session_key(who, id);
+    let mine = session_key(who, "");
     let mut all = hub.sessions.lock().unwrap();
-    if !all.contains_key(&key) && all.len() >= MAX_SESSIONS {
-        all.retain(|_, s| s.streams > 0 || s.used.elapsed() < SESSION_IDLE);
-        if all.len() >= MAX_SESSIONS {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "too many MCP sessions; try again later".into()));
+    if !all.contains_key(&key) {
+        let own = || all.iter().filter(|(k, _)| k.starts_with(&mine));
+        if own().count() >= SESSIONS_PER_LOGIN
+            && let Some(old) = own().min_by_key(|(_, s)| s.used).map(|(k, _)| k.clone())
+            && let Some(s) = all.remove(&old)
+        {
+            streams(hub, s.agent.as_deref(), -(s.streams as i32));
         }
     }
-    let named = id.get(33..).filter(|n| valid_agent(n));
     let s = all.entry(key.clone()).or_insert_with(|| Session {
-        agent: chosen.or(named).unwrap_or(default).to_string(),
+        agent: chosen.map(String::from),
+        role,
         waits: HashMap::new(),
         streams: 0,
         streamed: false,
-        called: false,
         used: Instant::now(),
     });
     s.used = Instant::now();
-    Ok((key, s.agent.clone()))
+    key
 }
 
-/// A new session's name and what to tell it about that: a default name another live session
-/// holds gets the next free suffix, and a chosen one is shared, with a warning.
-fn name_session(hub: &Hub, who: &Identity, chosen: Option<String>, default: String) -> (String, String) {
+/// Whether a live session holds `name`. Refused while a session of another login holds it, so a
+/// running session keeps its name.
+fn held(hub: &Hub, who: &Identity, name: &str) -> Result<bool, String> {
+    let (online, mine) = (Duration::from_secs(hub.cfg.timing.online_secs), session_key(who, ""));
+    let all = hub.sessions.lock().unwrap();
+    let holders = || all.iter().filter(|(_, s)| s.agent.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(name)));
+    if holders().any(|(k, _)| !k.starts_with(&mine)) {
+        return Err(format!("agent name `{name}` is in use by another tailnet user; pick a different name"));
+    }
+    Ok(holders().any(|(_, s)| s.live(online)))
+}
+
+/// The role a call gives its session: `hello`'s, or author for a review request.
+fn role_given(msg: &Value) -> Option<Role> {
+    match msg["params"]["name"].as_str().filter(|_| msg["method"] == "tools/call")? {
+        "hello" => Role::parse(msg["params"]["arguments"]["role"].as_str()?),
+        "request_review" | "request_rereview" => Some(Role::Author),
+        _ => None,
+    }
+}
+
+/// The session's agent and the role to record for it. A session without a chosen name gets one
+/// on its first call that acts (`active`), once its role is known: a free default name whose last
+/// holder had that role, else one never used. A session that hasn't said its role takes the one
+/// its free names had, unless they differ. A name shared with a live reviewer session stays a
+/// reviewer.
+fn named(hub: &Hub, who: &Identity, key: &str, default: &str, given: Option<Role>, active: bool) -> Result<(String, Option<Role>, String), String> {
     let online = Duration::from_secs(hub.cfg.timing.online_secs);
-    let taken = |name: &str| {
-        hub.sessions.lock().unwrap().values().any(|s| s.live(online) && s.agent.eq_ignore_ascii_case(name))
-    };
-    if let Some(name) = chosen {
-        let note = if taken(&name) {
-            format!("Another session is also connected as `{name}`: you share its events and tasks. To work apart, connect with a different `?agent=` name.")
-        } else {
-            String::new()
-        };
-        return (name, note);
-    }
-    let free = (1..=20)
-        .map(|n| if n == 1 { default.clone() } else { format!("{default}-{n}") })
-        .find(|n| !taken(n) && hub.check_name(n, who).is_ok());
-    match free {
-        Some(name) if name != default => {
-            let note = format!("Another session holds `{default}`, so you are `{name}`.");
-            (name, note)
+    let mine = session_key(who, "");
+    let mut all = hub.sessions.lock().unwrap();
+    let Some(s) = all.get(key) else { return Ok((String::new(), given, String::new())) };
+    let mut role = given.or(s.role);
+    let mut note = String::new();
+    let others = || all.iter().filter(|(k, _)| *k != key);
+    let name = match s.agent.clone() {
+        Some(name) => name,
+        None if !active => String::new(),
+        None => {
+            let free: Vec<String> = (1..=20)
+                .map(|n| if n == 1 { default.to_string() } else { format!("{default}-{n}") })
+                .filter(|n| {
+                    !others().any(|(k, o)| {
+                        o.agent.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(n)) && (o.live(online) || !k.starts_with(&mine))
+                    })
+                })
+                .collect();
+            let (name, r) = hub.read(|st, _| {
+                let free: Vec<(&String, Option<Role>)> = free
+                    .iter()
+                    .filter_map(|n| match st.agents.all().find(|a| a.name.eq_ignore_ascii_case(n)) {
+                        Some(a) if !a.login.eq_ignore_ascii_case(&who.login) => None,
+                        a => Some((n, a.map(|a| a.role))),
+                    })
+                    .collect();
+                let mut had = free.iter().filter_map(|(_, r)| *r);
+                let role = match (role, had.next()) {
+                    (Some(r), _) => r,
+                    (None, None) => Role::Author,
+                    (None, Some(r)) if had.all(|o| o == r) => r,
+                    _ => return Err("call `hello` with your role (reviewer or author) first".to_string()),
+                };
+                let name = free.iter().find(|(_, r)| *r == Some(role)).or_else(|| free.iter().find(|(_, r)| r.is_none())).or(free.first());
+                Ok((name.map_or(default.to_string(), |(n, _)| n.to_string()), role))
+            })?;
+            if name != default {
+                note = format!("You are `{name}`.");
+            }
+            role = Some(r);
+            hub.write(|st, _| st.new_session(&name));
+            name
         }
-        _ => (default, String::new()),
+    };
+    let shared = others().any(|(_, o)| o.agent.as_ref() == Some(&name) && o.role == Some(Role::Reviewer) && o.live(online));
+    let s = all.get_mut(key).expect("found");
+    if s.agent.is_none() && !name.is_empty() {
+        s.agent = Some(name.clone());
+        streams(hub, s.agent.as_deref(), s.streams as i32);
     }
+    s.role = role;
+    let role = if shared && role == Some(Role::Author) { None } else { role };
+    Ok((name, role, note))
+}
+
+/// What a new session that chose `name` is told: that it shares the name, if a live session holds it.
+fn shared_note(hub: &Hub, who: &Identity, name: &str) -> Result<String, String> {
+    hub.check_name(name, who).map_err(|e| format!("{e:#}"))?;
+    Ok(match held(hub, who, name)? {
+        true => format!("Another session is also connected as `{name}`: you share its events and tasks. To work apart, connect with a different `?agent=` name."),
+        false => String::new(),
+    })
 }
 
 /// Acknowledges what the session's earlier waits handed out when its client sends a request, and
@@ -433,7 +495,6 @@ fn session_seen(hub: &Hub, key: &str, agent: &str, msg: &Value) {
             s.waits.remove(&msg["params"]["requestId"].to_string());
             None
         } else if let Some(id) = msg.get("id") {
-            s.called |= msg["method"] == "tools/call";
             let acked = s.waits.values().flatten().copied().max();
             s.waits.retain(|_, n| n.is_none());
             if msg["method"] == "tools/call" && msg["params"]["name"] == "wait" {
@@ -444,7 +505,7 @@ fn session_seen(hub: &Hub, key: &str, agent: &str, msg: &Value) {
             None
         }
     };
-    if let Some(n) = acked {
+    if let Some(n) = acked.filter(|_| !agent.is_empty()) {
         hub.write(|s, _| s.ack(agent, n));
     }
 }
@@ -496,30 +557,32 @@ async fn mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (chosen, role) = match (chosen(&q, &headers), role_of(&q)) {
-        (Ok(c), Ok(r)) => (c, r),
-        (Err(e), _) | (_, Err(e)) => return e.into_response(),
+    let (chosen, role) = match chosen(&q, &headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
     };
     let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return Json(crate::mcp::error_response(Value::Null, -32700, &format!("parse error: {e}"))).into_response(),
     };
     let default = default_for(&headers, &who);
-    let initialize = value["method"] == "initialize";
-    let (agent, key, note, new_id) = if initialize {
-        let (agent, note) = name_session(&hub, &who, chosen, default);
-        let id = new_session_id(&agent);
-        match session(&hub, &who, &id, Some(&agent), &agent) {
-            Ok((key, _)) => (agent, Some(key), note, Some(id)),
-            Err(e) => return e.into_response(),
-        }
+    let active = value["method"] == "tools/call" && value["params"]["name"].as_str().is_some_and(|t| crate::mcp::ACTIVE_TOOLS.contains(&t));
+    let named = if value["method"] == "initialize" {
+        let id = new_session_id();
+        chosen
+            .as_deref()
+            .map_or(Ok(String::new()), |n| shared_note(&hub, &who, n))
+            .map(|note| (chosen.clone().unwrap_or_default(), role, note, Some(session(&hub, &who, &id, chosen.as_deref(), role)), Some(id)))
     } else if let Some(id) = session_id(&headers) {
-        match session(&hub, &who, id, chosen.as_deref(), &default) {
-            Ok((key, agent)) => (agent, Some(key), String::new(), None),
-            Err(e) => return e.into_response(),
-        }
+        let key = session(&hub, &who, id, chosen.as_deref(), role);
+        named(&hub, &who, &key, &default, role_given(&value), active).map(|(a, r, note)| (a, r, note, Some(key), None))
     } else {
-        (chosen.unwrap_or(default), None, String::new(), None)
+        Ok((chosen.unwrap_or(default), role_given(&value).or(role), String::new(), None, None))
+    };
+    let named = named.and_then(|n| if active { held(&hub, &who, &n.0).map(|_| n) } else { Ok(n) });
+    let (agent, role, note, key, new_id) = match named {
+        Ok(n) => n,
+        Err(e) => return Json(crate::mcp::error_response(value.get("id").cloned().unwrap_or(Value::Null), -32000, &e)).into_response(),
     };
     if let Some(key) = &key {
         session_seen(&hub, key, &agent, &value);
@@ -536,7 +599,7 @@ async fn mcp(
             move |n| answered(&hub, &key, &id, n)
         };
         tokio::spawn(async move {
-            let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: true, stream: true, note: "" };
+            let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: true, stream: true, note: &note };
             let call = crate::mcp::handle(&hub, &c, value);
             tokio::pin!(call);
             let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
@@ -583,44 +646,39 @@ async fn mcp(
     }
 }
 
+/// Counts an event stream of session `key` opening or closing, and with it its agent's.
+fn stream(hub: &Hub, key: &str, delta: i32) {
+    if let Some(s) = hub.sessions.lock().unwrap().get_mut(key) {
+        s.streams = s.streams.saturating_add_signed(delta as isize);
+        s.streamed = true;
+        s.used = Instant::now();
+        streams(hub, s.agent.as_deref(), delta);
+    }
+}
+
 /// A session's event stream. Clients keep it open while they run, so it keeps the agent online
 /// while it reads code between calls; the relay sends nothing on it but keepalives.
 async fn mcp_get(State(hub): St, Extension(who): Extension<Identity>, Query(q): Query<AgentQuery>, headers: HeaderMap) -> Response {
     let Some(id) = session_id(&headers).filter(|_| wants_stream(&headers)) else {
         return (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response();
     };
-    let chosen = match chosen(&q, &headers) {
+    let (chosen, role) = match chosen(&q, &headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
-    let (key, agent) = match session(&hub, &who, id, chosen.as_deref(), &default_for(&headers, &who)) {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(e) = hub.touch(&agent, &who, None) {
-        return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
-    }
-    if let Some(s) = hub.sessions.lock().unwrap().get_mut(&key) {
-        s.streams += 1;
-        s.streamed = true;
-    }
+    let key = session(&hub, &who, id, chosen.as_deref(), role);
+    stream(&hub, &key, 1);
     let (tx, rx) = mpsc::channel(1);
     tokio::spawn(async move {
-        {
-            let _online = hub.waiting(&agent);
-            let mut down = hub.shutdown.subscribe();
-            while tx.send((": alive\n\n".into(), None)).await.is_ok() {
-                tokio::select! {
-                    _ = tokio::time::sleep(KEEPALIVE) => {}
-                    _ = tx.closed() => break,
-                    _ = down.wait_for(|d| *d) => break,
-                }
+        let mut down = hub.shutdown.subscribe();
+        while tx.send((": alive\n\n".into(), None)).await.is_ok() {
+            tokio::select! {
+                _ = tokio::time::sleep(KEEPALIVE) => {}
+                _ = tx.closed() => break,
+                _ = down.wait_for(|d| *d) => break,
             }
         }
-        if let Some(s) = hub.sessions.lock().unwrap().get_mut(&key) {
-            s.streams -= 1;
-            s.used = Instant::now();
-        }
+        stream(&hub, &key, -1);
     });
     sse(rx, |_| {})
 }
@@ -628,46 +686,17 @@ async fn mcp_get(State(hub): St, Extension(who): Extension<Identity>, Query(q): 
 /// Ends a session, which frees its name.
 async fn mcp_delete(State(hub): St, Extension(who): Extension<Identity>, headers: HeaderMap) -> StatusCode {
     if let Some(id) = session_id(&headers) {
-        hub.sessions.lock().unwrap().remove(&session_key(&who, id));
+        let s = hub.sessions.lock().unwrap().remove(&session_key(&who, id));
+        if let Some(s) = s {
+            streams(&hub, s.agent.as_deref(), -(s.streams as i32));
+        }
     }
     StatusCode::OK
-}
-
-/// A Stop hook for Codex or Claude Code, run with curl: blocks stopping while the agent owes the
-/// relay something (or always for a looping reviewer with `keep_waiting`), else says nothing.
-async fn stop_hook(State(hub): St, Extension(who): Extension<Identity>, Query(q): Query<AgentQuery>, headers: HeaderMap) -> Response {
-    let agent = match agent_of(&q, &headers, &who) {
-        Ok(a) => a,
-        Err(r) => return r.into_response(),
-    };
-    if let Err(e) = hub.check_name(&agent, &who) {
-        return (StatusCode::CONFLICT, format!("{e:#}")).into_response();
-    }
-    let (actions, pending, role) =
-        hub.read(|s, now| (s.next_actions(&agent, now), s.has_undelivered(&agent), s.agents.get(&agent).map(|a| a.role)));
-    let role = role.unwrap_or(Role::Author);
-    let reason = if !actions.is_empty() || pending {
-        let mut text = crate::mcp::next_text(&actions, role, &[], &[]);
-        if pending {
-            text = format!("You have undelivered amx events: call `wait` now.\n\n{text}");
-        }
-        format!("[amx] You still have an active review obligation on the relay; do not stop.\n{text}")
-    } else if q.keep_waiting.is_some() && role == Role::Reviewer {
-        "[amx] You are a looping reviewer: call the amx `wait` tool again and handle what it returns.".into()
-    } else {
-        return StatusCode::NO_CONTENT.into_response();
-    };
-    let reason: String = reason.chars().take(6000).collect();
-    Json(json!({ "decision": "block", "reason": reason })).into_response()
 }
 
 /// How to connect each client, with this relay's address and the caller's default names.
 async fn setup(State(hub): St, Extension(who): Extension<Identity>) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], crate::text::setup(&hub.web_url(), &who.login))
-}
-
-async fn codex_toml(State(hub): St) -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], crate::text::codex_toml(&hub.web_url()))
 }
 
 #[cfg(test)]

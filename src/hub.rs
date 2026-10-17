@@ -125,21 +125,14 @@ impl Hub {
         self.state.lock().unwrap().check_name(name, who, now_ms())
     }
 
-    pub fn waiting(&self, name: &str) -> Waiting<'_> {
-        self.state.lock().unwrap().set_waiting(name, 1, now_ms());
-        Waiting {
-            hub: self,
-            name: name.to_string(),
-        }
-    }
-
     /// Blocks until `name` has new events or something it must act on, or the timeout passes;
     /// an author with nothing in progress isn't kept waiting. Progress events are dropped unless
     /// `progress` is set. See `State::take_events` for `held`.
     pub async fn wait(&self, name: &str, timeout: Duration, progress: bool, held: bool) -> (Vec<AgentEvent>, u64) {
         let mut rx = self.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
-        let _guard = self.waiting(name);
+        self.state.lock().unwrap().set_waiting(name, 1, now_ms());
+        let _guard = Waiting { hub: self, name: name.to_string() };
         loop {
             rx.borrow_and_update();
             let (taken, done) = {
