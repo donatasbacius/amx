@@ -1256,6 +1256,43 @@ fn review_page_asks_the_human_to_judge_a_disputed_finding() {
 }
 
 #[test]
+fn the_agent_list_shows_one_agent_per_row() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    sim.join("bob-codex", "bob@example.com", Role::Author);
+    let id = sim.request("alice-codex", 1);
+    sim.accept("rev-a", &id);
+    let index = amx::web::render_index(&sim.s, sim.now, |_| false);
+    let list = &index[index.find("<ul class=\"agents\">").unwrap()..];
+    let rows: Vec<&str> = list.split("<li>").skip(1).map(|li| &li[..li.find("</li>").unwrap()]).collect();
+    assert_eq!(rows.len(), 5, "{list}");
+    assert!(rows[0].starts_with("<b>rev-a</b><span class=\"role\">on <a href="), "busy reviewers first: {list}");
+    assert_eq!(rows[1..3], ["<b>rev-b</b><span class=\"role\">idle</span>", "<b>rev-c</b><span class=\"role\">idle</span>"]);
+    // Each agent is a row of its own, the width of the card, with its status at the card's right
+    // edge like the review rows' times: never set in columns, side by side or in a narrower box.
+    let css = include_str!("../assets/style.css");
+    for rule in css.lines().filter(|l| l.trim_start().starts_with(".agents")) {
+        for side_by_side in ["columns", "column-count", "grid", "float", "inline", "max-width"] {
+            assert!(!rule.contains(side_by_side), "{rule}");
+        }
+    }
+    assert!(css.contains(".agents li { display: flex; flex-wrap: wrap;") && css.contains(".agents .role { margin-left: auto; text-align: right; }"));
+    // A status that doesn't fit beside the name drops below it, still at the right edge; neither
+    // is kept on one line, so nothing pushes past the card or squeezes a name to a letter per line.
+    let nowrap = css.lines().find(|l| l.ends_with("{ white-space: nowrap; }") && l.contains(".me")).unwrap();
+    assert!(!nowrap.contains(".agents"), "{nowrap}");
+}
+
+#[test]
+fn a_status_box_without_controls_has_no_empty_row() {
+    // An empty named grid row still takes a row gap, which made every status box 2px taller.
+    let css = include_str!("../assets/style.css");
+    let verdict = &css[css.find(".verdict {").unwrap()..];
+    let verdict = &verdict[..verdict.find('}').unwrap()];
+    assert!(verdict.contains("grid-template: \"t w\" \"d d\" /"), "{verdict}");
+    assert!(css.contains(".act { grid-column: 1 / -1;"), "the control makes its own row");
+}
+
+#[test]
 fn the_open_cancel_row_tabs_in_the_order_it_reads() {
     // Keyboard order is the markup's: "Keep running", then the red button. Nothing in the
     // stylesheet may move the control's parts out of that order, or lean on ::details-content.
