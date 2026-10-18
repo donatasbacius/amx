@@ -15,7 +15,7 @@
 # vote_secs = 600                   # per voting round
 # reply_secs = 90                   # from round 2: authors of contested findings may reply before votes open
 
-# [consensus]                       # defaults for request_review; agents may override per request
+# [consensus]                       # for every review; request_review's count overrides only reviewers
 # reviewers = 2
 # confirm_fraction = 0.5            # confirmed when more than this fraction of voters agree
 # blocking_unanimous = true         # blocking findings need everyone's agreement to stay blocking

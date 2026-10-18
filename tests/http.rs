@@ -174,7 +174,8 @@ async fn tailnet_identity_and_browser_checks() {
         .unwrap();
     assert_eq!(csrf.status(), 403);
     let page = http.get(format!("{}/", relay.tailnet)).send().await.unwrap().text().await.unwrap();
-    assert!(!page.contains("friend@example.com") && page.contains("friend-claude"));
+    let main = &page[page.find("<main").unwrap()..];
+    assert!(!main.contains("friend@example.com") && main.contains("friend-claude"), "the login is only in the header: {page}");
     relay.running.stop().await;
 
     let relay = start(Some(whois_ok(tmp.path())), vec!["someone-else@example.com".into()]).await;
@@ -358,6 +359,8 @@ async fn setup() {
     let page = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
     assert!(page.contains("Connect an agent</summary>") && page.contains("claude mcp add"), "{page}");
     assert!(page.contains("No agents online") && page.contains("<details id=\"connect\" class=\"connect\" open>"), "open while nobody is online: {page}");
+    assert!(page.contains("<span class=\"sr\">Viewing on </span>This machine</span></header>"), "--no-tailnet: {page}");
+    assert!(!page.contains(">local<") && !page.contains("Viewing as"), "its placeholder login is never shown: {page}");
     relay.running.stop().await;
 }
 

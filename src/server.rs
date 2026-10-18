@@ -6,7 +6,7 @@ use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -148,6 +148,8 @@ pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
     Router::new()
         .route("/", get(crate::web::index))
         .route("/r/{id}", get(crate::web::review_page))
+        .route("/r/{id}/cancel", post(crate::web::cancel))
+        .route("/r/{id}/f/{fid}", post(crate::web::rule))
         .route("/static/style.css", get(static_css))
         .route("/static/app.js", get(static_js))
         .route("/api/reviews", get(crate::web::api_reviews))
@@ -156,7 +158,16 @@ pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
         .route("/mcp", get(mcp_get).post(mcp).delete(mcp_delete))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .layer(middleware::from_fn_with_state((hub.clone(), listener), identify))
+        .layer(middleware::map_response(no_framing))
         .with_state(hub)
+}
+
+/// No page of the relay may be shown inside another site's frame, where a click could be stolen.
+async fn no_framing(mut r: Response) -> Response {
+    let h = r.headers_mut();
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
+    r
 }
 
 fn host_name(host: &str) -> String {
@@ -205,6 +216,34 @@ fn from_another_site(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("cross-site") || v.eq_ignore_ascii_case("same-site"))
 }
 
+/// A header a reverse proxy adds, which a loopback request from the owner's own browser lacks:
+/// any naming a forwarded request or a client address, `Via`, or Tailscale's.
+fn proxy_header(h: &str) -> bool {
+    h == "via" || h.contains("forwarded") || h.ends_with("-ip") || h.starts_with("tailscale-")
+}
+
+/// Marks a request from the relay's owner: its Tailscale login over the tailnet, or loopback with
+/// no proxy header, where no login names the person.
+#[derive(Clone, Copy)]
+pub struct Owner {
+    pub loopback: bool,
+}
+
+/// Who a page is shown to: a tailnet login as Tailscale reports it, a browser on the relay's own
+/// machine, or a caller the relay can't name (proxied, or before Tailscale names the owner).
+#[derive(Clone)]
+pub enum Viewer {
+    Login(String),
+    ThisMachine,
+    Unknown,
+}
+
+/// Whether an owner login can be matched over the tailnet: not `local`, which stands in for an owner
+/// Tailscale hasn't named, nor `tagged-devices`, which every tagged node shares.
+fn names_a_person(login: &str) -> bool {
+    !login.eq_ignore_ascii_case("local") && !login.eq_ignore_ascii_case("tagged-devices")
+}
+
 const OWNER_UNKNOWN: &str =
     "the relay is waiting for Tailscale to identify this machine's owner; start Tailscale, or run the relay with --no-tailnet";
 
@@ -227,13 +266,31 @@ async fn identify(
     if agent_api && from_another_site(headers) {
         return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
     }
+    let human = req.method() == axum::http::Method::POST && path.starts_with("/r/");
+    if human && (!headers.contains_key(header::ORIGIN) || from_another_site(headers)) {
+        return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
+    }
     let read_only = req.method() == axum::http::Method::GET
         && (path == "/" || ["/r/", "/static/", "/api/reviews"].iter().any(|p| path.starts_with(p)));
+    if listener == Listener::Local && headers.keys().any(|h| proxy_header(h.as_str())) {
+        if read_only {
+            req.extensions_mut().insert(Viewer::Unknown);
+            return next.run(req).await;
+        }
+        return (StatusCode::FORBIDDEN, "a proxied request can't act as the relay's owner; open the relay by its own address").into_response();
+    }
     let owner = hub.owner.lock().unwrap().clone();
     let who = match listener {
         Listener::Local if addr.ip().is_loopback() => match owner {
-            Some(owner) => owner,
-            None if read_only => return next.run(req).await,
+            Some(owner) => {
+                req.extensions_mut().insert(Owner { loopback: true });
+                req.extensions_mut().insert(Viewer::ThisMachine);
+                owner
+            }
+            None if read_only => {
+                req.extensions_mut().insert(Viewer::Unknown);
+                return next.run(req).await;
+            }
             None => return (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "10")], OWNER_UNKNOWN).into_response(),
         },
         Listener::Local => return (StatusCode::FORBIDDEN, "not a local caller").into_response(),
@@ -243,6 +300,10 @@ async fn identify(
                 if !allow.is_empty() && !allow.iter().any(|l| l.eq_ignore_ascii_case(&id.login)) {
                     return (StatusCode::FORBIDDEN, "tailnet user not allowed").into_response();
                 }
+                if owner.is_some_and(|o| names_a_person(&o.login) && o.login.eq_ignore_ascii_case(&id.login)) {
+                    req.extensions_mut().insert(Owner { loopback: false });
+                }
+                req.extensions_mut().insert(Viewer::Login(id.login.clone()));
                 id
             }
             None => {
@@ -760,6 +821,33 @@ mod tests {
         assert!(conns.admit(ip("127.0.0.3"), true, &limits).is_none(), "but share a cap of their own");
         drop(a);
         assert!(conns.admit(ip("100.64.0.3"), false, &limits).is_some(), "a closed connection frees its slot");
+    }
+
+    #[test]
+    fn proxy_headers() {
+        for h in [
+            "forwarded",
+            "x-forwarded-for",
+            "x-original-forwarded-for",
+            "x-real-ip",
+            "client-ip",
+            "true-client-ip",
+            "cf-connecting-ip",
+            "x-cluster-client-ip",
+            "via",
+            "tailscale-user-login",
+        ] {
+            assert!(proxy_header(h), "{h}");
+        }
+        for h in [
+            "host", "origin", "referer", "user-agent", "accept", "accept-encoding", "accept-language", "cookie",
+            "connection", "content-type", "content-length", "cache-control", "pragma", "priority", "dnt",
+            "upgrade-insecure-requests", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-fetch-site",
+            "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user", "sec-gpc", "if-none-match", "if-modified-since",
+            "authorization", "mcp-session-id", "mcp-protocol-version", "last-event-id", "x-amx-agent", "traceparent",
+        ] {
+            assert!(!proxy_header(h), "{h}");
+        }
     }
 
     #[test]

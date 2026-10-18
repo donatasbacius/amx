@@ -183,6 +183,7 @@ pub struct Agent {
     delivered: u64,
 }
 
+#[derive(Clone)]
 pub struct Agents {
     map: BTreeMap<String, Agent>,
     /// Open session event streams per name, which count as activity like a `wait`.
@@ -379,9 +380,25 @@ pub struct Finding {
     pub open_round: u8,
     pub votes: BTreeMap<String, Vote>,
     pub outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruling: Option<Ruling>,
+}
+
+/// A human's decision on a finding the votes left open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ruling {
+    pub by: String,
+    pub must_fix: bool,
+    pub at: Ms,
 }
 
 impl Finding {
+    /// Its ruling, which counts only while the votes leave it disputed or unverified.
+    pub fn ruled(&self) -> Option<&Ruling> {
+        let open = self.outcome.as_ref().is_some_and(|o| matches!(o.status, Status::Disputed | Status::Unverified));
+        self.ruling.as_ref().filter(|_| open)
+    }
+
     /// Votes cast on its current revision; an amendment needs fresh ones.
     pub fn current_votes(&self) -> impl Iterator<Item = (&String, &Vote)> {
         self.votes.iter().filter(|(_, v)| v.revision >= self.revision)
@@ -436,6 +453,8 @@ pub struct Review {
     /// Who has amended, withdrawn or spoken since the current round started.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub replied: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_by: Option<String>,
 }
 
 impl Review {
@@ -494,6 +513,28 @@ impl Review {
             .filter(|f| f.by.as_deref() == Some(agent) && f.withdrawn.is_none() && f.open_round == round && round > 1)
             .map(|f| f.id.clone())
             .collect()
+    }
+
+    /// Whether `login` may cancel or rule on it: its author's login, or the hub owner (`owner`).
+    pub fn may_act(&self, login: &str, owner: bool) -> bool {
+        owner || self.author_login.eq_ignore_ascii_case(login)
+    }
+
+    /// The verdict of a finished review, from its findings and rulings as they stand now: a
+    /// stored one may predate a ruling, or a relay that dropped it.
+    pub fn verdict(&self) -> Option<Verdict> {
+        self.result.as_ref().map(|_| verdict_of(&self.findings))
+    }
+
+    /// Its result as `verdict` and the findings now give it.
+    pub fn result_now(&self, web: &str) -> Option<ReviewResult> {
+        let at = self.result.as_ref()?.at;
+        Some(ReviewResult { verdict: verdict_of(&self.findings), at, text: text::result(self, web) })
+    }
+
+    /// Its place in the order reviews were requested.
+    pub fn seq(&self) -> u64 {
+        self.id.trim_start_matches('r').parse().unwrap_or(0)
     }
 
     pub fn deadline_left(&self, now: Ms) -> Ms {
@@ -626,11 +667,18 @@ pub fn decide(findings: &mut [Finding], c: &Consensus, sole: bool) {
     }
 }
 
+/// The re-review of review `id` that hasn't failed, which locks its rulings.
+pub fn rereview<'a>(reviews: &'a [Review], id: &str) -> Option<&'a Review> {
+    reviews.iter().find(|o| o.parent.as_deref() == Some(id) && o.phase != Phase::Failed)
+}
+
+/// Changes are requested by a confirmed blocking or major finding, or one a human ruled must fix.
 pub fn verdict_of(findings: &[Finding]) -> Verdict {
     let blocks = findings.iter().any(|f| {
-        f.outcome.as_ref().is_some_and(|o| {
-            o.status == Status::Confirmed && matches!(o.severity, Severity::Blocking | Severity::Major)
-        })
+        f.ruled().is_some_and(|r| r.must_fix)
+            || f.outcome.as_ref().is_some_and(|o| {
+                o.status == Status::Confirmed && matches!(o.severity, Severity::Blocking | Severity::Major)
+            })
     });
     if blocks { Verdict::ChangesRequested } else { Verdict::Approve }
 }
@@ -642,12 +690,6 @@ pub struct NewReview {
     pub reviewers: Option<usize>,
     /// Offer only to these agents; `reviewers` then defaults to how many there are.
     pub picked: Vec<String>,
-    pub confirm_fraction: Option<f64>,
-    pub blocking_unanimous: Option<bool>,
-    pub vote_rounds: Option<u8>,
-    pub offer_secs: Option<u64>,
-    pub review_secs: Option<u64>,
-    pub vote_secs: Option<u64>,
 }
 
 impl NewReview {
@@ -658,12 +700,6 @@ impl NewReview {
             head_sha: None,
             reviewers: None,
             picked: Vec::new(),
-            confirm_fraction: None,
-            blocking_unanimous: None,
-            vote_rounds: None,
-            offer_secs: None,
-            review_secs: None,
-            vote_secs: None,
         }
     }
 }
@@ -766,6 +802,7 @@ pub struct Snapshot {
     pub reviews: Vec<Review>,
 }
 
+#[derive(Clone)]
 pub struct State {
     pub agents: Agents,
     pub reviews: Vec<Review>,
@@ -1292,19 +1329,7 @@ impl State {
         {
             bail!("head_sha must be a hex commit SHA");
         }
-        let mut c = self.consensus;
-        if let Some(f) = req.confirm_fraction {
-            if !(0.0..1.0).contains(&f) {
-                bail!("confirm_fraction must be in [0, 1)");
-            }
-            c.confirm_fraction = f;
-        }
-        if let Some(b) = req.blocking_unanimous {
-            c.blocking_unanimous = b;
-        }
-        if let Some(v) = req.vote_rounds {
-            c.vote_rounds = v.clamp(1, 3);
-        }
+        let c = self.consensus;
         let picked = self.check_picked(author, &req.picked, now)?;
         let reviewers = match req.reviewers {
             Some(n) if !picked.is_empty() && n > picked.len() => {
@@ -1321,9 +1346,9 @@ impl State {
         let params = ReviewParams {
             reviewers,
             consensus: c,
-            offer_secs: req.offer_secs.unwrap_or(t.offer_secs).clamp(5, 3600),
-            review_secs: req.review_secs.unwrap_or(t.review_secs).clamp(10, 4 * 3600),
-            vote_secs: req.vote_secs.unwrap_or(t.vote_secs).clamp(10, 4 * 3600),
+            offer_secs: t.offer_secs.clamp(5, 3600),
+            review_secs: t.review_secs.clamp(10, 4 * 3600),
+            vote_secs: t.vote_secs.clamp(10, 4 * 3600),
             reply_secs: t.reply_secs.min(600),
         };
         self.next_review += 1;
@@ -1353,6 +1378,7 @@ impl State {
             next_finding: 0,
             replying: false,
             replied: BTreeSet::new(),
+            cancelled_by: None,
         };
         let from = if r.picked.is_empty() { String::new() } else { format!(" from {}", r.picked.join(", ")) };
         r.log(now, author, "request", format!("requested {reviewers} reviewer(s){from}. {}", r.note));
@@ -1494,6 +1520,7 @@ impl State {
                 open_round: 1,
                 votes: BTreeMap::new(),
                 outcome: None,
+                ruling: None,
             });
         }
         let n = findings.len();
@@ -1771,7 +1798,7 @@ impl State {
         if prev.phase != Phase::Done {
             bail!("{} has not finished ({})", prev.id, prev.phase.label());
         }
-        if let Some(r) = self.reviews.iter().find(|r| r.parent.as_deref() == Some(&prev.id) && r.phase != Phase::Failed) {
+        if let Some(r) = rereview(&self.reviews, &prev.id) {
             bail!("{} is already re-reviewed as {}", prev.id, r.id);
         }
         let reviewed = prev
@@ -1809,7 +1836,7 @@ impl State {
         r.since_sha = reviewed;
         for f in prev.findings.iter() {
             let Some(o) = &f.outcome else { continue };
-            if !matches!(o.status, Status::Confirmed | Status::Disputed | Status::Unverified) {
+            if !matches!(o.status, Status::Confirmed | Status::Disputed | Status::Unverified) || f.ruled().is_some_and(|r| !r.must_fix) {
                 continue;
             }
             r.next_finding += 1;
@@ -1825,6 +1852,7 @@ impl State {
                 open_round: 1,
                 votes: BTreeMap::new(),
                 outcome: None,
+                ruling: f.ruled().cloned(),
             });
         }
         for (agent, login) in candidates.into_iter().take(r.params.reviewers) {
@@ -1846,6 +1874,76 @@ impl State {
         self.reviews.push(r);
         self.advance(now);
         Ok(new_id)
+    }
+
+    /// A human stops an unfinished review; `by` is their name as shown.
+    pub fn cancel(&mut self, id: &str, by: &str, now: Ms) -> Result<()> {
+        let State { agents, reviews, .. } = self;
+        let r = reviews
+            .iter_mut()
+            .find(|r| r.id.eq_ignore_ascii_case(id.trim()))
+            .ok_or_else(|| anyhow!("no review {id}"))?;
+        if !r.phase.active() {
+            bail!("{} has already ended", r.id);
+        }
+        r.cancelled_by = Some(by.to_string());
+        fail(r, agents, &format!("cancelled by {by}"), now);
+        Ok(())
+    }
+
+    /// A human rules on a finding the votes left open: `Some(true)` must fix, `Some(false)` dismiss,
+    /// `None` undoes. Returns whether anything changed.
+    pub fn rule(&mut self, id: &str, fid: &str, by: &str, must_fix: Option<bool>, now: Ms) -> Result<bool> {
+        let i = self
+            .reviews
+            .iter()
+            .position(|r| r.id.eq_ignore_ascii_case(id.trim()))
+            .ok_or_else(|| anyhow!("no review {id}"))?;
+        if let Some(o) = rereview(&self.reviews, &self.reviews[i].id) {
+            bail!("{0} re-reviews {1}, so rulings on {1} are locked unless {0} fails; reload the page", o.id, self.reviews[i].id);
+        }
+        let web = self.web_url.clone();
+        let State { agents, reviews, .. } = self;
+        let r = &mut reviews[i];
+        if r.phase != Phase::Done {
+            bail!("{} has not finished", r.id);
+        }
+        let rid = r.id.clone();
+        if must_fix.is_some() && r.log.iter().filter(|e| e.kind == "ruling").count() >= SAYS_PER_REVIEW {
+            bail!("{rid} has had {SAYS_PER_REVIEW} rulings; no more are taken");
+        }
+        let f = r
+            .findings
+            .iter_mut()
+            .find(|f| f.id.eq_ignore_ascii_case(fid.trim()))
+            .ok_or_else(|| anyhow!("{rid} has no finding {fid}"))?;
+        if !f.outcome.as_ref().is_some_and(|o| matches!(o.status, Status::Disputed | Status::Unverified)) {
+            bail!("{} is not disputed or unverified", f.id);
+        }
+        if f.ruling.as_ref().map(|x| x.must_fix) == must_fix {
+            return Ok(false);
+        }
+        f.ruling = must_fix.map(|must_fix| Ruling { by: by.to_string(), must_fix, at: now });
+        let fid = f.id.clone();
+        let what = match must_fix {
+            Some(true) => "must fix",
+            Some(false) => "dismissed",
+            None => "ruling undone",
+        };
+        r.log(now, by, "ruling", format!("{fid}: {what}"));
+        r.result = r.result_now(&web);
+        let v = match verdict_of(&r.findings) {
+            Verdict::Approve => "approve",
+            Verdict::ChangesRequested => "changes requested",
+        };
+        let did = match must_fix {
+            Some(true) => format!("ruled {fid} must fix"),
+            Some(false) => format!("dismissed {fid}"),
+            None => format!("undid the ruling on {fid}"),
+        };
+        let event = format!("[{rid}] {by} (a human) {did} (verdict: {v}).\n{}", text::next_step(r));
+        agents.outcome(&r.author.clone(), &rid, event, now);
+        Ok(true)
     }
 
     /// Applies deadlines and presence; call about once a second. Returns true if anything changed.
@@ -2174,9 +2272,19 @@ fn fail(r: &mut Review, agents: &mut Agents, why: &str, now: Ms) {
     r.ended = Some(now);
     r.failure = Some(why.to_string());
     r.log(now, "relay", "failed", why);
-    agents.outcome(&r.author, &r.id, format!("[{}] Review of {} failed: {why}. You can try `request_review` again later.", r.id, r.pr.url()), now);
+    let (author, reviewer) = match &r.cancelled_by {
+        Some(by) => (
+            format!("[{}] {by} (a human) cancelled the review of {}.\nNEXT: don't request it again unless your human asks.", r.id, r.pr.url()),
+            format!("[{}] Review cancelled by {by} (a human). Call `wait`.", r.id),
+        ),
+        None => (
+            format!("[{}] Review of {} failed: {why}. You can try `request_review` again later.", r.id, r.pr.url()),
+            format!("[{}] Review cancelled: {why}. Call `wait`.", r.id),
+        ),
+    };
+    agents.outcome(&r.author, &r.id, author, now);
     let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
     for a in names {
-        agents.notify(&a, &r.id, format!("[{}] Review cancelled: {why}. Call `wait`.", r.id), now);
+        agents.notify(&a, &r.id, reviewer.clone(), now);
     }
 }
