@@ -66,6 +66,28 @@ impl Hub {
         r
     }
 
+    /// Applies `f` and writes the `--state` file before anyone can see the change; if writing
+    /// fails, the change is undone. The outer error is the failed write, the inner one `f`'s.
+    pub fn write_saved<R>(&self, f: impl FnOnce(&mut State, Ms) -> Result<R>) -> Result<Result<R>> {
+        let _one = self.saving.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        let before = self.cfg.state.as_ref().map(|_| st.clone());
+        let now = now_ms();
+        let r = match f(&mut st, now) {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(e)),
+        };
+        if let (Some(path), Some(before)) = (&self.cfg.state, before)
+            && let Err(e) = crate::persist::save(path, &st.snapshot(now))
+        {
+            *st = before;
+            return Err(e);
+        }
+        drop(st);
+        self.bump();
+        Ok(Ok(r))
+    }
+
     /// A change nobody else needs to see or the state file to keep.
     pub fn quiet<R>(&self, f: impl FnOnce(&mut State, Ms) -> R) -> R {
         f(&mut self.state.lock().unwrap(), now_ms())

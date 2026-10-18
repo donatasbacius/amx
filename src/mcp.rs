@@ -1,11 +1,12 @@
 use crate::hub::Hub;
-use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, Ms, NewReview, Phase, Role, State, SubmitIn, VoteIn};
+use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, Ms, NewReview, Phase, Role, State, SubmitIn, Verdict, VoteIn, rereview, verdict_of};
 use crate::tailscale::Identity;
 use crate::text;
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -70,13 +71,7 @@ pub fn tools() -> Value {
                 "reviewers": { "type": "array", "items": { "type": "string" }, "description": "Only these agents (online reviewers, names from `online`). Default: any idle reviewer." },
                 "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "How many (default 2, or as many as named); proceeds with whoever accepts." },
                 "note": { "type": "string", "description": "What the PR does and what reviewers should focus on." },
-                "head_sha": { "type": "string", "description": "Commit to review." },
-                "confirm_fraction": { "type": "number", "description": "Advanced (default 0.5): agreeing fraction that confirms a finding." },
-                "blocking_unanimous": { "type": "boolean", "description": "Advanced (default true): blocking needs unanimous agreement." },
-                "vote_rounds": { "type": "integer", "minimum": 1, "maximum": 3, "description": "Advanced (default 2)." },
-                "offer_seconds": { "type": "integer", "description": "Advanced (default 120): time to accept." },
-                "review_seconds": { "type": "integer", "description": "Advanced (default 1200)." },
-                "vote_seconds": { "type": "integer", "description": "Advanced (default 600), per round." }
+                "head_sha": { "type": "string", "description": "Commit to review." }
             }, "required": ["pr_url"] }
         },
         {
@@ -203,13 +198,12 @@ struct RequestArgs {
     #[serde(default)]
     note: String,
     head_sha: Option<String>,
-    confirm_fraction: Option<f64>,
-    blocking_unanimous: Option<bool>,
-    vote_rounds: Option<u8>,
-    offer_seconds: Option<u64>,
-    review_seconds: Option<u64>,
-    vote_seconds: Option<u64>,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, Value>,
 }
+
+/// Per-request consensus and timing keys older clients still send; the hub's config decides.
+const RETIRED: &[&str] = &["confirm_fraction", "blocking_unanimous", "vote_rounds", "offer_seconds", "review_seconds", "vote_seconds"];
 
 #[derive(Deserialize)]
 struct IdArgs {
@@ -283,13 +277,15 @@ struct StatusArgs {
 
 /// The NEXT lines for `actions`. A task whose full text is in one of `events`, or that was
 /// already owed before this call (`known`), gets a one-line pointer, and the idle line is left
-/// out when an event already says what to do.
-pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], known: &[String]) -> String {
+/// out when an event already says what to do. `fixes` are the NEXT lines of finished reviews the
+/// events are about that still need fixing; the author is told those rather than "nothing pending".
+pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], known: &[String], fixes: &[String]) -> String {
     let has_next = |t: &str| t.lines().any(|l| l.starts_with("NEXT:"));
     if actions.is_empty() {
         return match role {
             _ if events.iter().any(|e| has_next(&e.text)) => String::new(),
             Role::Reviewer => "NEXT: nothing for you right now. Call `wait` again (keep looping).".into(),
+            Role::Author if !fixes.is_empty() => fixes.join("\n"),
             Role::Author if !events.is_empty() => "NEXT: nothing pending on the relay.".into(),
             Role::Author => "NEXT: nothing pending. Use `request_review` to get a PR reviewed.".into(),
         };
@@ -311,7 +307,14 @@ pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], known: &
 fn next_after(s: &State, agent: &str, events: &[AgentEvent], known: &[String], now: Ms) -> (String, bool) {
     let role = s.agents.get(agent).map(|a| a.role).unwrap_or(Role::Author);
     let actions = s.next_actions(agent, now);
-    (next_text(&actions, role, events, known), actions.iter().any(|a| a.urgent))
+    let ids: BTreeSet<&str> = events.iter().filter_map(|e| e.review.as_deref()).collect();
+    let fixes: Vec<String> = ids
+        .into_iter()
+        .filter_map(|id| s.review(id))
+        .filter(|r| r.phase == Phase::Done && verdict_of(&r.findings) == Verdict::ChangesRequested && rereview(&s.reviews, &r.id).is_none())
+        .map(text::next_step)
+        .collect();
+    (next_text(&actions, role, events, known, &fixes), actions.iter().any(|a| a.urgent))
 }
 
 fn owed_tasks(s: &State, agent: &str, now: Ms) -> Vec<String> {
@@ -394,13 +397,8 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                 head_sha: r.head_sha,
                 reviewers: count,
                 picked,
-                confirm_fraction: r.confirm_fraction,
-                blocking_unanimous: r.blocking_unanimous,
-                vote_rounds: r.vote_rounds,
-                offer_secs: r.offer_seconds,
-                review_secs: r.review_seconds,
-                vote_secs: r.vote_seconds,
             };
+            let retired: Vec<&str> = RETIRED.iter().copied().filter(|k| r.rest.contains_key(*k)).collect();
             let id = hub.write(|s, now| s.request_review(agent, req, now))?;
             let (idle, picked) = hub.read(|s, now| {
                 let picked = s.review(&id).map(|r| r.picked.clone()).unwrap_or_default();
@@ -412,11 +410,14 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                     .count();
                 (idle, picked)
             });
-            let head = if picked.is_empty() {
+            let mut head = if picked.is_empty() {
                 format!("Review {id} requested; offered to {idle} idle reviewer(s) online now (others are offered it if they come online before the offer closes).")
             } else {
                 format!("Review {id} requested from {}; {idle} of them idle now (busy ones are offered it if they free up before the offer closes).", picked.join(", "))
             };
+            if !retired.is_empty() {
+                head.push_str(&format!(" Ignored {}: the hub sets consensus rules.", retired.join(", ")));
+            }
             Ok(with_next(hub, agent, &before, head))
         }
         "accept_review" => {

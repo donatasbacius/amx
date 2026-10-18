@@ -1,12 +1,13 @@
 use crate::hub::Hub;
-use crate::relay::{Choice, Finding, LogEntry, Ms, OnlineAgent, Phase, Review, Role, Severity, State, Status, Verdict};
+use crate::relay::{Choice, Finding, LogEntry, Ms, OnlineAgent, Phase, Review, Role, Severity, State, Status, Verdict, rereview};
 use crate::text::{bidi, iso, phase_badge, short_sha, split_range, split_rates};
-use axum::extract::{Path, State as AxState};
+use axum::extract::{Form, Path, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Extension, Json};
+use crate::server::{Owner, Viewer};
 use crate::tailscale::Identity;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -20,6 +21,8 @@ macro_rules! icon {
 }
 const CHEVRON: &str = icon!("<path d=\"M6 3.5L10.5 8 6 12.5\"/>");
 const EXTERNAL: &str = icon!("<path d=\"M6 3.5h6.5V10M12.5 3.5l-9 9\"/>");
+const PERSON: &str = icon!("<circle cx=\"8\" cy=\"5.25\" r=\"2.75\"/><path d=\"M2.75 14c.6-2.9 2.6-4.5 5.25-4.5s4.65 1.6 5.25 4.5\"/>");
+const MACHINE: &str = icon!("<rect x=\"1.75\" y=\"2.75\" width=\"12.5\" height=\"8.5\" rx=\"1.5\"/><path d=\"M5.5 14h5M8 11.25V14\"/>");
 
 pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -133,14 +136,24 @@ fn status(r: &Review) -> (&'static str, String) {
         Phase::Voting(_) if r.replying => ("voting", "Replying".into()),
         Phase::Voting(1) => ("voting", "Voting".into()),
         Phase::Voting(n) => ("voting", format!("Voting, round {n}")),
-        Phase::Done if r.result.as_ref().is_some_and(|x| x.verdict == Verdict::Approve) => ("approved", "Approved".into()),
+        Phase::Done if r.verdict() == Some(Verdict::Approve) => ("approved", "Approved".into()),
         Phase::Done => ("changes", "Changes requested".into()),
+        Phase::Failed if r.cancelled_by.is_some() => ("failed", "Cancelled".into()),
         Phase::Failed => ("failed", "Failed".into()),
     }
 }
 
+/// Who the page is shown to, in its header: outside `main`, so polling never touches it.
+fn viewer_tag(v: &Viewer) -> String {
+    match v {
+        Viewer::Login(login) => format!("<span class=\"me\">{PERSON} <span class=\"sr\">Viewing as </span>{}</span>", esc(login)),
+        Viewer::ThisMachine => format!("<span class=\"me\">{MACHINE} <span class=\"sr\">Viewing on </span>This machine</span>"),
+        Viewer::Unknown => format!("<span class=\"me muted\">{PERSON} Not identified</span>"),
+    }
+}
+
 /// `live` pages poll for changes and show a line while they can't; others load no script.
-fn page(title: &str, main: &str, live: bool) -> String {
+fn page(title: &str, main: &str, live: bool, viewer: &Viewer) -> String {
     let (script, status, tag) = if live {
         (
             "<script src=\"/static/app.js\" defer></script>\n",
@@ -162,11 +175,12 @@ fn page(title: &str, main: &str, live: bool) -> String {
 {script}</head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<header class="top"><a class="brand" href="/">amx</a>{status}</header>
+<header class="top"><a class="brand" href="/">amx</a>{status}{me}</header>
 <main id="main"{tag}>{main}</main>
 </body>
 </html>"##,
         title = esc(title),
+        me = viewer_tag(viewer),
     )
 }
 
@@ -175,6 +189,9 @@ fn outcome(f: &Finding) -> Option<(&'static str, String)> {
     let Some(o) = &f.outcome else {
         return f.withdrawn.is_some().then(|| ("closed", "withdrawn".to_string()));
     };
+    if let Some(x) = f.ruled() {
+        return Some(if x.must_fix { ("changes", "must fix".into()) } else { ("closed", "dismissed".into()) });
+    }
     let carried = f.by.is_none();
     Some(match &o.status {
         Status::Confirmed if carried => ("present", "still present".to_string()),
@@ -251,7 +268,7 @@ pub fn timeline(r: &Review) -> Vec<Stage> {
         out.push(stage("Cross-examination", "pending", None));
     }
     let last = match r.phase {
-        Phase::Failed => stage("Failed", "done", finished),
+        Phase::Failed => stage(status(r).1, "done", finished),
         Phase::Done => stage("Consensus result", "done", finished),
         _ => stage("Consensus result", "pending", None),
     };
@@ -316,7 +333,10 @@ fn asked(r: &Review) -> String {
 /// Why a review failed, for its index row and its page, from what happened rather than from the
 /// relay's message to agents.
 fn failure(r: &Review) -> (&'static str, String) {
-    if !r.slots.is_empty() {
+    if let Some(by) = &r.cancelled_by {
+        let by = if by == "the hub owner" { "The hub owner" } else { by };
+        ("cancelled", format!("{by} cancelled it."))
+    } else if !r.slots.is_empty() {
         let who: Vec<&String> = r.slots.iter().map(|s| &s.agent).collect();
         ("reviewers dropped out", format!("All reviewers dropped out: {}.", names(&who)))
     } else if r.offered.is_empty() {
@@ -329,8 +349,11 @@ fn failure(r: &Review) -> (&'static str, String) {
 /// Confirmed blocking and major findings, those the reviewers left undecided, and confirmed minors and nits.
 fn to_do(r: &Review) -> (usize, usize, usize) {
     let (mut fix, mut decide, mut optional) = (0, 0, 0);
-    for o in r.findings.iter().filter_map(|f| f.outcome.as_ref()) {
+    for f in &r.findings {
+        let Some(o) = &f.outcome else { continue };
         match (&o.status, o.severity) {
+            _ if f.ruled().is_some_and(|x| x.must_fix) => fix += 1,
+            _ if f.ruled().is_some() => {}
             (Status::Confirmed, Severity::Blocking | Severity::Major) => fix += 1,
             (Status::Confirmed, _) => optional += 1,
             (Status::Disputed | Status::Unverified, _) => decide += 1,
@@ -349,8 +372,8 @@ fn repliers(r: &Review) -> Vec<&String> {
 }
 
 /// `last` is the newest finished review of the same PR, shown unless this one has a result.
-fn review_row(out: &mut String, r: &Review, last: Option<&Review>, now: Ms) {
-    let what = gist(r);
+fn review_row(out: &mut String, r: &Review, last: Option<&Review>, who_decides: &str, now: Ms) {
+    let what = gist(r, who_decides);
     let (cls, label) = status(r);
     let mut meta = vec![format!("<span class=\"st s-{cls}\">{label}</span>"), esc(&what)];
     if let Some(l) = last.filter(|_| r.phase != Phase::Done) {
@@ -384,7 +407,8 @@ fn availability(online: &[OnlineAgent]) -> String {
 }
 
 /// One flat list, one row per PR, newest request first: rows only move when a review is requested.
-pub fn render_index(st: &State, now: Ms) -> String {
+/// `may`: whether the viewer may act on a review.
+pub fn render_index(st: &State, now: Ms, may: impl Fn(&Review) -> bool) -> String {
     let mut out = String::from("<h1 class=\"sr\">Pull requests</h1>");
     let mut reviews: Vec<&Review> = st.reviews.iter().collect();
     reviews.sort_by_key(|r| std::cmp::Reverse(r.created));
@@ -401,7 +425,7 @@ pub fn render_index(st: &State, now: Ms) -> String {
     } else {
         out.push_str("<ul class=\"reviews\">");
         for r in reviews {
-            review_row(&mut out, r, last(r), now);
+            review_row(&mut out, r, last(r), to_decide(may(r), rereview(&st.reviews, &r.id).is_some()), now);
         }
         out.push_str("</ul>");
     }
@@ -547,7 +571,13 @@ fn agreement(f: &Finding) -> String {
     format!("{agree} of {} agree", agree + disagree)
 }
 
-fn render_finding(out: &mut String, r: &Review, f: &Finding) {
+/// One button of a ruling form; `fid` names it for screen readers.
+fn rule_button(class: &str, value: &str, label: &str, fid: &str) -> String {
+    format!("<button class=\"{class}\" name=\"ruling\" value=\"{value}\">{label}<span class=\"sr\"> {}</span></button>", esc(fid))
+}
+
+/// `rule`: the viewer may rule on this review's open findings now.
+fn render_finding(out: &mut String, r: &Review, f: &Finding, rule: bool) {
     let rank = rank(f);
     let sev = severity(f);
     let disputed = matches!(f.outcome.as_ref().map(|o| &o.status), Some(Status::Disputed | Status::Unverified));
@@ -602,6 +632,23 @@ fn render_finding(out: &mut String, r: &Review, f: &Finding) {
     if let Some(note) = severity_note(f) {
         let _ = write!(out, "<p class=\"facts\">{}</p>", esc(&note));
     }
+    let action = format!("/r/{}/f/{}", esc(&r.id), esc(&f.id));
+    match f.ruled().or(f.ruling.as_ref().filter(|_| f.outcome.is_none())) {
+        Some(x) => {
+            let undo = if rule { format!(" · <form method=\"post\" action=\"{action}\">{}</form>", rule_button("btn", "undo", "Undo", &format!("ruling on {}", f.id))) } else { String::new() };
+            let what = if x.must_fix { "Ruled must fix" } else { "Dismissed" };
+            let _ = write!(out, "<div class=\"facts ruled\">{what} by <b>{}</b>{undo}</div>", esc(&x.by));
+        }
+        None if rule && disputed => {
+            let _ = write!(
+                out,
+                "<form class=\"rule\" method=\"post\" action=\"{action}\"><span class=\"q\">Reviewers didn't settle it. Your call:</span>{}{}</form>",
+                rule_button("btn btn-fix", "must_fix", "Must fix", &f.id),
+                rule_button("btn", "dismiss", "Dismiss", &f.id),
+            );
+        }
+        None => {}
+    }
     if let Some(w) = &f.withdrawn {
         let _ = write!(out, "<p class=\"facts\">Withdrawn: {}</p>", esc(w));
     }
@@ -649,7 +696,7 @@ fn since_link(r: &Review) -> Option<String> {
 }
 
 /// One list in page order: what to fix, what to judge, the optional, then the fixed and dismissed, dimmed.
-fn render_findings(out: &mut String, r: &Review) {
+fn render_findings(out: &mut String, r: &Review, rule: bool) {
     if r.findings.is_empty() {
         return;
     }
@@ -666,7 +713,7 @@ fn render_findings(out: &mut String, r: &Review) {
     if !shown.is_empty() {
         out.push_str("<div class=\"findings\">");
         for (_, f) in shown {
-            render_finding(out, r, f);
+            render_finding(out, r, f, rule);
         }
         out.push_str("</div>");
     }
@@ -676,7 +723,9 @@ fn waiting_for(who: Vec<&String>, to: &str) -> String {
     if who.is_empty() { "Waiting for the deadline".into() } else { format!("Waiting for {} to {to}", names(&who)) }
 }
 
-fn render_verdict(out: &mut String, r: &Review, old: bool, now: Ms) {
+/// `can`: the viewer may cancel it while it runs.
+/// `locked`: a re-review has taken over this review's open findings.
+fn render_verdict(out: &mut String, r: &Review, old: bool, can: bool, locked: bool, now: Ms) {
     let (cls, label) = status(r);
     let detail = match r.phase {
         Phase::Done => {
@@ -687,7 +736,8 @@ fn render_verdict(out: &mut String, r: &Review, old: bool, now: Ms) {
                 parts.push(format!("{fix} to fix"));
             }
             if decide > 0 {
-                parts.push(format!("<span class=\"needs\">{decide} for you to decide</span>"));
+                let what = format!("{decide} {}", to_decide(can, locked));
+                parts.push(if locked { what } else { format!("<span class=\"needs\">{what}</span>") });
             }
             if parts.is_empty() {
                 parts.push(if r.findings.is_empty() { "No findings" } else { "Nothing to fix" }.into());
@@ -709,9 +759,25 @@ fn render_verdict(out: &mut String, r: &Review, old: bool, now: Ms) {
         Phase::Voting(_) if r.replying => esc(&waiting_for(repliers(r), "reply")),
         Phase::Voting(_) => esc(&waiting_for(r.active_slots().filter(|s| !r.owed_votes(&s.agent).is_empty()).map(|s| &s.agent).collect(), "vote")),
     };
+    let cancel = if can && r.phase.active() {
+        let who: Vec<&String> = r.active_slots().map(|s| &s.agent).collect();
+        let stop = match who.len() {
+            0 => "The".to_string(),
+            1 => format!("{} stops, and the", esc(who[0])),
+            _ => format!("{} stop, and the", esc(&names(&who))),
+        };
+        format!(
+            "<details class=\"act\" id=\"cancel\"><summary class=\"btn\"><span class=\"c0\">Cancel review</span><span class=\"c1\">Keep running</span></summary>\
+             <form method=\"post\" action=\"/r/{}/cancel\"><p id=\"cancel-what\">{stop} PR is free for a new review. You can't undo this.</p>\
+             <button class=\"btn btn-fix\" aria-describedby=\"cancel-what\">Cancel review</button></form></details>",
+            esc(&r.id)
+        )
+    } else {
+        String::new()
+    };
     let _ = write!(
         out,
-        "<section class=\"verdict v-{cls}{old}\" aria-label=\"Status\"><p class=\"vt\">{label}</p><p class=\"vd\">{detail}</p><p class=\"vw\">{}</p></section>",
+        "<section class=\"verdict v-{cls}{old}\" aria-label=\"Status\"><p class=\"vt\">{label}</p><p class=\"vd\">{detail}</p><p class=\"vw\">{}</p>{cancel}</section>",
         when(r, now),
         old = if old { " v-old" } else { "" },
     );
@@ -739,6 +805,7 @@ fn render_reviewers(out: &mut String, r: &Review) {
                 format!("<span class=\"badge s-{cls}\">{label}</span>{sha}")
             }
             (None, None) if r.phase == Phase::Offering => "<span class=\"badge s-waiting\">accepted</span>".into(),
+            (None, None) if r.phase == Phase::Failed => "<span class=\"badge s-closed\">stopped</span>".into(),
             (None, None) => "<span class=\"badge s-waiting\">reviewing</span>".into(),
         };
         let summary = s
@@ -752,8 +819,18 @@ fn render_reviewers(out: &mut String, r: &Review) {
     out.push_str("</ul>");
 }
 
-/// A review in a few words, for its index row and the PR's history.
-fn gist(r: &Review) -> String {
+/// Who decides the findings the reviewers left open: the viewer, if they may rule on the review,
+/// else its author; nobody once a re-review has carried them over (`locked`).
+fn to_decide(can: bool, locked: bool) -> &'static str {
+    match (locked, can) {
+        (true, _) => "carried to the re-review",
+        (false, true) => "for you to decide",
+        (false, false) => "for the author to decide",
+    }
+}
+
+/// A review in a few words, for its index row and the PR's history. `who_decides`: from `to_decide`.
+fn gist(r: &Review, who_decides: &str) -> String {
     match r.phase {
         Phase::Offering => format!("{} of {} accepted", r.active_slots().count(), r.params.reviewers),
         Phase::Reviewing => format!("{} of {} submitted", r.active_slots().filter(|s| s.submission.is_some()).count(), r.active_slots().count()),
@@ -764,15 +841,18 @@ fn gist(r: &Review) -> String {
             let done = r.active_slots().filter(|s| r.owed_votes(&s.agent).is_empty() && voted(&s.agent)).count();
             format!("{done} of {} voted", done + owing)
         }
-        Phase::Failed => failure(r).0.into(),
+        Phase::Failed => match &r.cancelled_by {
+            Some(by) => format!("by {by}"),
+            None => failure(r).0.into(),
+        },
         Phase::Done => {
             let (fix, decide, _) = to_do(r);
             match (fix, decide) {
                 (0, 0) if r.findings.is_empty() => "no findings".into(),
                 (0, 0) => "nothing to fix".into(),
                 (f, 0) => format!("{f} to fix"),
-                (0, d) => format!("{d} to decide"),
-                (f, d) => format!("{f} to fix · {d} to decide"),
+                (0, d) => format!("{d} {who_decides}"),
+                (f, d) => format!("{f} to fix · {d} {who_decides}"),
             }
         }
     }
@@ -797,7 +877,7 @@ fn render_newer(out: &mut String, r: &Review, prs: &[Review]) {
     );
 }
 
-fn render_history(out: &mut String, r: &Review, prs: &[Review], now: Ms) {
+fn render_history(out: &mut String, r: &Review, prs: &[Review], may: &dyn Fn(&Review) -> bool, now: Ms) {
     if prs.len() < 2 {
         return;
     }
@@ -812,41 +892,26 @@ fn render_history(out: &mut String, r: &Review, prs: &[Review], now: Ms) {
         let _ = write!(
             out,
             "<li{current}><span class=\"h-id\">{id}</span><span class=\"st s-{cls}\">{label}</span><span class=\"h-gist\">{}</span><span class=\"h-when\">{}</span></li>",
-            esc(&gist(x)),
+            esc(&gist(x, to_decide(may(x), rereview(prs, &x.id).is_some()))),
             when(x, now),
         );
     }
     out.push_str("</ol>");
 }
 
-/// Consensus settings that differ from the defaults, in a few words each.
-fn unusual(r: &Review) -> Vec<String> {
-    let (c, d) = (r.params.consensus, crate::config::Consensus::default());
-    let mut v = Vec::new();
-    if c.vote_rounds != d.vote_rounds {
-        v.push(format!("{} voting round{}", c.vote_rounds, if c.vote_rounds == 1 { "" } else { "s" }));
-    }
-    if c.confirm_fraction != d.confirm_fraction {
-        v.push(format!("confirmed above {:.0}%", c.confirm_fraction * 100.0));
-    }
-    if c.blocking_unanimous != d.blocking_unanimous {
-        v.push("blocking by majority".into());
-    }
-    v
-}
-
 /// The page as seen on the day the review was requested.
 pub fn render_review(r: &Review) -> String {
-    render_review_page(r, &[], r.created)
+    render_review_page(r, &[], r.created, &|_| false)
 }
 
-/// `prs` are all reviews of the same PR, this one included, oldest first.
-pub fn render_review_page(r: &Review, prs: &[Review], now: Ms) -> String {
+/// `prs` are all reviews of the same PR, this one included, oldest first. `may`: whether the
+/// viewer may cancel or rule on a review.
+pub fn render_review_page(r: &Review, prs: &[Review], now: Ms, may: &dyn Fn(&Review) -> bool) -> String {
+    let can = may(r);
     let mut meta = vec![format!("{} by <b>{}</b>", esc(&r.id), esc(&r.author))];
     if let Some(h) = &r.head_sha {
         meta.push(format!("<code>{}</code>", esc(short_sha(h))));
     }
-    meta.extend(unusual(r));
     meta.push(format!("requested {}", time_tag(r.created, now)));
     let mut out = String::new();
     render_newer(&mut out, r, prs);
@@ -858,14 +923,15 @@ pub fn render_review_page(r: &Review, prs: &[Review], now: Ms) -> String {
         short = esc(&r.pr.short()),
         meta = dotted(&meta),
     );
-    render_verdict(&mut out, r, prs.last().is_some_and(|l| l.id != r.id), now);
-    render_findings(&mut out, r);
+    let locked = rereview(prs, &r.id).is_some();
+    render_verdict(&mut out, r, prs.last().is_some_and(|l| l.id != r.id), can, locked, now);
+    render_findings(&mut out, r, can && r.phase == Phase::Done && !locked);
     if !r.note.is_empty() {
-        let _ = write!(out, "<div class=\"note\"><span class=\"note-by\">{}:</span><div class=\"md\" dir=\"auto\">{}</div></div>", esc(&r.author), markdown(&r.note));
+        let _ = write!(out, "<div class=\"note\"><span class=\"note-by\">{}: </span><div class=\"md\" dir=\"auto\">{}</div></div>", esc(&r.author), markdown(&r.note));
     }
     render_discussion(&mut out, r);
     render_reviewers(&mut out, r);
-    render_history(&mut out, r, prs, now);
+    render_history(&mut out, r, prs, may, now);
     render_transcript(&mut out, r);
     out
 }
@@ -993,7 +1059,7 @@ fn list_json(r: &Review, now: Ms) -> Value {
         "ended": r.ended,
         "deadline": r.phase.active().then_some(r.deadline),
         "deadline_left_ms": r.phase.active().then(|| r.deadline_left(now)),
-        "verdict": r.result.as_ref().map(|x| x.verdict),
+        "verdict": r.verdict(),
         "failure": r.failure,
         "parent": r.parent,
         "reviewers": r.slots.iter().map(|s| &s.agent).collect::<Vec<_>>(),
@@ -1003,12 +1069,13 @@ fn list_json(r: &Review, now: Ms) -> Value {
 }
 
 /// The whole review as JSON, with what the page hides before every reviewer has submitted left out.
-pub fn review_json(r: &Review, rereviews: &[String], now: Ms) -> Value {
+pub fn review_json(r: &Review, rereviews: &[String], now: Ms, web: &str) -> Value {
     let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
     let Some(m) = v.as_object_mut() else {
         return v;
     };
     m.remove("next_finding");
+    m.insert("result".into(), json!(r.result_now(web)));
     if !r.revealed() {
         let shown: Vec<Value> = visible(r).filter_map(|f| serde_json::to_value(f).ok()).collect();
         m.insert("findings".into(), Value::Array(shown));
@@ -1052,7 +1119,7 @@ fn rereviews(st: &State, id: &str) -> Vec<String> {
 
 fn siblings(st: &State, r: &Review) -> Vec<Review> {
     let mut v: Vec<Review> = st.reviews.iter().filter(|x| x.pr == r.pr).cloned().collect();
-    v.sort_by_key(|x| x.created);
+    v.sort_by_key(Review::seq);
     v
 }
 
@@ -1093,9 +1160,16 @@ fn no_store(mut r: Response) -> Response {
     r
 }
 
-pub async fn index(AxState(hub): AxState<Arc<Hub>>, who: Option<Extension<Identity>>, headers: HeaderMap) -> Response {
+pub async fn index(
+    AxState(hub): AxState<Arc<Hub>>,
+    who: Option<Extension<Identity>>,
+    owner: Option<Extension<Owner>>,
+    Extension(viewer): Extension<Viewer>,
+    headers: HeaderMap,
+) -> Response {
+    let may = |r: &Review| who.as_ref().is_some_and(|Extension(w)| r.may_act(&w.login, owner.is_some()));
     let (mut main, running, quiet) =
-        hub.read(|s, now| (render_index(s, now), running(s), s.reviews.is_empty() || s.online(now).is_empty()));
+        hub.read(|s, now| (render_index(s, now, may), running(s), s.reviews.is_empty() || s.online(now).is_empty()));
     if let Some(Extension(who)) = who {
         main.push_str(&connect(&hub.web_url(), &who.login, quiet));
     }
@@ -1104,12 +1178,15 @@ pub async fn index(AxState(hub): AxState<Arc<Hub>>, who: Option<Extension<Identi
     if partial(&headers) {
         return fragment(&headers, main);
     }
-    Html(page(&title, &main, true)).into_response()
+    no_store(Html(page(&title, &main, true, &viewer)).into_response())
 }
 
 pub async fn review_page(
     AxState(hub): AxState<Arc<Hub>>,
     Path(id): Path<String>,
+    who: Option<Extension<Identity>>,
+    owner: Option<Extension<Owner>>,
+    Extension(viewer): Extension<Viewer>,
     headers: HeaderMap,
 ) -> Response {
     let Some((r, prs, now)) = hub.read(|s, now| s.review(&id).map(|r| (r.clone(), siblings(s, r), now))) else {
@@ -1117,15 +1194,90 @@ pub async fn review_page(
             "<h1>No review {}</h1><p class=\"empty\">The relay may have restarted. <a href=\"/\">All reviews</a></p>",
             esc(&id)
         );
-        let body = if partial(&headers) { titled("amx", &main) } else { page("amx", &main, false) };
+        let body = if partial(&headers) { titled("amx", &main) } else { page("amx", &main, false, &viewer) };
         return no_store((StatusCode::NOT_FOUND, Html(body)).into_response());
     };
     let title = format!("{} · {}", status(&r).1, r.pr.short());
-    let main = titled(&title, &render_review_page(&r, &prs, now));
+    let may = |r: &Review| who.as_ref().is_some_and(|Extension(w)| r.may_act(&w.login, owner.is_some()));
+    let main = titled(&title, &render_review_page(&r, &prs, now, &may));
     if partial(&headers) {
         return fragment(&headers, main);
     }
-    Html(page(&title, &main, true)).into_response()
+    no_store(Html(page(&title, &main, true, &viewer)).into_response())
+}
+
+/// A refused action, as a page that doesn't poll.
+fn refused(code: StatusCode, id: &str, why: &str, viewer: &Viewer) -> Response {
+    let main = format!("<h1>Not done</h1><p>{}</p><p><a href=\"/r/{1}\">Back to {1}</a></p>", esc(why), esc(id));
+    no_store((code, Html(page("amx", &main, false, viewer))).into_response())
+}
+
+/// Runs a person's action on review `id` (and its finding `fid`) if they may act on it, saves
+/// it, and sends them back to its page. The hub owner is told apart by how the request came.
+fn act(hub: &Hub, id: &str, fid: Option<&str>, who: &Identity, owner: Option<Owner>, viewer: &Viewer, f: impl FnOnce(&mut State, &str, Ms) -> anyhow::Result<()>) -> Response {
+    let has = |r: &Review| r.phase != Phase::Done || fid.is_none_or(|fid| r.findings.iter().any(|f| f.id.eq_ignore_ascii_case(fid.trim())));
+    let Some((rid, may, found)) = hub.read(|s, _| s.review(id).map(|r| (r.id.clone(), r.may_act(&who.login, owner.is_some()), has(r)))) else {
+        return refused(StatusCode::NOT_FOUND, id, &format!("There is no review {id}."), viewer);
+    };
+    if !may {
+        return refused(StatusCode::FORBIDDEN, &rid, "Only the review's author or the hub owner can do this.", viewer);
+    }
+    if !found {
+        return refused(StatusCode::NOT_FOUND, &rid, &format!("{rid} has no finding {}.", fid.unwrap_or("")), viewer);
+    }
+    let by = if owner.is_some_and(|o| o.loopback) { "the hub owner" } else { who.login.split('@').next().unwrap_or("") };
+    match hub.write_saved(|s, now| f(s, by, now)) {
+        Ok(Err(e)) => return refused(StatusCode::CONFLICT, &rid, &format!("{e:#}."), viewer),
+        Err(e) => {
+            tracing::error!("{e:#}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, &rid, "The relay couldn't save it. Try again.", viewer);
+        }
+        Ok(Ok(())) => {}
+    }
+    no_store((StatusCode::SEE_OTHER, [(header::LOCATION, format!("/r/{rid}"))]).into_response())
+}
+
+pub async fn cancel(
+    AxState(hub): AxState<Arc<Hub>>,
+    Path(id): Path<String>,
+    Extension(who): Extension<Identity>,
+    owner: Option<Extension<Owner>>,
+    Extension(viewer): Extension<Viewer>,
+) -> Response {
+    act(&hub, &id, None, &who, owner.map(|Extension(o)| o), &viewer, |s, by, now| match s.review(&id) {
+        Some(r) if r.cancelled_by.is_some() => Ok(()),
+        Some(r) if !r.phase.active() => {
+            let how = match (r.phase, r.verdict()) {
+                (Phase::Done, Some(Verdict::Approve)) => "it was approved",
+                (Phase::Done, _) => "changes were requested",
+                _ => "it failed",
+            };
+            anyhow::bail!("{} had already ended: {how} at {}", r.id, utc(r.ended.unwrap_or(r.created), now))
+        }
+        _ => s.cancel(&id, by, now),
+    })
+}
+
+#[derive(Deserialize)]
+pub struct RuleForm {
+    ruling: String,
+}
+
+pub async fn rule(
+    AxState(hub): AxState<Arc<Hub>>,
+    Path((id, fid)): Path<(String, String)>,
+    Extension(who): Extension<Identity>,
+    owner: Option<Extension<Owner>>,
+    Extension(viewer): Extension<Viewer>,
+    Form(form): Form<RuleForm>,
+) -> Response {
+    let must_fix = match form.ruling.as_str() {
+        "must_fix" => Some(true),
+        "dismiss" => Some(false),
+        "undo" => None,
+        _ => return refused(StatusCode::BAD_REQUEST, &id, "A ruling is must_fix, dismiss or undo.", &viewer),
+    };
+    act(&hub, &id, Some(&fid), &who, owner.map(|Extension(o)| o), &viewer, |s, by, now| s.rule(&id, &fid, by, must_fix, now).map(|_| ()))
 }
 
 pub async fn api_reviews(AxState(hub): AxState<Arc<Hub>>) -> Response {
@@ -1139,7 +1291,7 @@ pub async fn api_reviews(AxState(hub): AxState<Arc<Hub>>) -> Response {
 
 pub async fn api_review(AxState(hub): AxState<Arc<Hub>>, Path(id): Path<String>) -> Response {
     match snapshot(&hub, &id) {
-        Some((r, children, now)) => no_store(Json(review_json(&r, &children, now)).into_response()),
+        Some((r, children, now)) => no_store(Json(review_json(&r, &children, now, &hub.web_url())).into_response()),
         None => (StatusCode::NOT_FOUND, Json(json!({ "error": format!("no review {id}") }))).into_response(),
     }
 }

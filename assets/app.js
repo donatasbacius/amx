@@ -78,7 +78,7 @@
     [].forEach.call(to.attributes, function (a) {
       if (a.name !== keep && el.getAttribute(a.name) !== a.value) el.setAttribute(a.name, a.value);
     });
-    [].slice.call(el.attributes).forEach(function (a) {
+    Array.from(el.attributes).forEach(function (a) {
       if (a.name !== keep && !to.hasAttribute(a.name)) el.removeAttribute(a.name);
     });
     if (keep && !el.amxMine && to.hasAttribute("open")) el.open = el.amxOpen = true;
@@ -88,7 +88,7 @@
   // Children with an id are matched by id, the rest by position.
   function children(el, to) {
     var cur = el.firstChild;
-    [].slice.call(to.childNodes).forEach(function (n) {
+    Array.from(to.childNodes).forEach(function (n) {
       var m = n.id ? document.getElementById(n.id) : cur;
       if (m && m.parentNode === el && m.nodeName === n.nodeName && (m.id || "") === (n.id || "")) {
         if (m === cur) cur = cur.nextSibling;
