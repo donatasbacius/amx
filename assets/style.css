@@ -84,7 +84,7 @@ details[open] > summary > .i { transform: rotate(90deg); }
 }
 .th time, .connect > summary, .more > summary, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role, .note-by { color: var(--muted); }
 .th, .me, .note, .agents, .vbox > summary, .aside, .badge, .st, .connect h3 { font-size: var(--fs-1); line-height: var(--lh-1); }
-.rv-when, .vw, .was, .h-when, .badge, .st, .log time, .me, .agents .role { white-space: nowrap; }
+.rv-when, .vw, .was, .h-when, .badge, .st, .log time, .me { white-space: nowrap; }
 .meta b, .facts b, .et b { color: var(--text); }
 
 .top {
@@ -143,16 +143,16 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .rv-meta { margin-top: 2px; }
 .online { margin: var(--sp-5) 0 0; }
 .online > summary, .connect > summary { padding: var(--sp-2) 0; }
-.agents { columns: 3 15em; column-gap: var(--sp-5); margin-top: var(--sp-2); padding: var(--sp-3) var(--row-x); }
-.agents li { display: flex; gap: var(--sp-2); padding: 3px 0; break-inside: avoid; overflow-wrap: anywhere; }
+.agents { margin-top: var(--sp-2); padding: var(--sp-3) var(--row-x); }
+.agents li { display: flex; flex-wrap: wrap; column-gap: var(--sp-2); padding: 3px 0; overflow-wrap: anywhere; }
 .agents b { min-width: 0; }
-.agents .role { margin-left: auto; }
+.agents .role { margin-left: auto; text-align: right; }
 .connect { margin-top: var(--sp-4); }
 .connect h3 { font-weight: 650; margin: var(--sp-4) 0 var(--sp-2); }
 .connect p, .connect pre { margin: 0 0 var(--sp-2); }
 
 .verdict {
-  display: grid; grid-template: "t w" "d d" "x x" / minmax(0, 1fr) auto;
+  display: grid; grid-template: "t w" "d d" / minmax(0, 1fr) auto;
   gap: 2px var(--sp-4); align-items: baseline;
   background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--bar, var(--line-strong));
   border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); margin: 0 0 var(--sp-2);
@@ -167,7 +167,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .v-waiting, .v-inreview, .v-voting { --bar: var(--run); }
 .v-old { --bar: var(--line-strong); }
 .needs { color: var(--judge-text); font-weight: 600; }
-.act { grid-area: x; margin-top: var(--sp-2); }
+.act { grid-column: 1 / -1; margin-top: var(--sp-2); }
 .act > summary { display: flex; align-items: center; width: fit-content; margin-left: auto; }
 .act[open] .c0, .act:not([open]) .c1 { display: none; }
 .act form { justify-content: end; padding-top: var(--sp-3); border-top: 1px solid var(--line); }
