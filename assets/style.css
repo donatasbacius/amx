@@ -58,22 +58,24 @@ body {
 a { color: var(--link); text-decoration: none; }
 a:hover { text-decoration: underline; }
 b { font-weight: 600; }
-code, pre { font-family: var(--mono); font-size: 0.875em; }
-code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; overflow-wrap: anywhere; }
+code, pre { font-family: var(--mono); font-size: .875em; }
+code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; overflow-wrap: anywhere; }
 pre { background: var(--code-bg); padding: var(--sp-3) var(--sp-4); border-radius: 6px; overflow-x: auto; line-height: 1.45; }
 pre code { background: none; padding: 0; overflow-wrap: normal; }
 :focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-radius: 3px; }
 .skip { position: absolute; left: -9999px; }
 .skip:focus { left: 16px; top: 8px; z-index: 3; background: var(--panel); padding: 4px 8px; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+/* Icons centre on the capitals at any --icon size. */
 .i {
-  width: 1em; height: 1em; flex: none; vertical-align: -0.125em;
+  width: var(--icon, 1em); height: var(--icon, 1em); flex: none;
+  vertical-align: -.125em; vertical-align: calc((1cap - var(--icon, 1em)) / 2);
   fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
 }
 summary { list-style: none; cursor: pointer; }
 summary::-webkit-details-marker { display: none; }
-summary > .i { transition: transform 0.15s; }
-summary > .i:first-child { margin: 0 0.3em 0 -0.3em; }
+summary > .i { transition: transform .15s; }
+summary > .i:first-child { margin: 0 .3em 0 -.3em; }
 details[open] > summary > .i { transform: rotate(90deg); }
 
 /* Relay chrome: small and grey. */
@@ -89,13 +91,13 @@ details[open] > summary > .i { transform: rotate(90deg); }
   display: flex; align-items: center; gap: var(--sp-3);
   max-width: var(--page); margin: 0 auto; padding: var(--sp-4) var(--sp-4) 0;
 }
-.brand { font-weight: 700; font-size: var(--fs-3); line-height: var(--lh-3); color: var(--text); letter-spacing: 0.02em; margin-right: auto; }
+.brand { font-weight: 700; font-size: var(--fs-3); line-height: var(--lh-3); color: var(--text); letter-spacing: .02em; margin-right: auto; }
 .me { overflow: hidden; text-overflow: ellipsis; }
 
 main { max-width: var(--page); margin: 0 auto; padding: 0 var(--sp-4) var(--sp-7); }
 h1 { font-size: var(--fs-4); line-height: var(--lh-4); font-weight: 700; margin: var(--sp-5) 0 var(--sp-1); overflow-wrap: anywhere; }
 h1 a { color: var(--text); }
-h1 .ext { color: var(--muted); font-size: 0.65em; margin-left: 0.3em; }
+h1 .ext { color: var(--muted); --icon: .65em; margin-left: .2em; }
 h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin: var(--sp-6) 0 var(--sp-3); }
 .count { font-weight: 400; margin-left: 2px; }
 .empty { margin: var(--sp-2) 0; }
@@ -103,7 +105,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .md { overflow-wrap: anywhere; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
-.md p { margin: 0 0 0.6em; }
+.md p { margin: 0 0 .6em; }
 .md table { border-collapse: collapse; display: block; overflow-x: auto; }
 .md th, .md td { border: 1px solid var(--line); padding: 3px 8px; }
 .note .md, .talk .md, .connect p { max-width: var(--measure); }
@@ -190,7 +192,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .f[open] > summary { padding-bottom: var(--sp-2); }
 .sev {
   flex: none; width: var(--sev-w); align-self: center; text-align: center;
-  font-size: 11.5px; line-height: 18px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  font-size: 11.5px; line-height: 18px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
   border: 1.5px solid transparent; border-radius: 4px;
 }
 .sev-blocking { background: var(--text); color: var(--panel); }

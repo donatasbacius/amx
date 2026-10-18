@@ -209,6 +209,7 @@ async fn requests_take_the_hubs_rules_and_old_reviews_keep_theirs() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(not(target_os = "linux"), ignore = "binds 127.0.0.2-6, which only Linux routes by default")]
 async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the_slot() {
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 2).await;
@@ -347,6 +348,7 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(not(target_os = "linux"), ignore = "binds 127.0.0.2-6, which only Linux routes by default")]
 async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_the_rereview() {
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 1).await;
@@ -507,6 +509,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(not(target_os = "linux"), ignore = "binds 127.0.0.2-6, which only Linux routes by default")]
 async fn every_page_names_its_viewer_as_tailscale_reports_them_and_is_not_cached() {
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 2).await;
