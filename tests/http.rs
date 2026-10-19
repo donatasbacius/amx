@@ -222,7 +222,7 @@ async fn review_over_mcp_with_long_polls() {
     .await;
     assert!(sub.contains("Submitted 1 finding"), "{sub}");
     let result = ok_tool(&author, "owner-codex", "wait", json!({"timeout_seconds": 5})).await;
-    assert!(result.contains("CHANGES REQUESTED") && result.contains("request_rereview"), "{result}");
+    assert!(result.contains("NEEDS YOUR CALL") && result.contains("only their author vouches for F1: check them against the code yourself"), "a sole reviewer's finding is unverified: {result}");
 
     let page = reqwest::get(format!("{author}/r/r1")).await.unwrap().text().await.unwrap();
     assert!(!page.contains("<script>alert"), "escaped");
