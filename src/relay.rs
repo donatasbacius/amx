@@ -351,7 +351,7 @@ pub enum Status {
     Disputed,
     Duplicate(String),
     Withdrawn,
-    /// Nobody else voted on its current revision; its author's word alone counts only for the sole reviewer.
+    /// Nobody else voted on its current revision, as when it had only one reviewer.
     Unverified,
 }
 
@@ -541,6 +541,12 @@ impl Review {
         self.deadline.saturating_sub(now)
     }
 
+    /// Whether `login` already holds a slot. Other people take one slot each; the author's own
+    /// agents may take any number.
+    fn login_taken(&self, login: &str) -> bool {
+        !self.author_login.eq_ignore_ascii_case(login) && self.active_slots().any(|s| s.login.eq_ignore_ascii_case(login))
+    }
+
     /// Refuses `agent` if its name now belongs to a different login than the one that took part.
     fn check_login(&self, agent: &str, login: &str) -> Result<()> {
         let bound = if self.author == agent {
@@ -577,8 +583,8 @@ impl Review {
 }
 
 /// Merges duplicates, then applies the voting rule to every finding. Only a finding someone other than its author
-/// backs as it stands can be confirmed, unless its author is the `sole` reviewer who submitted.
-pub fn decide(findings: &mut [Finding], c: &Consensus, sole: bool) {
+/// backs as it stands can be confirmed.
+pub fn decide(findings: &mut [Finding], c: &Consensus) {
     let ids: Vec<String> = findings.iter().map(|f| f.id.clone()).collect();
     let rating: BTreeMap<String, Severity> = findings.iter().map(|f| (f.id.clone(), f.severity)).collect();
     let mut merged: BTreeMap<String, String> = BTreeMap::new();
@@ -633,7 +639,7 @@ pub fn decide(findings: &mut [Finding], c: &Consensus, sole: bool) {
             }
         }
         let agree = rated.len();
-        let backed = (sole && f.by.is_some()) || f.current_votes().any(|(_, v)| v.choice != Choice::Disagree);
+        let backed = f.current_votes().any(|(_, v)| v.choice != Choice::Disagree);
         let total = (agree + disagree) as f64;
         let mut severity = f.severity;
         let mut downgraded = false;
@@ -821,12 +827,48 @@ fn valid_sha(s: &str) -> bool {
 /// A finding's line link: printable ASCII under the PR's repository, nothing an HTML attribute or a terminal would act on.
 fn check_url(pr: &PrRef, url: &str) -> Result<String> {
     let url = bounded(url, "finding url", MAX_URL)?;
-    let prefix = format!("https://github.com/{}/{}/", pr.owner, pr.repo);
-    let plain = url.chars().all(|c| c.is_ascii_graphic() && !"\"'<>\\^`{|}".contains(c));
-    if !url.to_ascii_lowercase().starts_with(&prefix) || !plain || url.split(['/', '?', '#']).any(|s| s == "..") {
-        bail!("finding url must be a line link into the PR's repository, e.g. {prefix}blob/<head_sha>/<path>#L<line>");
+    let prefix = format!("https://github.com/{}/{}/blob/", pr.owner, pr.repo);
+    let rest = url.get(prefix.len()..).filter(|_| url[..prefix.len()].eq_ignore_ascii_case(&prefix));
+    let ok = rest.and_then(|rest| {
+        let (path, lines) = match rest.split_once('#') {
+            Some((path, lines)) => (path, Some(lines)),
+            None => (rest, None),
+        };
+        let path = path.strip_suffix("?plain=1").unwrap_or(path);
+        let (sha, path) = path.split_once('/')?;
+        let line = |n: &str| (1..=7).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit());
+        let lines_ok = match lines.map(|l| l.strip_prefix('L')) {
+            None => true,
+            Some(Some(l)) => l.split_once("-L").map_or(line(l), |(a, b)| line(a) && line(b)),
+            Some(None) => false,
+        };
+        (valid_sha(sha) && path.split('/').all(path_part) && lines_ok).then_some(())
+    });
+    if ok.is_none() {
+        bail!("finding url must be a line link into the PR's repository: {prefix}<head_sha>/<path>, optionally with ?plain=1 and #L<line> or #L<from>-L<to>; the path may use letters, digits, %XX escapes and . _ - + @ [ ] ( ) ~ , = !");
     }
     Ok(url)
+}
+
+/// One segment of a file path in a line link: letters (any script), digits, `%XX` escapes and the
+/// punctuation real paths use; no whitespace, `:`, quotes, angle brackets, nor anything that is or
+/// decodes to `.`, `..`, a slash, a backslash or a control character.
+fn path_part(p: &str) -> bool {
+    let mut decoded = Vec::new();
+    let mut cs = p.chars();
+    while let Some(c) = cs.next() {
+        let byte = match c {
+            '%' => cs.next().zip(cs.next()).and_then(|(a, b)| Some((a.to_digit(16)? * 16 + b.to_digit(16)?) as u8)),
+            c if c.is_ascii() => (c.is_ascii_alphanumeric() || "._-+@[]()~,=!".contains(c)).then_some(c as u8),
+            c if c.is_alphanumeric() => Some(b'a'),
+            _ => None,
+        };
+        match byte {
+            Some(b) if !b.is_ascii_control() && b != b'/' && b != b'\\' => decoded.push(b),
+            _ => return false,
+        }
+    }
+    !matches!(decoded.as_slice(), [] | b"." | b"..")
 }
 
 fn need_text(s: &str, what: &str) -> Result<String> {
@@ -1389,6 +1431,8 @@ impl State {
     fn check_picked(&self, author: &str, names: &[String], now: Ms) -> Result<Vec<String>> {
         let mut picked: Vec<String> = Vec::new();
         let mut bad = Vec::new();
+        let author_login = self.login_of(author);
+        let mut logins: Vec<String> = Vec::new();
         for name in names.iter().map(|n| n.trim()) {
             if picked.iter().any(|p| p == name) {
                 continue;
@@ -1398,6 +1442,8 @@ impl State {
                 None => bad.push(format!("{name} (unknown agent)")),
                 Some(_) if !self.agents.online(name, now) => bad.push(format!("{name} (not online)")),
                 Some(a) if a.role != Role::Reviewer => bad.push(format!("{name} (not a reviewer)")),
+                Some(a) if logins.contains(&a.login.to_ascii_lowercase()) => bad.push(format!("{name} (another picked reviewer's Tailscale login)")),
+                Some(a) if !a.login.eq_ignore_ascii_case(&author_login) => logins.push(a.login.to_ascii_lowercase()),
                 Some(_) => {}
             }
             picked.push(name.to_string());
@@ -1437,6 +1483,9 @@ impl State {
         }
         if r.active_slots().count() >= r.params.reviewers {
             bail!("{} already has enough reviewers", r.id);
+        }
+        if r.login_taken(&login) {
+            bail!("another agent of your Tailscale login already reviews {}: each person takes one slot", r.id);
         }
         r.declined.remove(agent);
         r.slots.push(Slot {
@@ -1820,17 +1869,18 @@ impl State {
             .filter(|r| r.phase.active())
             .flat_map(|r| r.active_slots().map(|s| s.agent.clone()))
             .collect();
-        let candidates: Vec<(String, String)> = prev
-            .slots
-            .iter()
-            .filter(|s| {
-                s.active()
-                    && self.agents.online(&s.agent, now)
-                    && !busy.contains(&s.agent)
-                    && self.agents.get(&s.agent).is_some_and(|a| a.role == Role::Reviewer && a.login == s.login)
-            })
-            .map(|s| (s.agent.clone(), s.login.clone()))
-            .collect();
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for s in prev.slots.iter().filter(|s| {
+            s.active()
+                && self.agents.online(&s.agent, now)
+                && !busy.contains(&s.agent)
+                && self.agents.get(&s.agent).is_some_and(|a| a.role == Role::Reviewer && a.login == s.login)
+        }) {
+            let author = s.login.eq_ignore_ascii_case(&r.author_login);
+            if author || !candidates.iter().any(|(_, l)| l.eq_ignore_ascii_case(&s.login)) {
+                candidates.push((s.agent.clone(), s.login.clone()));
+            }
+        }
         r.parent = Some(prev.id.clone());
         r.iteration = prev.iteration + 1;
         r.since_sha = reviewed;
@@ -2043,6 +2093,7 @@ impl State {
                             && !busy.contains(&a.name)
                             && !r.offered.contains(&a.name)
                             && r.slot(&a.name).is_none()
+                            && !r.login_taken(&a.login)
                             && (r.picked.is_empty() || r.picked.contains(&a.name))
                     })
                     .map(|a| a.name.clone())
@@ -2243,8 +2294,7 @@ fn finish(r: &mut Review, agents: &mut Agents, web: &str, now: Ms) {
         return;
     }
     let c = r.params.consensus;
-    let sole = r.slots.iter().filter(|s| s.submission.is_some()).count() == 1;
-    decide(&mut r.findings, &c, sole);
+    decide(&mut r.findings, &c);
     let verdict = verdict_of(&r.findings);
     r.phase = Phase::Done;
     r.ended = Some(now);

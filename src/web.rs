@@ -128,14 +128,19 @@ fn when(r: &Review, now: Ms) -> String {
     }
 }
 
-/// The review's state as a class and label.
-fn status(r: &Review) -> (&'static str, String) {
+/// The review's state as a class and label. An approved review isn't "Approved" while it has
+/// findings for someone to decide, unless a re-review took them over (`locked`); `can`: the
+/// viewer may decide them.
+fn status(r: &Review, locked: bool, can: bool) -> (&'static str, String) {
     match r.phase {
         Phase::Offering => ("waiting", "Waiting for reviewers".into()),
         Phase::Reviewing => ("inreview", "Reviewing".into()),
         Phase::Voting(_) if r.replying => ("voting", "Replying".into()),
         Phase::Voting(1) => ("voting", "Voting".into()),
         Phase::Voting(n) => ("voting", format!("Voting, round {n}")),
+        Phase::Done if r.verdict() == Some(Verdict::Approve) && !locked && to_do(r).1 > 0 => {
+            ("judge", if can { "Needs your call" } else { "Needs the author's call" }.into())
+        }
         Phase::Done if r.verdict() == Some(Verdict::Approve) => ("approved", "Approved".into()),
         Phase::Done => ("changes", "Changes requested".into()),
         Phase::Failed if r.cancelled_by.is_some() => ("failed", "Cancelled".into()),
@@ -268,7 +273,7 @@ pub fn timeline(r: &Review) -> Vec<Stage> {
         out.push(stage("Cross-examination", "pending", None));
     }
     let last = match r.phase {
-        Phase::Failed => stage(status(r).1, "done", finished),
+        Phase::Failed => stage(status(r, false, false).1, "done", finished),
         Phase::Done => stage("Consensus result", "done", finished),
         _ => stage("Consensus result", "pending", None),
     };
@@ -372,12 +377,14 @@ fn repliers(r: &Review) -> Vec<&String> {
 }
 
 /// `last` is the newest finished review of the same PR, shown unless this one has a result.
-fn review_row(out: &mut String, r: &Review, last: Option<&Review>, who_decides: &str, now: Ms) {
-    let what = gist(r, who_decides);
-    let (cls, label) = status(r);
+/// `reviews`: all of them, to tell which are locked by a re-review.
+fn review_row(out: &mut String, r: &Review, last: Option<&Review>, reviews: &[Review], may: &dyn Fn(&Review) -> bool, now: Ms) {
+    let locked = |x: &Review| rereview(reviews, &x.id).is_some();
+    let what = gist(r, may(r), locked(r));
+    let (cls, label) = status(r, locked(r), may(r));
     let mut meta = vec![format!("<span class=\"st s-{cls}\">{label}</span>"), esc(&what)];
     if let Some(l) = last.filter(|_| r.phase != Phase::Done) {
-        meta.push(format!("last: {}", status(l).1.to_lowercase()));
+        meta.push(format!("last: {}", status(l, locked(l), may(l)).1.to_lowercase()));
     }
     meta.push(esc(&r.author));
     let _ = write!(
@@ -425,7 +432,7 @@ pub fn render_index(st: &State, now: Ms, may: impl Fn(&Review) -> bool) -> Strin
     } else {
         out.push_str("<ul class=\"reviews\">");
         for r in reviews {
-            review_row(&mut out, r, last(r), to_decide(may(r), rereview(&st.reviews, &r.id).is_some()), now);
+            review_row(&mut out, r, last(r), &st.reviews, &may, now);
         }
         out.push_str("</ul>");
     }
@@ -640,9 +647,10 @@ fn render_finding(out: &mut String, r: &Review, f: &Finding, rule: bool) {
             let _ = write!(out, "<div class=\"facts ruled\">{what} by <b>{}</b>{undo}</div>", esc(&x.by));
         }
         None if rule && disputed => {
+            let why = if f.outcome.as_ref().is_some_and(|o| o.status == Status::Unverified) { "Nobody else checked it" } else { "Reviewers didn't settle it" };
             let _ = write!(
                 out,
-                "<form class=\"rule\" method=\"post\" action=\"{action}\"><span class=\"q\">Reviewers didn't settle it. Your call:</span>{}{}</form>",
+                "<form class=\"rule\" method=\"post\" action=\"{action}\"><span class=\"q\">{why}. Your call:</span>{}{}</form>",
                 rule_button("btn btn-fix", "must_fix", "Must fix", &f.id),
                 rule_button("btn", "dismiss", "Dismiss", &f.id),
             );
@@ -726,7 +734,7 @@ fn waiting_for(who: Vec<&String>, to: &str) -> String {
 /// `can`: the viewer may cancel it while it runs.
 /// `locked`: a re-review has taken over this review's open findings.
 fn render_verdict(out: &mut String, r: &Review, old: bool, can: bool, locked: bool, now: Ms) {
-    let (cls, label) = status(r);
+    let (cls, label) = status(r, locked, can);
     let detail = match r.phase {
         Phase::Done => {
             let (fix, decide, optional) = to_do(r);
@@ -736,8 +744,8 @@ fn render_verdict(out: &mut String, r: &Review, old: bool, can: bool, locked: bo
                 parts.push(format!("{fix} to fix"));
             }
             if decide > 0 {
-                let what = format!("{decide} {}", to_decide(can, locked));
-                parts.push(if locked { what } else { format!("<span class=\"needs\">{what}</span>") });
+                let what = format!("{decide} {}", to_decide(can, locked, fix));
+                parts.push(if locked || old { what } else { format!("<span class=\"needs\">{what}</span>") });
             }
             if parts.is_empty() {
                 parts.push(if r.findings.is_empty() { "No findings" } else { "Nothing to fix" }.into());
@@ -821,16 +829,17 @@ fn render_reviewers(out: &mut String, r: &Review) {
 
 /// Who decides the findings the reviewers left open: the viewer, if they may rule on the review,
 /// else its author; nobody once a re-review has carried them over (`locked`).
-fn to_decide(can: bool, locked: bool) -> &'static str {
-    match (locked, can) {
-        (true, _) => "carried to the re-review",
-        (false, true) => "for you to decide",
-        (false, false) => "for the author to decide",
+fn to_decide(can: bool, locked: bool, fix: usize) -> &'static str {
+    match (locked, fix, can) {
+        (true, _, _) => "carried to the re-review",
+        (false, 0, _) => "to decide",
+        (false, _, true) => "for you to decide",
+        (false, _, false) => "for the author to decide",
     }
 }
 
-/// A review in a few words, for its index row and the PR's history. `who_decides`: from `to_decide`.
-fn gist(r: &Review, who_decides: &str) -> String {
+/// A review in a few words, for its index row and the PR's history; `can` and `locked` as for `status`.
+fn gist(r: &Review, can: bool, locked: bool) -> String {
     match r.phase {
         Phase::Offering => format!("{} of {} accepted", r.active_slots().count(), r.params.reviewers),
         Phase::Reviewing => format!("{} of {} submitted", r.active_slots().filter(|s| s.submission.is_some()).count(), r.active_slots().count()),
@@ -851,15 +860,17 @@ fn gist(r: &Review, who_decides: &str) -> String {
                 (0, 0) if r.findings.is_empty() => "no findings".into(),
                 (0, 0) => "nothing to fix".into(),
                 (f, 0) => format!("{f} to fix"),
-                (0, d) => format!("{d} {who_decides}"),
-                (f, d) => format!("{f} to fix · {d} {who_decides}"),
+                (f, d) => {
+                    let what = format!("{d} {}", to_decide(can, locked, f));
+                    if f == 0 { what } else { format!("{f} to fix · {what}") }
+                }
             }
         }
     }
 }
 
 /// On an old review, one line naming the PR's latest review and, if that one hasn't finished, the last result.
-fn render_newer(out: &mut String, r: &Review, prs: &[Review]) {
+fn render_newer(out: &mut String, r: &Review, prs: &[Review], may: &dyn Fn(&Review) -> bool) {
     let Some(latest) = prs.last().filter(|l| l.id != r.id) else {
         return;
     };
@@ -867,13 +878,13 @@ fn render_newer(out: &mut String, r: &Review, prs: &[Review]) {
         .iter()
         .filter(|x| x.phase == Phase::Done && latest.phase.active())
         .max_by_key(|x| x.ended)
-        .map(|x| format!("&nbsp;· last result: {}", status(x).1.to_lowercase()))
+        .map(|x| format!("&nbsp;· last result: {}", status(x, rereview(prs, &x.id).is_some(), may(x)).1.to_lowercase()))
         .unwrap_or_default();
     let _ = write!(
         out,
         "<p class=\"newer\">Newer review: <a href=\"/r/{0}\">{0}</a> ({1}){last}</p>",
         esc(&latest.id),
-        status(latest).1.to_lowercase(),
+        status(latest, false, may(latest)).1.to_lowercase(),
     );
 }
 
@@ -888,11 +899,12 @@ fn render_history(out: &mut String, r: &Review, prs: &[Review], may: &dyn Fn(&Re
         } else {
             ("", format!("<a href=\"/r/{0}\">{0}</a>", esc(&x.id)))
         };
-        let (cls, label) = status(x);
+        let locked = rereview(prs, &x.id).is_some();
+        let (cls, label) = status(x, locked, may(x));
         let _ = write!(
             out,
             "<li{current}><span class=\"h-id\">{id}</span><span class=\"st s-{cls}\">{label}</span><span class=\"h-gist\">{}</span><span class=\"h-when\">{}</span></li>",
-            esc(&gist(x, to_decide(may(x), rereview(prs, &x.id).is_some()))),
+            esc(&gist(x, may(x), locked)),
             when(x, now),
         );
     }
@@ -914,7 +926,7 @@ pub fn render_review_page(r: &Review, prs: &[Review], now: Ms, may: &dyn Fn(&Rev
     }
     meta.push(format!("requested {}", time_tag(r.created, now)));
     let mut out = String::new();
-    render_newer(&mut out, r, prs);
+    render_newer(&mut out, r, prs, may);
     let _ = write!(
         out,
         "<h1><a href=\"{url}\" rel=\"noopener noreferrer\" target=\"_blank\">{short}<span class=\"ext\">{EXTERNAL}</span></a></h1>\
@@ -1197,8 +1209,8 @@ pub async fn review_page(
         let body = if partial(&headers) { titled("amx", &main) } else { page("amx", &main, false, &viewer) };
         return no_store((StatusCode::NOT_FOUND, Html(body)).into_response());
     };
-    let title = format!("{} · {}", status(&r).1, r.pr.short());
     let may = |r: &Review| who.as_ref().is_some_and(|Extension(w)| r.may_act(&w.login, owner.is_some()));
+    let title = format!("{} · {}", status(&r, rereview(&prs, &r.id).is_some(), may(&r)).1, r.pr.short());
     let main = titled(&title, &render_review_page(&r, &prs, now, &may));
     if partial(&headers) {
         return fragment(&headers, main);

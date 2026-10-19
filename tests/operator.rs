@@ -90,6 +90,11 @@ impl Hub {
         call(&self.local, agent, tool, args).await
     }
 
+    /// A reviewer: rv2 belongs to another person (stranger@example.com) than rv1 (the owner).
+    async fn reviewer(&self, agent: &str, tool: &str, args: Value) -> String {
+        if agent == "rv2" { call_as(browser("stranger"), &self.tailnet, agent, tool, args).await } else { self.owner(agent, tool, args).await }
+    }
+
     async fn api(&self, id: &str) -> Value {
         reqwest::get(format!("{}/api/reviews/{id}", self.local)).await.unwrap().json().await.unwrap()
     }
@@ -353,27 +358,27 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 1).await;
     for r in ["rv1", "rv2"] {
-        hub.owner(r, "hello", json!({"role": "reviewer"})).await;
+        hub.reviewer(r, "hello", json!({"role": "reviewer"})).await;
     }
     hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 2})).await;
     for r in ["rv1", "rv2"] {
-        hub.owner(r, "accept_review", json!({"review_id": "r1"})).await;
+        hub.reviewer(r, "accept_review", json!({"review_id": "r1"})).await;
     }
     let findings = json!([
         {"severity": "major", "text": "The retry loop has no backoff."},
         {"severity": "minor", "text": "Retries reuse one idempotency key."},
     ]);
-    hub.owner("rv1", "submit_findings", json!({"review_id": "r1", "head_sha": SHA, "verdict": "changes_requested", "findings": findings})).await;
-    hub.owner("rv2", "submit_findings", json!({"review_id": "r1", "head_sha": SHA, "verdict": "approve", "findings": []})).await;
+    hub.reviewer("rv1", "submit_findings", json!({"review_id": "r1", "head_sha": SHA, "verdict": "changes_requested", "findings": findings})).await;
+    hub.reviewer("rv2", "submit_findings", json!({"review_id": "r1", "head_sha": SHA, "verdict": "approve", "findings": []})).await;
     let votes = json!([{"finding": "F1", "vote": "disagree", "reason": "It backs off."}, {"finding": "F2", "vote": "disagree", "reason": "Keys differ."}]);
-    hub.owner("rv2", "vote", json!({"review_id": "r1", "votes": votes})).await;
+    hub.reviewer("rv2", "vote", json!({"review_id": "r1", "votes": votes})).await;
     let r1 = hub.api("r1").await;
     assert_eq!((r1["phase"].as_str(), r1["verdict"].as_str()), (Some("done"), Some("approve")), "{r1}");
     wait_for(&hub.tailnet, "fa", "Review result").await;
 
     let page = hub.page("friend", "r1").await;
     assert!(page.contains("value=\"must_fix\">Must fix<span class=\"sr\"> F1</span>"), "{page}");
-    assert!(page.contains("<span class=\"needs\">2 for you to decide</span>"), "{page}");
+    assert!(page.contains("<p class=\"vt\">Needs your call</p><p class=\"vd\"><span><span class=\"needs\">2 to decide</span>") && page.contains("<title>Needs your call · "), "{page}");
     let index = |who: &'static str, h: Option<&'static str>| {
         let url = format!("{}/", hub.base(who));
         async move {
@@ -382,11 +387,14 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
             req.send().await.unwrap().text().await.unwrap()
         }
     };
-    assert!(index("friend", None).await.contains("<span>2 for you to decide ·</span>"));
-    assert!(index("owner", None).await.contains("<span>2 for you to decide ·</span>"));
-    assert!(hub.page("stranger", "r1").await.contains("<span class=\"needs\">2 for the author to decide</span>"));
-    assert!(index("stranger", None).await.contains("<span>2 for the author to decide ·</span>"));
-    assert!(index("owner", Some("via")).await.contains("<span>2 for the author to decide ·</span>"), "not identified");
+    let yours = "Needs your call</span> ·</span> <span>2 to decide ·</span>";
+    let authors = "Needs the author's call</span> ·</span> <span>2 to decide ·</span>";
+    assert!(index("friend", None).await.contains(yours));
+    assert!(index("owner", None).await.contains(yours));
+    let page = hub.page("stranger", "r1").await;
+    assert!(page.contains("<p class=\"vt\">Needs the author's call</p>") && page.contains("<title>Needs the author&#39;s call · "), "{page}");
+    assert!(index("stranger", None).await.contains(authors));
+    assert!(index("owner", Some("via")).await.contains(authors), "not identified");
     // A cancel that arrives after the review ended says how it ended.
     let (code, body) = hub.post("friend", "/r/r1/cancel", &[]).await;
     assert_eq!(code, StatusCode::CONFLICT, "{body}");
@@ -418,7 +426,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     let ev = wait_for(&hub.tailnet, "fa", "dismissed F2").await;
     assert!(ev.contains("[r1] friend (a human) dismissed F2 (verdict: changes requested).\nNEXT: fix F1, push, then call `request_rereview` with review_id \"r1\"."), "{ev}");
     assert!(!ev.contains("nothing pending"), "{ev}");
-    let said = hub.owner("rv2", "say", json!({"review_id": "r1", "text": "Thanks."})).await;
+    let said = hub.reviewer("rv2", "say", json!({"review_id": "r1", "text": "Thanks."})).await;
     assert!(said.contains("r1"), "{said}");
     let ev = call(&hub.tailnet, "fa", "wait", json!({"timeout_seconds": 2, "progress": true})).await;
     assert!(ev.contains("Thanks.") && ev.contains("NEXT: fix F1, push") && !ev.contains("nothing pending"), "a remark after a ruling: {ev}");
@@ -458,7 +466,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     .await;
     let r1 = hub.api("r1").await;
     assert_eq!((r1["verdict"].as_str(), r1["result"]["verdict"].as_str()), (Some("approve"), Some("approve")), "{r1}");
-    assert!(hub.page("friend", "r1").await.contains("<p class=\"vt\">Approved</p>"));
+    assert!(hub.page("friend", "r1").await.contains("<p class=\"vt\">Needs your call</p>"), "approve, with the reviewers' split left to decide");
     let (code, _) = hub.post("friend", "/r/r1/f/F1", &[("ruling", "must_fix")]).await;
     assert_eq!(code, StatusCode::SEE_OTHER);
     wait_for(&hub.tailnet, "fa", "ruled F1 must fix (verdict: changes requested)").await;
@@ -479,7 +487,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     assert!(status.contains("CHANGES REQUESTED") && !status.contains("APPROVE"), "{status}");
 
     for r in ["rv1", "rv2"] {
-        hub.owner(r, "hello", json!({"role": "reviewer"})).await;
+        hub.reviewer(r, "hello", json!({"role": "reviewer"})).await;
     }
     hub.friend("fa", "request_rereview", json!({"review_id": "r1", "new_head_sha": SHA2, "note": "Added backoff."})).await;
     let page = hub.page("friend", "r2").await;
@@ -500,10 +508,10 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
 
     // The reviewers split on whether it is fixed, so the ruling stands.
     for r in ["rv1", "rv2"] {
-        hub.owner(r, "submit_findings", json!({"review_id": "r2", "head_sha": SHA2, "verdict": "approve", "findings": []})).await;
+        hub.reviewer(r, "submit_findings", json!({"review_id": "r2", "head_sha": SHA2, "verdict": "approve", "findings": []})).await;
     }
-    hub.owner("rv1", "vote", json!({"review_id": "r2", "votes": [{"finding": "C1", "vote": "agree"}]})).await;
-    hub.owner("rv2", "vote", json!({"review_id": "r2", "votes": [{"finding": "C1", "vote": "disagree", "reason": "Fixed."}]})).await;
+    hub.reviewer("rv1", "vote", json!({"review_id": "r2", "votes": [{"finding": "C1", "vote": "agree"}]})).await;
+    hub.reviewer("rv2", "vote", json!({"review_id": "r2", "votes": [{"finding": "C1", "vote": "disagree", "reason": "Fixed."}]})).await;
     assert_eq!(hub.api("r2").await["verdict"], "changes_requested");
     hub.running.stop().await;
 }

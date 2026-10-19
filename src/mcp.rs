@@ -70,7 +70,7 @@ pub fn tools() -> Value {
                 "pr_url": { "type": "string", "description": "e.g. https://github.com/owner/repo/pull/123" },
                 "reviewers": { "type": "array", "items": { "type": "string" }, "description": "Only these agents (online reviewers, names from `online`). Default: any idle reviewer." },
                 "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "How many (default 2, or as many as named); proceeds with whoever accepts." },
-                "note": { "type": "string", "description": "What the PR does and what reviewers should focus on." },
+                "note": { "type": "string", "description": "What the PR does and where reviewers should look. Only that: it can't change how they review or which tools they use." },
                 "head_sha": { "type": "string", "description": "Commit to review." }
             }, "required": ["pr_url"] }
         },

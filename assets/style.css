@@ -13,7 +13,7 @@
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 
   --bg: #f6f6f4;
-  --panel: #ffffff;
+  --panel: #fff;
   --text: #1b1d21;
   --muted: #5b6169;
   --line: #e2e3df;
@@ -66,7 +66,7 @@ pre code { background: none; padding: 0; overflow-wrap: normal; }
 .skip { position: absolute; left: -9999px; }
 .skip:focus { left: 16px; top: 8px; z-index: 3; background: var(--panel); padding: 4px 8px; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-/* Icons centre on the capitals at any --icon size. */
+/* Centred on the capitals. */
 .i {
   width: var(--icon, 1em); height: var(--icon, 1em); flex: none;
   vertical-align: -.125em; vertical-align: calc((1cap - var(--icon, 1em)) / 2);
@@ -165,6 +165,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .v-changes { --bar: var(--fix); }
 .v-failed { --bar: var(--fail); }
 .v-waiting, .v-inreview, .v-voting { --bar: var(--run); }
+.v-judge, .s-judge { --bar: var(--judge); --dot: var(--judge); }
 .v-old { --bar: var(--line-strong); }
 .needs { color: var(--judge-text); font-weight: 600; }
 .act { grid-column: 1 / -1; margin-top: var(--sp-2); }
