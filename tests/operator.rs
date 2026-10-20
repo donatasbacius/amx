@@ -491,7 +491,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     }
     hub.friend("fa", "request_rereview", json!({"review_id": "r1", "new_head_sha": SHA2, "note": "Added backoff."})).await;
     let page = hub.page("friend", "r2").await;
-    assert!(page.contains("<div class=\"note\"><span class=\"note-by\">fa: </span><div class=\"md\" dir=\"auto\"><p>Added backoff.</p>"), "one word space after the colon: {page}");
+    assert!(page.contains("<h2>Discussion <span class=\"count\">1</span></h2><ol class=\"talk\"><li><div class=\"th\"><b>fa</b> <time class=\"clock\"") && page.contains("<p>Added backoff.</p>"), "the note opens the discussion: {page}");
     let all = wait_for(&hub.local, "rv1", "carried from r1/F1").await;
     let task = &all[all.find("[r2] You are assigned again").unwrap()..];
     assert!(task.contains("C1 [major] carried from r1/F1, ruled must fix by friend:"), "{task}");

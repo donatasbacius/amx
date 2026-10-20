@@ -82,8 +82,8 @@ details[open] > summary > .i { transform: rotate(90deg); }
 .live, .meta, .newer, .rv-meta, .rv-when, .vw, .fid, .was, .facts, .h-gist, .h-when, .log li, .rule .q {
   color: var(--muted); font-size: var(--fs-1); line-height: var(--lh-1);
 }
-.th time, .connect > summary, .more > summary, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role, .note-by { color: var(--muted); }
-.th, .me, .note, .agents, .vbox > summary, .aside, .badge, .st, .connect h3 { font-size: var(--fs-1); line-height: var(--lh-1); }
+.th time, .connect > summary, .more > summary, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role { color: var(--muted); }
+.th, .me, .agents, .vbox > summary, .aside, .badge, .st, .connect h3 { font-size: var(--fs-1); line-height: var(--lh-1); }
 .rv-when, .vw, .was, .h-when, .badge, .st, .log time, .me { white-space: nowrap; }
 .meta b, .facts b, .et b { color: var(--text); }
 
@@ -108,7 +108,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .md p { margin: 0 0 .6em; }
 .md table { border-collapse: collapse; display: block; overflow-x: auto; }
 .md th, .md td { border: 1px solid var(--line); padding: 3px 8px; }
-.note .md, .talk .md, .connect p { max-width: var(--measure); }
+.talk .md, .connect p { max-width: var(--measure); }
 
 .badge, .st { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-weight: 600; }
 .badge { padding: 0 9px 0 8px; border-radius: 999px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); }
@@ -179,8 +179,6 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .ruled form { display: inline; }
 .newer { margin: var(--sp-4) 0 0; }
 .newer + h1 { margin-top: var(--sp-2); }
-.note { display: flex; margin: var(--sp-3) 0 0; }
-.note-by { flex: none; font-weight: 600; white-space: pre; }
 .aside { font-weight: 400; margin-left: var(--sp-2); }
 
 .f { scroll-margin-top: var(--sp-4); }
@@ -225,7 +223,8 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .more[open] > summary { margin-bottom: var(--sp-3); }
 .talk > li { padding: var(--sp-3) 0; overflow-wrap: anywhere; }
 .th { display: flex; gap: var(--sp-2); align-items: baseline; }
-.log li { display: grid; grid-template-columns: 4.5em minmax(0, 1fr); gap: var(--sp-3); padding: var(--sp-2) var(--row-x); }
+.log { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: var(--sp-3); }
+.log li { display: grid; grid-column: span 2; grid-template-columns: subgrid; padding: var(--sp-2) var(--row-x); }
 .et { min-width: 0; overflow-wrap: anywhere; }
 .et .md, .et .md > p:first-child { display: inline; }
 .et .md > p:first-child + * { margin-top: var(--sp-1); }
@@ -239,9 +238,6 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
   .meta > span, .rv-meta > span, .vd > span, .online > summary > span { display: inline-block; }
   p a, .aside a, .md a, .agents a { padding-block: 3px; }
   .online > summary, .connect > summary, .more > summary { padding-block: var(--sp-3); }
-  .note { display: block; }
-  .note .md, .note .md > p:first-child { display: inline; }
-  .note .md > p:first-child + * { margin-top: var(--sp-1); }
   .vbox { margin-top: 0; }
   .vbox > summary { min-height: 44px; padding: var(--sp-2) 0 var(--sp-3); margin-bottom: calc(-1 * var(--sp-3)); }
   .history li { position: relative; min-height: 44px; align-items: center; }
@@ -255,7 +251,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
   .f > summary > .fx { grid-area: fx; flex-wrap: wrap; justify-content: end; gap: var(--sp-2); }
   .f > summary > .i { grid-area: chev; }
   .fb { padding: 0 var(--row-x) var(--sp-3); }
-  .log li { gap: var(--sp-2); }
+  .log { column-gap: var(--sp-2); }
   .history li { grid-template: "id st when" "id gist gist" / 2.5em minmax(0, 1fr) auto; row-gap: 0; }
   .h-id { grid-area: id; } .history .st { grid-area: st; } .h-gist { grid-area: gist; } .h-when { grid-area: when; }
 }
