@@ -777,7 +777,7 @@ fn review_page_rewords_only_the_relays_own_log_lines() {
     assert!(r.log.iter().any(|e| e.text == format!("submitted 1 finding(s) at {SHA}")), "{:?}", r.log);
     assert!(r.log.iter().any(|e| e.text == "cross-examination round 1 started"), "{:?}", r.log);
     let page = amx::web::render_review(r);
-    assert!(page.contains("<h2>Discussion <span class=\"count\">1</span></h2>"), "{page}");
+    assert!(page.contains("<h2>Discussion <span class=\"count\">2</span></h2>"), "the note and one message: {page}");
     assert!(page.contains("submitted 1 finding at <code>0123456</code>"), "{page}");
     assert!(page.contains(">Reviewing: rev-a, rev-b<") && page.contains(">Voting<"), "{page}");
     assert!(page.contains(">Result: changes requested<"), "{page}");
@@ -2225,4 +2225,37 @@ fn finding_links_are_plain_line_links() {
         f.url = Some(format!("https://github.com/Rust-Lang/rust/blob/0123456{g}"));
     }
     sim.s.submit("rev-a", &id, sub, sim.now).unwrap();
+}
+
+#[test]
+fn the_authors_note_opens_the_discussion() {
+    let mut sim = setup(&["rev-a"]);
+    let id = sim.request("alice-codex", 1);
+    let at = sim.s.review(&id).unwrap().created;
+    sim.advance(60);
+    let page = amx::web::render_review(sim.s.review(&id).unwrap());
+    let first = format!(
+        "<h2>Discussion <span class=\"count\">1</span></h2><ol class=\"talk\"><li><div class=\"th\"><b>alice-codex</b> <time class=\"clock\" datetime=\"{}\">",
+        amx::text::iso(at).replace(' ', "T")
+    );
+    assert!(page.contains(&first) && page.contains("<p>Adds a cache</p>") && !page.contains("class=\"note"), "{page}");
+    sim.s.say("alice-codex", &id, "On it.", sim.now).unwrap();
+    let page = amx::web::render_review(sim.s.review(&id).unwrap());
+    let (note, said) = (page.find("<p>Adds a cache</p>").unwrap(), page.find("<p>On it.</p>").unwrap());
+    assert!(page.contains("<h2>Discussion <span class=\"count\">2</span></h2>") && note < said, "{page}");
+
+    let mut req = NewReview::new("https://github.com/rust-lang/rust/pull/2");
+    req.reviewers = Some(1);
+    let quiet = sim.s.request_review("alice-codex", req, sim.now).unwrap();
+    assert!(!amx::web::render_review(sim.s.review(&quiet).unwrap()).contains("Discussion"), "no note, no messages");
+}
+
+#[test]
+fn transcript_times_set_one_column_as_wide_as_the_widest() {
+    // The page script turns times into "Oct 17 14:53" or "17. Okt. 14:53" on other days, far wider
+    // than "14:53": the column must fit the widest, the same for every entry.
+    let css = include_str!("../assets/style.css");
+    let log = |sel: &str| css.lines().find(|l| l.starts_with(sel)).unwrap_or_default();
+    assert!(log(".log {").contains("grid-template-columns: auto minmax(0, 1fr)"), "{css}");
+    assert!(log(".log li {").contains("grid-template-columns: subgrid") && !log(".log li {").contains("em minmax"), "{css}");
 }

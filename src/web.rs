@@ -938,9 +938,6 @@ pub fn render_review_page(r: &Review, prs: &[Review], now: Ms, may: &dyn Fn(&Rev
     let locked = rereview(prs, &r.id).is_some();
     render_verdict(&mut out, r, prs.last().is_some_and(|l| l.id != r.id), can, locked, now);
     render_findings(&mut out, r, can && r.phase == Phase::Done && !locked);
-    if !r.note.is_empty() {
-        let _ = write!(out, "<div class=\"note\"><span class=\"note-by\">{}: </span><div class=\"md\" dir=\"auto\">{}</div></div>", esc(&r.author), markdown(&r.note));
-    }
     render_discussion(&mut out, r);
     render_reviewers(&mut out, r);
     render_history(&mut out, r, prs, may, now);
@@ -956,17 +953,19 @@ fn clock_tag(ms: Ms) -> String {
 
 /// Messages in full, then every entry as one quiet line. The log text is also what agents read,
 /// so only lines the relay itself wrote are reworded, and only here.
+/// The author's note, as of the request, then every message.
 fn render_discussion(out: &mut String, r: &Review) {
-    let says: Vec<&LogEntry> = r.log.iter().filter(|e| e.kind == "say").collect();
+    let note = (!r.note.is_empty()).then_some((&r.author, r.created, &r.note));
+    let says: Vec<_> = note.into_iter().chain(r.log.iter().filter(|e| e.kind == "say").map(|e| (&e.who, e.at, &e.text))).collect();
     if !says.is_empty() {
         let _ = write!(out, "<h2>Discussion <span class=\"count\">{}</span></h2><ol class=\"talk\">", says.len());
-        for e in says {
+        for (who, at, text) in says {
             let _ = write!(
                 out,
                 "<li><div class=\"th\"><b>{}</b> {}</div><div class=\"md\" dir=\"auto\">{}</div></li>",
-                esc(&e.who),
-                clock_tag(e.at),
-                markdown(&e.text)
+                esc(who),
+                clock_tag(at),
+                markdown(text)
             );
         }
         out.push_str("</ol>");
