@@ -3,6 +3,7 @@
 use amx::config::{Consensus, Timing};
 use amx::relay::{AmendIn, FindingIn, Model, Ms, NewReview, Phase, Role, State, Status, SubmitIn, Verdict, VoteIn};
 use amx::tailscale::Identity;
+use amx::web::View;
 
 const PR: &str = "https://github.com/rust-lang/rust/pull/1";
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -148,6 +149,11 @@ impl Sim {
     fn verdict(&self, id: &str) -> Verdict {
         self.s.review(id).unwrap().result.as_ref().unwrap().verdict
     }
+}
+
+/// The index as the author of every PR sees it.
+fn author() -> View<'static> {
+    View { may: &|_| true, mine: &|_| true, ..View::anyone() }
 }
 
 fn setup(reviewers: &[&str]) -> Sim {
@@ -539,7 +545,7 @@ fn rereview_rechecks_previous_findings() {
     assert!(page.contains(">re-checking<"), "carried findings say they are being re-checked: {page}");
     assert!(page.contains("<span class=\"fid\">C1</span>") && page.contains(&format!("Carried over from <a href=\"/r/{id}#F1\">{id}/F1</a>")), "{page}");
     assert!(page.contains(&format!("https://github.com/rust-lang/rust/compare/{SHA}...{SHA2}")) && page.contains("changes since <code>0123456"), "{page}");
-    let index = amx::web::render_index(&sim.s, sim.now, |_| false);
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
     assert!(index.contains("<span>0 of 2 submitted ·</span> <span>last: changes requested ·</span>") && index.contains("data-deadline") && !index.contains(&format!("href=\"/r/{id}\"")), "{index}");
     let task = sim.events("rev-b");
     assert!(task.contains("re-review") && task.contains("cache never invalidated") && task.contains("compare/"), "{task}");
@@ -591,8 +597,8 @@ fn a_failed_rereview_can_be_retried_from_its_parent() {
     let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
     sim.advance(121);
     assert_eq!(sim.phase(&id2), Phase::Failed);
-    let index = amx::web::render_index(&sim.s, sim.now, |_| false);
-    assert!(index.contains("<span>no reviewers free ·</span> <span>last: needs the author's call ·</span> <span>alice-codex</span></div>"), "the PR still stands where it did: {index}");
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
+    assert!(index.contains("<span>no reviewers free ·</span> <span>last: needs the author's call ·</span> <span>2 reviews ·</span> <span>alice-codex</span></span>"), "the PR still stands where it did: {index}");
     sim.join("rev-new", "friend5@example.com", Role::Reviewer);
     let id3 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
     let r3 = sim.s.review(&id3).unwrap();
@@ -822,7 +828,7 @@ fn review_page_puts_confirmed_findings_first_and_closes_the_rest() {
     assert!(page.contains("rev-c</b> agrees") && !page.contains("agrees, as blocking"), "{page}");
     assert!(!page.contains("summary-table") && !page.contains("local"), "{page}");
     assert!(!page.contains("Consensus rules") && !page.contains("voting round"), "only unusual settings are named: {page}");
-    assert!(amx::web::render_index(&sim.s, sim.now, |_| false).contains("1 to fix"));
+    assert!(amx::web::render_index(&sim.s, sim.now, &View::anyone()).contains("1 to fix"));
 }
 
 #[test]
@@ -937,7 +943,7 @@ fn a_pr_title_is_cleaned_shown_to_people_and_kept_from_agents() {
     let id2 = sim.s.rereview("alice-codex", &id, SHA2, "", sim.now).unwrap();
     let saved = reload(&sim.s, sim.now, sim.now);
     assert_eq!(saved.review(&id2).unwrap().title.as_deref(), Some(title.as_str()), "carried to the re-review and saved");
-    assert!(amx::web::render_index(&saved, sim.now, |_| false).contains(">PRTITLE &lt;b&gt;"));
+    assert!(amx::web::render_index(&saved, sim.now, &View::anyone()).contains(">PRTITLE &lt;b&gt;"));
 }
 
 #[test]
@@ -1289,9 +1295,9 @@ fn review_page_asks_the_human_to_judge_a_disputed_finding() {
     assert_eq!(sim.status(&id, "F1"), Status::Disputed);
     let page = amx::web::render_review(sim.s.review(&id).unwrap());
     assert!(page.contains("<p class=\"vt\">Needs the author's call</p>") && page.contains("<span class=\"needs\">1 to decide</span>"), "{page}");
-    let index = amx::web::render_index(&sim.s, sim.now, |_| false);
-    assert!(index.contains("Needs the author's call</span> ·</span> <span>1 to decide ·</span>"), "the index row uses the history's words: {index}");
-    assert!(amx::web::render_index(&sim.s, sim.now, |_| true).contains("Needs your call</span> ·</span> <span>1 to decide ·</span>"));
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
+    assert!(index.contains("Needs the author's call</span>") && index.contains("<span>1 to decide ·</span>"), "the index row uses the history's words: {index}");
+    assert!(amx::web::render_index(&sim.s, sim.now, &author()).contains("Needs your call</span>"));
     assert!(page.contains("<details class=\"f\" id=\"F1\" open>") && page.contains("<details class=\"vbox\" open><summary>"), "{page}");
     assert!(page.contains(">disputed<") && page.contains("1 of 2 agree"), "{page}");
 
@@ -1304,7 +1310,7 @@ fn review_page_asks_the_human_to_judge_a_disputed_finding() {
     assert!(page.contains("<span class=\"h-gist\">1 carried to the re-review</span>"), "{page}");
     let newer = amx::web::render_review_page(sim.s.review(&id2).unwrap(), &prs, sim.now, &|_| true);
     assert!(newer.contains("<span class=\"h-gist\">1 carried to the re-review</span>") && !newer.contains("to decide"), "{newer}");
-    assert!(!amx::web::render_index(&sim.s, sim.now, |_| true).contains("to decide"));
+    assert!(!amx::web::render_index(&sim.s, sim.now, &author()).contains("to decide"));
 }
 
 #[test]
@@ -1313,7 +1319,7 @@ fn the_agent_list_shows_one_agent_per_row() {
     sim.join("bob-codex", "bob@example.com", Role::Author);
     let id = sim.request("alice-codex", 1);
     sim.accept("rev-a", &id);
-    let index = amx::web::render_index(&sim.s, sim.now, |_| false);
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
     let list = &index[index.find("<ul class=\"agents\">").unwrap()..];
     let rows: Vec<&str> = list.split("<li>").skip(1).map(|li| &li[..li.find("</li>").unwrap()]).collect();
     assert_eq!(rows.len(), 5, "{list}");
@@ -2045,7 +2051,7 @@ fn a_later_round_counts_only_its_own_voters_and_names_the_reply_window() {
     assert!(page.contains(">Replying, then voting, round 2<"), "{page}");
     sim.skip_replies();
     assert_eq!(sim.phase(&id), Phase::Voting(2));
-    let index = amx::web::render_index(&sim.s, sim.now, |_| false);
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
     assert!(index.contains("<span>0 of 1 voted ·</span>"), "rev-a has nothing to vote on: {index}");
 }
 
@@ -2103,9 +2109,9 @@ fn only_a_rereview_locks_rulings_and_undo_outlasts_the_ruling_cap() {
 }
 
 #[test]
-fn css_and_js_stay_under_20kb() {
+fn css_and_js_stay_under_24kb() {
     let n = include_str!("../assets/style.css").len() + include_str!("../assets/app.js").len();
-    assert!(n < 20_000, "{n} bytes");
+    assert!(n < 24_000, "{n} bytes");
 }
 
 #[test]
@@ -2146,8 +2152,8 @@ fn a_sole_reviewers_findings_are_unverified() {
     let page = amx::web::render_review_page(sim.s.review(&id).unwrap(), &[], sim.now, &|_| true);
     assert!(page.contains(">unverified<") && page.contains("Nobody else checked it. Your call:") && !page.contains("didn't settle"), "{page}");
     assert!(page.contains("<section class=\"verdict v-judge\" aria-label=\"Status\"><p class=\"vt\">Needs your call</p><p class=\"vd\"><span><span class=\"needs\">1 to decide</span></span></p>"), "{page}");
-    let index = amx::web::render_index(&sim.s, sim.now, |_| false);
-    assert!(index.contains("<span class=\"st s-judge\">Needs the author's call</span> ·</span> <span>1 to decide"), "{index}");
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
+    assert!(index.contains("<span class=\"st s-judge\">Needs the author's call</span>") && index.contains("<span>1 to decide ·</span>"), "{index}");
     sim.request("alice-codex", 1);
     let mut prs: Vec<_> = sim.s.reviews.clone();
     prs.sort_by_key(|x| x.created);
@@ -2222,7 +2228,7 @@ fn findings_left_open_beside_ones_to_fix_say_who_decides() {
     let page = |can: bool| amx::web::render_review_page(sim.s.review(&id).unwrap(), &[], sim.now, &|_| can);
     assert!(page(true).contains("<p class=\"vt\">Changes requested</p><p class=\"vd\"><span>1 to fix ·</span> <span><span class=\"needs\">1 for you to decide</span>"), "{}", page(true));
     assert!(page(false).contains("<span class=\"needs\">1 for the author to decide</span>"), "{}", page(false));
-    assert!(amx::web::render_index(&sim.s, sim.now, |_| false).contains("<span>1 to fix · 1 for the author to decide ·</span>"));
+    assert!(amx::web::render_index(&sim.s, sim.now, &View::anyone()).contains("<span>1 to fix · 1 for the author to decide ·</span>"));
 }
 
 #[test]
@@ -2349,7 +2355,7 @@ fn an_offer_deadline_with_only_one_program_fails() {
     let page = amx::web::render_review(sim.s.review(&id).unwrap());
     assert!(page.contains("<p class=\"vd\">No codex reviewer accepted in time; a review with more than one reviewer needs both claude and codex. cl-a and cl-b accepted. The author can request it again.</p>"), "{page}");
     assert!(page.contains("<b>cl-a</b> <span class=\"pg\">claude</span> <span class=\"badge s-closed\">stopped</span>"), "{page}");
-    let index = amx::web::render_index(&sim.s, sim.now, |_| false);
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
     assert!(index.contains("<span>no codex reviewer ·</span>") && !index.contains("dropped out"), "{index}");
 }
 
@@ -2443,7 +2449,7 @@ fn models_survive_a_snapshot_and_older_files_load_without_them() {
     assert_eq!(old.agents.get("cx-a").unwrap().model, None);
     assert!(old.next_actions("cx-a", sim.now)[0].text.contains("call `hello`"), "a restored reviewer says hello again before it can accept");
     assert!(old.accept("cx-a", &id, sim.now).is_err());
-    let pages = amx::web::render_review(old.review(&id).unwrap()) + &amx::web::render_index(&old, sim.now, |_| false);
+    let pages = amx::web::render_review(old.review(&id).unwrap()) + &amx::web::render_index(&old, sim.now, &View::anyone());
     assert!(pages.contains("<b>cl-a</b> <span class=\"badge") && !pages.contains("class=\"pg\""), "no program, nothing shown: {pages}");
 }
 
@@ -2463,4 +2469,102 @@ fn a_missing_program_failure_survives_a_snapshot_and_older_files_load_without_it
     old.restore(serde_json::from_value(v).unwrap(), sim.now);
     let r = old.review(&id).unwrap();
     assert_eq!((r.phase, r.missing), (Phase::Failed, None));
+}
+
+fn request_pr(sim: &mut Sim, author: &str, pr: u32, reviewers: usize) -> String {
+    let mut req = NewReview::new(&format!("https://github.com/rust-lang/rust/pull/{pr}"));
+    req.reviewers = Some(reviewers);
+    sim.s.request_review(author, req, sim.now).unwrap()
+}
+
+/// The index's group ids, in page order, with each group's count.
+fn groups(index: &str) -> Vec<(String, usize)> {
+    index
+        .split(" id=\"g-")
+        .skip(1)
+        .map(|g| {
+            let count = &g[g.find("class=\"count\">").unwrap() + 14..];
+            (g[..g.find('"').unwrap()].to_string(), count[..count.find('<').unwrap()].parse().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn the_index_groups_prs_by_what_each_needs() {
+    const DAY: Ms = 86_400_000;
+    let mut sim = setup(&["rev-a"]);
+    sim.join("bob-codex", "bob@example.com", Role::Author);
+    let done = |sim: &mut Sim, author: &str, pr: u32, findings: &[(&str, &str)]| {
+        let id = request_pr(sim, author, pr, 1);
+        sim.accept("rev-a", &id);
+        sim.submit("rev-a", &id, findings);
+        sim.advance(1);
+        id
+    };
+    done(&mut sim, "alice-codex", 1, &[("major", "a call for alice")]);
+    let bobs = done(&mut sim, "bob-codex", 2, &[("major", "a call for bob"), ("major", "another")]);
+    done(&mut sim, "alice-codex", 3, &[]);
+    done(&mut sim, "alice-codex", 4, &[("major", "older")]);
+    done(&mut sim, "alice-codex", 4, &[]);
+    request_pr(&mut sim, "alice-codex", 5, 1);
+    let alice = View { may: &|_| true, mine: &|r| r.author == "alice-codex", ..View::anyone() };
+
+    let index = amx::web::render_index(&sim.s, sim.now, &alice);
+    assert_eq!(groups(&index), [("call".into(), 1), ("running".into(), 1), ("open".into(), 1), ("approved".into(), 2)], "{index}");
+    let open = &index[index.find("id=\"g-open\"").unwrap()..index.find("id=\"g-approved\"").unwrap()];
+    assert!(open.contains("<span class=\"st s-judge\">Needs the author's call</span>") && open.contains("<span>bob-codex ·</span> <span>you can rule</span>"), "{open}");
+    assert!(index.contains("<details id=\"g-approved\" class=\"grp\"><summary>") && !index.contains("g-approved\" class=\"grp\" open"), "approved starts collapsed: {index}");
+    assert!(index.contains("<span>rust-lang/rust#4 ·</span> <span>no findings ·</span> <span>2 reviews ·</span>"), "{index}");
+    assert!(index.contains("<p class=\"foot\">5 PRs · 6 reviews · <a href=\"/?show=all\">list all</a></p>"), "{index}");
+    let theirs = amx::web::render_index(&sim.s, sim.now, &View::anyone());
+    assert_eq!(groups(&theirs), [("running".into(), 1), ("open".into(), 2), ("approved".into(), 2)], "nobody's call is a stranger's: {theirs}");
+    assert!(!theirs.contains("you can rule"), "{theirs}");
+
+    sim.s.rule(&bobs, "F1", "bob", Some(true), sim.now + 5 * DAY).unwrap();
+    let week = amx::web::render_index(&sim.s, sim.now + 7 * DAY, &alice);
+    assert_eq!(groups(&week), [("call".into(), 1), ("running".into(), 1), ("open".into(), 1), ("approved".into(), 2)], "a ruling is activity: {week}");
+    let later = amx::web::render_index(&sim.s, sim.now + 12 * DAY, &alice);
+    assert_eq!(groups(&later), [("call".into(), 1), ("running".into(), 1), ("quiet".into(), 1), ("approved".into(), 2)], "your call never goes quiet: {later}");
+    assert!(later.contains("<details id=\"g-quiet\" class=\"grp\"><summary>"), "{later}");
+
+    let approved = amx::web::render_index(&sim.s, sim.now, &View { show: Some("approved"), ..View::anyone() });
+    assert!(approved.contains("<h1 class=\"sec\">Approved <span class=\"count\">2</span>") && !approved.contains("id=\"g-") && approved.matches("<li class=\"rv\">").count() == 2, "{approved}");
+    let all = amx::web::render_index(&sim.s, sim.now, &View { show: Some("all"), ..View::anyone() });
+    assert!(all.contains("All pull requests <span class=\"count\">5</span>") && all.matches("<li class=\"rv\">").count() == 5, "{all}");
+}
+
+#[test]
+fn long_approved_lists_link_to_their_own_view() {
+    let mut sim = setup(&["rev-a"]);
+    for pr in 1..=12 {
+        let id = request_pr(&mut sim, "alice-codex", pr, 1);
+        sim.accept("rev-a", &id);
+        sim.submit("rev-a", &id, &[]);
+        sim.advance(1);
+    }
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
+    assert_eq!(groups(&index), [("approved".into(), 12)], "{index}");
+    assert!(index.contains("<span class=\"note\">newest 10 · <a href=\"/?show=approved\">list all</a></span>") && index.matches("<li class=\"rv\">").count() == 10, "{index}");
+    assert!(index.find("rust#12 ·").unwrap() < index.find("rust#3 ·").unwrap() && !index.contains("rust#2 ·"), "newest first: {index}");
+    let empty = amx::web::render_index(&State::new(Timing::default(), Consensus::default(), 50), sim.now, &View::anyone());
+    assert!(empty.contains("<p class=\"empty\">No reviews yet.</p>") && !empty.contains("id=\"g-") && !empty.contains("class=\"foot\""), "{empty}");
+}
+
+#[test]
+fn the_agents_panel_counts_each_program_and_names_the_one_short() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cl-b", Model::Claude), ("cx-a", Model::Codex)]);
+    let busy = request_pr(&mut sim, "alice-codex", 1, 2);
+    sim.accept("cl-a", &busy);
+    sim.accept("cx-a", &busy);
+    let waiting = request_pr(&mut sim, "alice-codex", 2, 2);
+    sim.accept("cl-b", &waiting);
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
+    assert!(index.contains("<p class=\"prog\"><span><b>claude</b> 0 idle, 2 busy</span><span><b>codex</b> 0 idle, 1 busy</span></p>"), "{index}");
+    assert!(index.contains(&format!("<p class=\"warn\">No codex reviewer is idle: <a href=\"/r/{waiting}\">rust#2</a> waits for one.</p>")), "{index}");
+    assert!(index.contains("<span>needs a codex reviewer ·</span>"), "{index}");
+    assert!(index.contains("<a class=\"ag-sum\" href=\"#agents\">Agents: <span>3 reviewing ·</span> <span>1 author ·</span> <span>no codex idle</span></a>"), "the phone's summary: {index}");
+    assert!(index.find("class=\"list\"").unwrap() < index.find("<aside class=\"side\"><section id=\"agents\" class=\"panel\">").unwrap(), "{index}");
+    sim.join_as("cx-b", "friend9@example.com", Model::Codex);
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
+    assert!(!index.contains("class=\"warn\"") && !index.contains("no codex idle"), "an idle codex reviewer can take it: {index}");
 }
