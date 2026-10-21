@@ -218,7 +218,7 @@ async fn requests_take_the_hubs_rules_and_old_reviews_keep_theirs() {
 async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the_slot() {
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 2).await;
-    hub.owner("rv", "hello", json!({"role": "reviewer"})).await;
+    hub.owner("rv", "hello", json!({"role": "reviewer", "model": "claude"})).await;
     hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 1, "title": "Drop the <v1> export"})).await;
     for n in 2..=5 {
         hub.friend("fa", "request_review", json!({"pr_url": pr(n), "count": 1})).await;
@@ -343,7 +343,7 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     assert!(index.contains("Drop the &lt;v1&gt; export<span class=\"sr\">, Cancelled</span>") && index.contains("example-org/demo#2</span>") && index.contains(">Pull request #2<span") && index.contains("Cancelled</span> ·</span> <span>by friend ·</span>"), "{index}");
     assert_eq!(hub.api("r1").await["title"], "Drop the <v1> export");
     assert_eq!(hub.api("r1").await["timeline"].as_array().unwrap().last().unwrap()["name"], "Cancelled");
-    assert!(page.contains("<b>rv</b> <span class=\"badge s-closed\">stopped</span>") && !page.contains(">reviewing<"), "{page}");
+    assert!(page.contains("<b>rv</b> <span class=\"pg\">claude</span> <span class=\"badge s-closed\">stopped</span>") && !page.contains(">reviewing<"), "{page}");
     assert!(hub.page("owner", "r2").await.contains("The hub owner cancelled it."));
     let r1 = hub.api("r1").await;
     assert_eq!((r1["phase"].as_str(), r1["cancelled_by"].as_str()), (Some("failed"), Some("friend")));
@@ -359,8 +359,8 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
 async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_the_rereview() {
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 1).await;
-    for r in ["rv1", "rv2"] {
-        hub.reviewer(r, "hello", json!({"role": "reviewer"})).await;
+    for (r, model) in [("rv1", "claude"), ("rv2", "codex")] {
+        hub.reviewer(r, "hello", json!({"role": "reviewer", "model": model})).await;
     }
     hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 2})).await;
     for r in ["rv1", "rv2"] {
@@ -488,8 +488,8 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     let status = hub.friend("fa", "review_status", json!({"review_id": "r1"})).await;
     assert!(status.contains("CHANGES REQUESTED") && !status.contains("APPROVE"), "{status}");
 
-    for r in ["rv1", "rv2"] {
-        hub.reviewer(r, "hello", json!({"role": "reviewer"})).await;
+    for (r, model) in [("rv1", "claude"), ("rv2", "codex")] {
+        hub.reviewer(r, "hello", json!({"role": "reviewer", "model": model})).await;
     }
     hub.friend("fa", "request_rereview", json!({"review_id": "r1", "new_head_sha": SHA2, "note": "Added backoff."})).await;
     let page = hub.page("friend", "r2").await;

@@ -1,5 +1,5 @@
 use crate::hub::Hub;
-use crate::relay::Role;
+use crate::relay::{Model, Role};
 use crate::tailscale::Identity;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Query, Request, State};
@@ -466,10 +466,14 @@ fn held(hub: &Hub, who: &Identity, name: &str) -> Result<bool, String> {
     Ok(holders().any(|(_, s)| s.live(online)))
 }
 
-/// The role a call gives its session: `hello`'s, or author for a review request.
+/// The role a call gives its session: `hello`'s (a reviewer's only with its model), or author for a review request.
 fn role_given(msg: &Value) -> Option<Role> {
     match msg["params"]["name"].as_str().filter(|_| msg["method"] == "tools/call")? {
-        "hello" => Role::parse(msg["params"]["arguments"]["role"].as_str()?),
+        "hello" => {
+            let a = &msg["params"]["arguments"];
+            let role = Role::parse(a["role"].as_str()?)?;
+            (role == Role::Author || a["model"].as_str().and_then(Model::parse).is_some()).then_some(role)
+        }
         "request_review" | "request_rereview" => Some(Role::Author),
         _ => None,
     }

@@ -1,5 +1,5 @@
 use crate::hub::Hub;
-use crate::relay::{Choice, Finding, LogEntry, Ms, OnlineAgent, Phase, Review, Role, Severity, State, Status, Verdict, rereview};
+use crate::relay::{Choice, Finding, LogEntry, Model, Ms, OnlineAgent, Phase, Review, Role, Severity, State, Status, Verdict, rereview};
 use crate::text::{bidi, iso, phase_badge, short_sha, split_range, split_rates};
 use axum::extract::{Form, Path, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -337,18 +337,26 @@ fn asked(r: &Review) -> String {
 
 /// Why a review failed, for its index row and its page, from what happened rather than from the
 /// relay's message to agents.
-fn failure(r: &Review) -> (&'static str, String) {
+fn failure(r: &Review) -> (String, String) {
+    let who: Vec<&String> = r.slots.iter().map(|s| &s.agent).collect();
     if let Some(by) = &r.cancelled_by {
         let by = if by == "the hub owner" { "The hub owner" } else { by };
-        ("cancelled", format!("{by} cancelled it."))
-    } else if !r.slots.is_empty() {
-        let who: Vec<&String> = r.slots.iter().map(|s| &s.agent).collect();
-        ("reviewers dropped out", format!("All reviewers dropped out: {}.", names(&who)))
+        ("cancelled".into(), format!("{by} cancelled it."))
+    } else if let Some(m) = r.missing.map(|m| m.as_str()) {
+        let why = format!("No {m} reviewer accepted in time; a review with more than one reviewer needs both claude and codex. {} accepted.", names(&who));
+        (format!("no {m} reviewer"), why)
+    } else if !who.is_empty() {
+        ("reviewers dropped out".into(), format!("All reviewers dropped out: {}.", names(&who)))
     } else if r.offered.is_empty() {
-        ("no reviewers free", "No reviewers were free.".into())
+        ("no reviewers free".into(), "No reviewers were free.".into())
     } else {
-        ("nobody accepted", format!("Nobody accepted in time. {}", asked(r)))
+        ("nobody accepted".into(), format!("Nobody accepted in time. {}", asked(r)))
     }
+}
+
+/// The program a reviewer runs in, after its name.
+fn program(m: Option<Model>) -> String {
+    m.map(|m| format!(" <span class=\"pg\">{}</span>", m.as_str())).unwrap_or_default()
 }
 
 /// Confirmed blocking and major findings, those the reviewers left undecided, and confirmed minors and nits.
@@ -475,7 +483,8 @@ pub fn render_index(st: &State, now: Ms, may: impl Fn(&Review) -> bool) -> Strin
             (None, Role::Reviewer) => "idle".into(),
             (None, Role::Author) => "author".into(),
         };
-        let _ = write!(out, "<li><b>{}</b><span class=\"role\">{what}</span></li>", esc(&a.name));
+        let model = a.model.filter(|_| a.role == Role::Reviewer);
+        let _ = write!(out, "<li><b>{}</b>{}<span class=\"role\">{what}</span></li>", esc(&a.name), program(model));
     }
     out.push_str("</ul></details>");
     out
@@ -495,7 +504,7 @@ fn connect(url: &str, login: &str, open: bool) -> String {
          <h3>Codex</h3><p>In <code>~/.codex/config.toml</code>, replace any <code>[mcp_servers.amx]</code> table with:</p><pre><code>{toml}</code></pre>\
          <h3>Then</h3><p>Agents are named <code>{claude}</code> and <code>{codex}</code>; a second session becomes <code>{claude}-2</code>. \
          To pick a name, use <code>{u}/mcp?agent=NAME</code>.</p>\
-         <p>To make a reviewer, tell the agent: \u{201c}Call amx hello with role reviewer, then loop on amx wait and do what it says.\u{201d}</p>\
+         <p>To make a reviewer, tell the agent: \u{201c}Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\u{201d}</p>\
          <p>For everyone on a repo, commit this as <code>.mcp.json</code> (Claude Code), or the table above as <code>.codex/config.toml</code> (Codex):</p>\
          <pre><code>{json}</code></pre></details>",
         open = if open { " open" } else { "" },
@@ -840,7 +849,7 @@ fn render_reviewers(out: &mut String, r: &Review) {
             .filter(|x| !x.summary.is_empty() && r.revealed())
             .map(|x| format!("<div class=\"md\" dir=\"auto\">{}</div>", markdown(&x.summary)))
             .unwrap_or_default();
-        let _ = write!(out, "<li><div class=\"who\"><b>{}</b> {state}</div>{summary}</li>", esc(&s.agent));
+        let _ = write!(out, "<li><div class=\"who\"><b>{}</b>{} {state}</div>{summary}</li>", esc(&s.agent), program(s.model));
     }
     out.push_str("</ul>");
 }
@@ -870,7 +879,7 @@ fn gist(r: &Review, can: bool, locked: bool) -> String {
         }
         Phase::Failed => match &r.cancelled_by {
             Some(by) => format!("by {by}"),
-            None => failure(r).0.into(),
+            None => failure(r).0,
         },
         Phase::Done => {
             let (fix, decide, _) = to_do(r);

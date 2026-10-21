@@ -596,10 +596,11 @@ pub fn online(agents: &[OnlineAgent], me: &str) -> String {
     for a in agents {
         let _ = writeln!(
             s,
-            "- {}{} ({}, {} on {}) — {}",
+            "- {}{} ({}{}, {} on {}) — {}",
             a.name,
             if a.name == me { " (you)" } else { "" },
             a.role.as_str(),
+            a.model.filter(|_| a.role == Role::Reviewer).map(|m| format!(", {}", m.as_str())).unwrap_or_default(),
             a.login,
             a.node,
             match &a.busy {
@@ -623,7 +624,7 @@ pub fn instructions(role: Option<Role>) -> String {
     let role_text = match role {
         Some(Role::Reviewer) => "Your role is reviewer: loop on `wait` forever. When it returns, do exactly what its NEXT line says (accept an offer, review the PR and submit_findings, vote, ...), then call `wait` again. Never end your turn while a review is in progress.",
         Some(Role::Author) => "Your role is author: call `request_review` with a PR URL, then `wait` until the consolidated result arrives. Fix confirmed findings, push, and `request_rereview`.",
-        None => "Reviewers call `hello` with role \"reviewer\", then loop on `wait` forever, doing exactly what each NEXT line says; never end your turn while a review is in progress. Authors call `request_review` with a PR URL, then `wait` for the consolidated result.",
+        None => "Reviewers call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program they run in), then loop on `wait` forever, doing exactly what each NEXT line says; never end your turn while a review is in progress. Authors call `request_review` with a PR URL, then `wait` for the consolidated result.",
     };
     format!(
         "amx is a relay where coding agents review each other's GitHub pull requests. {role_text} \
@@ -667,7 +668,7 @@ pub fn setup(url: &str, login: &str) -> String {
          Codex: in ~/.codex/config.toml, replace any [mcp_servers.amx] table with\n\n{}\n\n\
          Agents are named {claude} and {codex}; a second session becomes {claude}-2. To pick a name, use {url}/mcp?agent=NAME.\n\
          For everyone on a repo, commit {} as .mcp.json (Claude Code), or the table above as .codex/config.toml (Codex).\n\n\
-         Reviewers: tell the agent \"Call amx hello with role reviewer, then loop on amx wait and do what it says.\"\n",
+         Reviewers: tell the agent \"Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\"\n",
         claude_add(url),
         codex_toml(url),
         mcp_json(url),
@@ -702,7 +703,7 @@ mod tests {
              Agents are named sam-claude and sam-codex; a second session becomes sam-claude-2. To pick a name, use http://relay:7341/mcp?agent=NAME.\n\
              For everyone on a repo, commit {\"mcpServers\": {\"amx\": {\"type\": \"http\", \"url\": \"http://relay:7341/mcp\"}}} \
              as .mcp.json (Claude Code), or the table above as .codex/config.toml (Codex).\n\n\
-             Reviewers: tell the agent \"Call amx hello with role reviewer, then loop on amx wait and do what it says.\"\n"
+             Reviewers: tell the agent \"Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\"\n"
         );
     }
 

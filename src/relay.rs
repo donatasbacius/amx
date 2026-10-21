@@ -45,6 +45,7 @@ const AGENTS_PER_LOGIN: usize = 20;
 const MAX_AGENTS: usize = 200;
 const MAX_FINDINGS: usize = 60;
 const FORGET_AGENT_MS: Ms = 24 * 3600 * 1000;
+const NO_MODEL: &str = "call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program you run in) before you can take reviews.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +125,33 @@ impl Role {
     }
 }
 
+/// The agent program a reviewer says it runs in; self-reported, so it can't be checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Model {
+    Claude,
+    Codex,
+}
+
+impl Model {
+    pub const ALL: [Model; 2] = [Model::Claude, Model::Codex];
+
+    pub fn parse(s: &str) -> Option<Model> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(Model::Claude),
+            "codex" => Some(Model::Codex),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Model::Claude => "claude",
+            Model::Codex => "codex",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub seq: u64,
@@ -174,6 +202,8 @@ pub struct Agent {
     pub user_id: u64,
     pub node: String,
     pub role: Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Model>,
     pub first_seen: Ms,
     pub last_seen: Ms,
     /// Requests blocked in `wait` for this agent.
@@ -317,6 +347,8 @@ pub struct Submission {
 pub struct Slot {
     pub agent: String,
     pub login: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Model>,
     pub joined: Ms,
     pub dropped: Option<String>,
     pub submission: Option<Submission>,
@@ -460,6 +492,9 @@ pub struct Review {
     pub replied: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled_by: Option<String>,
+    /// The program the review failed for want of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing: Option<Model>,
 }
 
 impl Review {
@@ -550,6 +585,26 @@ impl Review {
     /// agents may take any number.
     fn login_taken(&self, login: &str) -> bool {
         !self.author_login.eq_ignore_ascii_case(login) && self.active_slots().any(|s| s.login.eq_ignore_ascii_case(login))
+    }
+
+    /// The program a review of two or more reviewers has none of yet; it needs both.
+    pub fn missing_model(&self) -> Option<Model> {
+        if self.params.reviewers < 2 {
+            return None;
+        }
+        Model::ALL.into_iter().find(|m| !self.active_slots().any(|s| s.model == Some(*m)))
+    }
+
+    /// Whether a reviewer running `model` may take a slot: none may without one, and the last slot
+    /// is kept for the program the review still lacks.
+    pub fn fits(&self, model: Option<Model>) -> bool {
+        model.is_some_and(|m| self.lacks(m).is_none())
+    }
+
+    /// The program the review would be left without if a `model` reviewer took the next slot.
+    fn lacks(&self, model: Model) -> Option<Model> {
+        let open = self.params.reviewers.saturating_sub(self.active_slots().count() + 1);
+        self.missing_model().filter(|m| *m != model && open == 0)
     }
 
     /// Refuses `agent` if its name now belongs to a different login than the one that took part.
@@ -797,6 +852,7 @@ pub struct OnlineAgent {
     pub login: String,
     pub node: String,
     pub role: Role,
+    pub model: Option<Model>,
     pub busy: Option<String>,
     pub idle_ms: Ms,
 }
@@ -1032,6 +1088,7 @@ impl State {
             user_id: who.user_id,
             node: who.node.clone(),
             role: role.unwrap_or(Role::Author),
+            model: None,
             first_seen: now,
             last_seen: now,
             waiting: 0,
@@ -1106,6 +1163,13 @@ impl State {
         Ok(())
     }
 
+    /// Records the program a reviewer says it runs in.
+    pub fn set_model(&mut self, name: &str, model: Model) {
+        if let Some(a) = self.agents.map.get_mut(name) {
+            a.model = Some(model);
+        }
+    }
+
     fn login_of(&self, name: &str) -> String {
         self.agents.get(name).map(|a| a.login.clone()).unwrap_or_default()
     }
@@ -1140,6 +1204,7 @@ impl State {
                 login: a.login.clone(),
                 node: a.node.clone(),
                 role: a.role,
+                model: a.model,
                 busy: self.busy_with(&a.name).map(|r| r.id.clone()),
                 idle_ms: self.agents.silent_ms(&a.name, now),
             })
@@ -1243,7 +1308,17 @@ impl State {
         let mut out = Vec::new();
         let idle = self.busy_with(name).is_none();
         let reviewer = self.agents.get(name).is_some_and(|a| a.role == Role::Reviewer);
+        let model = self.agents.get(name).and_then(|a| a.model);
         let mut offers = 0;
+        if reviewer && idle && model.is_none() {
+            out.push(Action {
+                review: String::new(),
+                urgent: true,
+                text: NO_MODEL.to_string(),
+                task: None,
+                short: None,
+            });
+        }
         for r in self.reviews.iter().filter(|r| r.phase.active()) {
             let left = text::dur(r.deadline_left(now));
             let id = &r.id;
@@ -1317,6 +1392,7 @@ impl State {
                 && !r.declined.contains(name)
                 && reviewer
                 && idle
+                && r.fits(model)
             {
                 offers += 1;
                 if offers <= OFFERS_SHOWN {
@@ -1399,6 +1475,12 @@ impl State {
         if !(1..=5).contains(&reviewers) {
             bail!("the number of reviewers must be between 1 and 5");
         }
+        if reviewers >= 2 && !picked.is_empty() {
+            let models: BTreeSet<Model> = picked.iter().filter_map(|p| self.agents.get(p)?.model).collect();
+            if let Some(m) = Model::ALL.into_iter().find(|m| !models.contains(m)) {
+                bail!("none of the reviewers you named is a {} reviewer: a review with more than one reviewer needs both claude and codex; call `online` to see who runs which", m.as_str());
+            }
+        }
         let t = self.timing;
         let params = ReviewParams {
             reviewers,
@@ -1437,6 +1519,7 @@ impl State {
             replying: false,
             replied: BTreeSet::new(),
             cancelled_by: None,
+            missing: None,
         };
         let from = if r.picked.is_empty() { String::new() } else { format!(" from {}", r.picked.join(", ")) };
         r.log(now, author, "request", format!("requested {reviewers} reviewer(s){from}. {}", r.note));
@@ -1458,6 +1541,7 @@ impl State {
                 None => bad.push(format!("{name} (unknown agent)")),
                 Some(_) if !self.agents.online(name, now) => bad.push(format!("{name} (not online)")),
                 Some(a) if a.role != Role::Reviewer => bad.push(format!("{name} (not a reviewer)")),
+                Some(a) if a.model.is_none() => bad.push(format!("{name} (hasn't said whether it is claude or codex)")),
                 Some(a) if logins.contains(&a.login.to_ascii_lowercase()) => bad.push(format!("{name} (another picked reviewer's Tailscale login)")),
                 Some(a) if !a.login.eq_ignore_ascii_case(&author_login) => logins.push(a.login.to_ascii_lowercase()),
                 Some(_) => {}
@@ -1473,6 +1557,7 @@ impl State {
     pub fn accept(&mut self, agent: &str, id: &str, now: Ms) -> Result<()> {
         let busy = self.busy_with(agent).map(|r| r.id.clone());
         let role = self.agents.get(agent).map(|a| a.role);
+        let model = self.agents.get(agent).and_then(|a| a.model);
         let login = self.login_of(agent);
         let r = self.review_mut(id)?;
         r.check_login(agent, &login)?;
@@ -1503,10 +1588,17 @@ impl State {
         if r.login_taken(&login) {
             bail!("another agent of your Tailscale login already reviews {}: each person takes one slot", r.id);
         }
+        let Some(model) = model else {
+            bail!("call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program you run in) first");
+        };
+        if let Some(m) = r.lacks(model) {
+            bail!("{} still needs a {} reviewer: a review with more than one reviewer has both claude and codex. Call `wait`", r.id, m.as_str());
+        }
         r.declined.remove(agent);
         r.slots.push(Slot {
             agent: agent.to_string(),
             login,
+            model: Some(model),
             joined: now,
             dropped: None,
             submission: None,
@@ -1886,7 +1978,7 @@ impl State {
             .filter(|r| r.phase.active())
             .flat_map(|r| r.active_slots().map(|s| s.agent.clone()))
             .collect();
-        let mut candidates: Vec<(String, String)> = Vec::new();
+        let mut candidates: Vec<(String, String, Model)> = Vec::new();
         for s in prev.slots.iter().filter(|s| {
             s.active()
                 && self.agents.online(&s.agent, now)
@@ -1894,8 +1986,11 @@ impl State {
                 && self.agents.get(&s.agent).is_some_and(|a| a.role == Role::Reviewer && a.login == s.login)
         }) {
             let author = s.login.eq_ignore_ascii_case(&r.author_login);
-            if author || !candidates.iter().any(|(_, l)| l.eq_ignore_ascii_case(&s.login)) {
-                candidates.push((s.agent.clone(), s.login.clone()));
+            let model = self.agents.get(&s.agent).and_then(|a| a.model);
+            if let Some(model) = model
+                && (author || !candidates.iter().any(|(_, l, _)| l.eq_ignore_ascii_case(&s.login)))
+            {
+                candidates.push((s.agent.clone(), s.login.clone(), model));
             }
         }
         r.parent = Some(prev.id.clone());
@@ -1922,10 +2017,14 @@ impl State {
                 ruling: f.ruled().cloned(),
             });
         }
-        for (agent, login) in candidates.into_iter().take(r.params.reviewers) {
+        for (agent, login, model) in candidates {
+            if r.slots.len() >= r.params.reviewers || !r.fits(Some(model)) {
+                continue;
+            }
             r.slots.push(Slot {
                 agent: agent.clone(),
                 login,
+                model: Some(model),
                 joined: now,
                 dropped: None,
                 submission: None,
@@ -2111,6 +2210,7 @@ impl State {
                             && !r.offered.contains(&a.name)
                             && r.slot(&a.name).is_none()
                             && !r.login_taken(&a.login)
+                            && r.fits(a.model)
                             && (r.picked.is_empty() || r.picked.contains(&a.name))
                     })
                     .map(|a| a.name.clone())
@@ -2121,8 +2221,14 @@ impl State {
                     changed = true;
                 }
                 let n = r.active_slots().count();
-                if n >= r.params.reviewers || (now >= r.deadline && n > 0) {
+                let missing = r.missing_model();
+                if n >= r.params.reviewers || (now >= r.deadline && n > 0 && missing.is_none()) {
                     start_reviewing(r, agents, now);
+                    return true;
+                }
+                if let Some(m) = missing.filter(|_| now >= r.deadline && n > 0) {
+                    r.missing = Some(m);
+                    fail(r, agents, &format!("no {} reviewer accepted before the offer deadline, and a review with more than one reviewer needs both claude and codex", m.as_str()), now);
                     return true;
                 }
                 if now >= r.deadline {
