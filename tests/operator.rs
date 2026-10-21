@@ -340,7 +340,7 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     assert!(page.contains("<title>Cancelled · Drop the &lt;v1&gt; export</title>") && page.contains("<p class=\"vt\">Cancelled</p>"), "{page}");
     assert!(page.contains("friend cancelled it. The author can request it again.") && !page.contains("id=\"cancel\""), "{page}");
     let index = browser("friend").get(format!("{}/", hub.tailnet)).send().await.unwrap().text().await.unwrap();
-    assert!(index.contains("Drop the &lt;v1&gt; export<span class=\"sr\">, Cancelled</span>") && index.contains("example-org/demo#2</span>") && index.contains(">Pull request #2<span") && index.contains("Cancelled</span> ·</span> <span>by friend ·</span>"), "{index}");
+    assert!(index.contains("Drop the &lt;v1&gt; export<span class=\"sr\">, Cancelled</span>") && index.contains("<span class=\"st s-failed\">Cancelled</span>") && index.contains(">Pull request #2<span") && index.contains("<span>example-org/demo#1 ·</span> <span>by friend ·</span>"), "{index}");
     assert_eq!(hub.api("r1").await["title"], "Drop the <v1> export");
     assert_eq!(hub.api("r1").await["timeline"].as_array().unwrap().last().unwrap()["name"], "Cancelled");
     assert!(page.contains("<b>rv</b> <span class=\"pg\">claude</span> <span class=\"badge s-closed\">stopped</span>") && !page.contains(">reviewing<"), "{page}");
@@ -389,10 +389,11 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
             req.send().await.unwrap().text().await.unwrap()
         }
     };
-    let yours = "Needs your call</span> ·</span> <span>2 to decide ·</span>";
-    let authors = "Needs the author's call</span> ·</span> <span>2 to decide ·</span>";
+    let yours = "<section id=\"g-call\" class=\"grp\"><h2 class=\"sec\">Needs your call <span class=\"count\">1</span></h2><ul class=\"reviews\"><li class=\"rv\"><span class=\"st s-judge\">Needs your call</span>";
+    let authors = "<span class=\"st s-judge\">Needs the author's call</span>";
     assert!(index("friend", None).await.contains(yours));
-    assert!(index("owner", None).await.contains(yours));
+    let owner = index("owner", None).await;
+    assert!(owner.contains(authors) && owner.contains("<span>fa ·</span> <span>you can rule</span>") && !owner.contains("g-call"), "the owner's own PRs only: {owner}");
     let page = hub.page("stranger", "r1").await;
     assert!(page.contains("<p class=\"vt\">Needs the author's call</p>") && page.contains("<title>Needs the author&#39;s call · "), "{page}");
     assert!(index("stranger", None).await.contains(authors));

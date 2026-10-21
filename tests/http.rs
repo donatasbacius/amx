@@ -247,7 +247,7 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
         ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
     }
     let index = get("/").await.unwrap().text().await.unwrap();
-    assert!(index.contains("<span>2 reviewing ·</span> <span>1 author</span></summary>") && index.contains("on <a href=\"/r/r1\">rust#1</a>"), "{index}");
+    assert!(index.contains("Agents: <span>2 reviewing ·</span> <span>1 author</span></a>") && index.contains("on <a href=\"/r/r1\">rust#1</a>"), "{index}");
     let finding = json!([{"severity":"major","text":"SECRET until revealed\nsecond line"}]);
     ok_tool(&base, "rev-a", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","summary":"PRIVATE","findings":finding})).await;
 
@@ -289,9 +289,9 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     assert!(page.contains("<li aria-current=\"page\"><span class=\"h-id\"><b>r1</b>") && page.contains("<a href=\"/r/r3\">r3</a></span>"), "{page}");
     let index = get("/").await.unwrap().text().await.unwrap();
     assert!(page.contains("<span class=\"h-gist\">0 of 1 accepted</span>"), "the history says what the index row says: {page}");
-    assert!(index.contains("<span>0 of 1 accepted ·</span> <span>last: changes requested ·</span> <span>author</span>") && !index.contains("href=\"/r/r1\""), "one row per PR: {index}");
+    assert!(index.contains("<span>0 of 1 accepted ·</span> <span>last: changes requested ·</span> <span>2 reviews ·</span> <span>author</span>") && !index.contains("href=\"/r/r1\""), "one row per PR: {index}");
     assert!(index.contains("<title>amx · 2 running</title>") && index.contains("#2<span class=\"sr\">, Waiting for reviewers</span></a>"), "{index}");
-    assert!(index.contains("<span>2 reviewers idle ·</span> <span>1 author</span></summary>"), "zero counts left out: {index}");
+    assert!(index.contains("<span>2 reviewers idle ·</span> <span>1 author</span></a>"), "zero counts left out: {index}");
 
     let missing = get("/api/reviews/r9").await.unwrap();
     assert_eq!(missing.status(), 404);
@@ -359,8 +359,8 @@ async fn setup() {
     assert_eq!(reqwest::get(format!("{base}/api/hook/stop?agent=rev")).await.unwrap().status(), 404);
     let page = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
     assert!(page.contains("Connect an agent</summary>") && page.contains("claude mcp add"), "{page}");
-    assert!(page.contains("Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait"), "{page}");
-    assert!(page.contains("No agents online") && page.contains("<details id=\"connect\" class=\"connect\" open>"), "open while nobody is online: {page}");
+    assert!(page.contains("local-claude</code> and <code>local-codex</code>. <a href=\"/setup\">Full setup</a>"), "the rest is on /setup: {page}");
+    assert!(page.contains("No agents online") && page.contains("<details id=\"connect\" class=\"side-d connect\" open>"), "open while nobody is online: {page}");
     assert!(page.contains("<span class=\"sr\">Viewing on </span>This machine</span></header>"), "--no-tailnet: {page}");
     assert!(!page.contains(">local<") && !page.contains("Viewing as"), "its placeholder login is never shown: {page}");
     relay.running.stop().await;
