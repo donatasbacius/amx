@@ -94,7 +94,7 @@ Add to `CLAUDE.md` / `AGENTS.md`:
 ```markdown
 ## Reviews over amx
 To get a pull request reviewed by other agents, push it, then call the amx `request_review`
-tool with the PR URL and a short note on what to focus on (to choose reviewers, pass their
+tool with the PR URL, its title and a short note on what to focus on (to choose reviewers, pass their
 agent names from `online` as `reviewers`). Call `wait` until the result
 arrives (it starts with "Review result"). Fix confirmed findings (and disputed ones you
 agree with), check unverified ones against the code yourself, push, then call

@@ -21,6 +21,8 @@ const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_WAIT_BYTES: usize = 64 * 1024;
 /// Characters in each text an agent sends (see `bounded`); longer ones are refused.
 const MAX_NOTE: usize = 8000;
+/// GitHub's own limit.
+const MAX_TITLE: usize = 256;
 const MAX_SAY: usize = 4000;
 const MAX_FINDING: usize = 2000;
 const MAX_REASON: usize = 1000;
@@ -427,6 +429,9 @@ pub struct Review {
     pub author: String,
     pub author_login: String,
     pub note: String,
+    /// The PR's title as the author agent gave it, for people only: never in agents' text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub params: ReviewParams,
     pub created: Ms,
     pub ended: Option<Ms>,
@@ -692,6 +697,7 @@ pub fn verdict_of(findings: &[Finding]) -> Verdict {
 pub struct NewReview {
     pub pr_url: String,
     pub note: String,
+    pub title: Option<String>,
     pub head_sha: Option<String>,
     pub reviewers: Option<usize>,
     /// Offer only to these agents; `reviewers` then defaults to how many there are.
@@ -703,6 +709,7 @@ impl NewReview {
         NewReview {
             pr_url: pr_url.into(),
             note: String::new(),
+            title: None,
             head_sha: None,
             reviewers: None,
             picked: Vec::new(),
@@ -887,6 +894,14 @@ fn bounded(s: &str, what: &str, max: usize) -> Result<String> {
         bail!("{what} is {n} characters; at most {max} are allowed, so be more concise");
     }
     Ok(s.to_string())
+}
+
+/// One line of at most `MAX_TITLE` characters, without control or bidi characters; `None` if empty.
+fn one_line(s: &str) -> Option<String> {
+    let s: String = s.chars().filter(|&c| !text::bidi(c)).map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s: String = s.chars().take(MAX_TITLE).collect();
+    (!s.is_empty()).then(|| s.trim_end().to_string())
 }
 
 fn finding_size(text: &str, url: Option<&str>) -> usize {
@@ -1400,6 +1415,7 @@ impl State {
             author: author.to_string(),
             author_login: login,
             note: bounded(&req.note, "note", MAX_NOTE)?,
+            title: req.title.as_deref().and_then(one_line),
             params,
             created: now,
             ended: None,
@@ -1858,6 +1874,7 @@ impl State {
             .or(prev.head_sha.clone());
         let mut req = NewReview::new(&prev.pr.url());
         req.note = note.to_string();
+        req.title = prev.title.clone();
         req.head_sha = Some(head_sha.to_string());
         req.reviewers = Some(prev.params.reviewers);
         let mut r = self.new_review(author, req, now)?;

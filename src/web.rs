@@ -389,13 +389,31 @@ fn review_row(out: &mut String, r: &Review, last: Option<&Review>, reviews: &[Re
     meta.push(esc(&r.author));
     let _ = write!(
         out,
-        "<li class=\"rv\"><div class=\"rv-top\"><a class=\"rv-pr\" href=\"/r/{id}\">{pr}<span class=\"sr\">, {label}</span></a>\
-         <span class=\"rv-when\">{}</span></div><div class=\"rv-meta\">{meta}</div></li>",
+        "<li class=\"rv\"><div class=\"rv-top\"><span class=\"ref\">{short}</span><span class=\"rv-when\">{}</span></div>\
+         <a class=\"rv-pr\" href=\"/r/{id}\" dir=\"auto\">{pr}<span class=\"sr\">, {label}</span></a><div class=\"rv-meta\">{meta}</div></li>",
         when(r, now),
         id = esc(&r.id),
-        pr = esc(&r.pr.short()),
+        short = esc(&r.pr.short()),
+        pr = esc(&pr_name(r)),
         meta = dotted(&meta),
     );
+}
+
+/// The PR's title, else "Pull request #123" under its `owner/repo#123`.
+fn pr_name(r: &Review) -> String {
+    r.title.clone().unwrap_or_else(|| format!("Pull request #{}", r.pr.number))
+}
+
+/// The PR's title cut at a word to fit a browser tab, else its short form.
+fn tab_name(r: &Review) -> String {
+    match &r.title {
+        Some(t) if t.chars().count() > 60 => {
+            let cut: String = t.chars().take(56).collect();
+            format!("{}…", cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head).trim_end())
+        }
+        Some(t) => t.clone(),
+        None => r.pr.short(),
+    }
 }
 
 /// "10 reviewers idle · 6 reviewing · 2 authors", leaving out the parts that are zero.
@@ -929,10 +947,11 @@ pub fn render_review_page(r: &Review, prs: &[Review], now: Ms, may: &dyn Fn(&Rev
     render_newer(&mut out, r, prs, may);
     let _ = write!(
         out,
-        "<h1><a href=\"{url}\" rel=\"noopener noreferrer\" target=\"_blank\">{short}<span class=\"ext\">{EXTERNAL}</span></a></h1>\
+        "<h1><span class=\"ref\">{short}</span><a href=\"{url}\" rel=\"noopener noreferrer\" target=\"_blank\" dir=\"auto\">{name}<span class=\"ext\">{EXTERNAL}</span></a></h1>\
          <p class=\"meta\">{meta}</p>",
         url = esc(&r.pr.url()),
         short = esc(&r.pr.short()),
+        name = esc(&pr_name(r)),
         meta = dotted(&meta),
     );
     let locked = rereview(prs, &r.id).is_some();
@@ -1061,6 +1080,7 @@ fn list_json(r: &Review, now: Ms) -> Value {
         "id": r.id,
         "pr": r.pr.url(),
         "repo": r.pr.short(),
+        "title": r.title,
         "author": r.author,
         "phase": phase_badge(r.phase),
         "round": r.round(),
@@ -1209,7 +1229,7 @@ pub async fn review_page(
         return no_store((StatusCode::NOT_FOUND, Html(body)).into_response());
     };
     let may = |r: &Review| who.as_ref().is_some_and(|Extension(w)| r.may_act(&w.login, owner.is_some()));
-    let title = format!("{} · {}", status(&r, rereview(&prs, &r.id).is_some(), may(&r)).1, r.pr.short());
+    let title = format!("{} · {}", status(&r, rereview(&prs, &r.id).is_some(), may(&r)).1, tab_name(&r));
     let main = titled(&title, &render_review_page(&r, &prs, now, &may));
     if partial(&headers) {
         return fragment(&headers, main);

@@ -79,7 +79,7 @@ summary > .i:first-child { margin: 0 .3em 0 -.3em; }
 details[open] > summary > .i { transform: rotate(90deg); }
 
 /* Relay chrome: small and grey. */
-.live, .meta, .newer, .rv-meta, .rv-when, .vw, .fid, .was, .facts, .h-gist, .h-when, .log li, .rule .q {
+.live, .meta, .newer, .ref, .rv-meta, .rv-when, .vw, .fid, .was, .facts, .h-gist, .h-when, .log li, .rule .q {
   color: var(--muted); font-size: var(--fs-1); line-height: var(--lh-1);
 }
 .th time, .connect > summary, .more > summary, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role { color: var(--muted); }
@@ -95,8 +95,9 @@ details[open] > summary > .i { transform: rotate(90deg); }
 .me { overflow: hidden; text-overflow: ellipsis; }
 
 main { max-width: var(--page); margin: 0 auto; padding: 0 var(--sp-4) var(--sp-7); }
-h1 { font-size: var(--fs-4); line-height: var(--lh-4); font-weight: 700; margin: var(--sp-5) 0 var(--sp-1); overflow-wrap: anywhere; }
+h1 { font-size: var(--fs-4); line-height: var(--lh-4); font-weight: 700; margin: var(--sp-5) 0 var(--sp-1); overflow-wrap: anywhere; text-wrap: balance; }
 h1 a { color: var(--text); }
+h1 .ref { display: block; font-weight: 400; }
 h1 .ext { color: var(--muted); --icon: .65em; margin-left: .2em; }
 h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin: var(--sp-6) 0 var(--sp-3); }
 .count { font-weight: 400; margin-left: 2px; }
@@ -137,7 +138,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .rv:hover .rv-pr { text-decoration: underline; }
 .rv:has(.rv-pr:focus-visible) { outline: 2px solid var(--link); outline-offset: -2px; }
 .rv-top { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-3); }
-.rv-pr { font-weight: 600; min-width: 0; }
+.rv-pr { font-weight: 600; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .rv-pr::after { content: ""; position: absolute; inset: 0; }
 .rv-pr:focus-visible { outline: none; }
 .rv-meta { margin-top: 2px; }
