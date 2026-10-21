@@ -82,7 +82,7 @@ details[open] > summary > .i { transform: rotate(90deg); }
 .live, .meta, .newer, .ref, .rv-meta, .rv-when, .vw, .fid, .was, .facts, .h-gist, .h-when, .log li, .rule .q {
   color: var(--muted); font-size: var(--fs-1); line-height: var(--lh-1);
 }
-.th time, .connect > summary, .more > summary, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role { color: var(--muted); }
+.th time, .connect > summary, .more > summary, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role, .pg { color: var(--muted); }
 .th, .me, .agents, .vbox > summary, .aside, .badge, .st, .connect h3 { font-size: var(--fs-1); line-height: var(--lh-1); }
 .rv-when, .vw, .was, .h-when, .badge, .st, .log time, .me { white-space: nowrap; }
 .meta b, .facts b, .et b { color: var(--text); }
@@ -133,6 +133,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .f + .f, :is(.reviews, .reviewers, .log, .history, .talk) > li + li { border-top: 1px solid var(--line); }
 .reviews, .reviews-empty { margin-top: var(--sp-5); }
 .rv, .reviewers li { padding: var(--row-y) var(--row-x); overflow-wrap: anywhere; }
+.reviewers .pg { margin-right: 4px; }
 .rv { position: relative; }
 .rv:hover, .f > summary:hover { background: var(--bg); }
 .rv:hover .rv-pr { text-decoration: underline; }

@@ -124,7 +124,7 @@ fn a_crash_during_a_long_wait_loses_nothing() {
     let sid = head.lines().find_map(|l| l.strip_prefix("mcp-session-id: ")).expect("a session id").trim().to_string();
     let session = format!("mcp-session-id: {sid}");
     let headers = [session.as_str(), "accept: application/json, text/event-stream"];
-    let hello = curl(&url, &headers, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"role":"reviewer"}}}"#).output().unwrap();
+    let hello = curl(&url, &headers, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"role":"reviewer","model":"claude"}}}"#).output().unwrap();
     assert!(String::from_utf8_lossy(&hello.stdout).contains("You are `local-claude`"));
 
     let wait = |id: u32| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"wait","arguments":{{}},"_meta":{{"progressToken":{id}}}}}}}"#);

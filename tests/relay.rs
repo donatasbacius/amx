@@ -1,7 +1,7 @@
 //! The review protocol driven by scripted agents on a synthetic clock.
 
 use amx::config::{Consensus, Timing};
-use amx::relay::{AmendIn, FindingIn, Ms, NewReview, Phase, Role, State, Status, SubmitIn, Verdict, VoteIn};
+use amx::relay::{AmendIn, FindingIn, Model, Ms, NewReview, Phase, Role, State, Status, SubmitIn, Verdict, VoteIn};
 use amx::tailscale::Identity;
 
 const PR: &str = "https://github.com/rust-lang/rust/pull/1";
@@ -34,9 +34,20 @@ impl Sim {
         }
     }
 
+    /// Reviewers alternate between claude and codex in the order they join.
     fn join(&mut self, name: &str, login: &str, role: Role) {
+        let model = if self.s.agents.all().filter(|a| a.model.is_some()).count() % 2 == 0 { Model::Claude } else { Model::Codex };
         self.s.touch(name, &who(login), Some(role), self.now).unwrap();
+        if role == Role::Reviewer {
+            self.s.set_model(name, model);
+        }
         self.alive.push(name.into());
+        self.s.tick(self.now);
+    }
+
+    fn join_as(&mut self, name: &str, login: &str, model: Model) {
+        self.join(name, login, Role::Reviewer);
+        self.s.set_model(name, model);
         self.s.tick(self.now);
     }
 
@@ -415,16 +426,17 @@ fn reviewer_going_offline_is_dropped() {
 
 #[test]
 fn fewer_reviewers_than_requested() {
-    let mut sim = setup(&["rev-a"]);
+    let mut sim = setup(&["rev-a", "rev-b"]);
     let id = sim.request("alice-codex", 3);
     sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
     assert_eq!(sim.phase(&id), Phase::Offering);
     sim.join("rev-late", "friend9@example.com", Role::Reviewer);
     assert!(sim.events("rev-late").contains("Review offer"), "reviewers coming online get the offer");
     sim.s.decline("rev-late", &id, "no access", sim.now).unwrap();
     sim.advance(121);
     assert_eq!(sim.phase(&id), Phase::Reviewing);
-    assert!(sim.events("alice-codex").contains("rev-a (of 3 requested)"));
+    assert!(sim.events("alice-codex").contains("rev-a, rev-b (of 3 requested)"));
 }
 
 #[test]
@@ -1305,8 +1317,9 @@ fn the_agent_list_shows_one_agent_per_row() {
     let list = &index[index.find("<ul class=\"agents\">").unwrap()..];
     let rows: Vec<&str> = list.split("<li>").skip(1).map(|li| &li[..li.find("</li>").unwrap()]).collect();
     assert_eq!(rows.len(), 5, "{list}");
-    assert!(rows[0].starts_with("<b>rev-a</b><span class=\"role\">on <a href="), "busy reviewers first: {list}");
-    assert_eq!(rows[1..3], ["<b>rev-b</b><span class=\"role\">idle</span>", "<b>rev-c</b><span class=\"role\">idle</span>"]);
+    assert!(rows[0].starts_with("<b>rev-a</b> <span class=\"pg\">claude</span><span class=\"role\">on <a href="), "busy reviewers first: {list}");
+    assert_eq!(rows[1..3], ["<b>rev-b</b> <span class=\"pg\">codex</span><span class=\"role\">idle</span>", "<b>rev-c</b> <span class=\"pg\">claude</span><span class=\"role\">idle</span>"]);
+    assert!(rows[3..].iter().all(|r| !r.contains("pg")), "authors show no program: {list}");
     // Each agent is a row of its own, the width of the card, with its status at the card's right
     // edge like the review rows' times: never set in columns, side by side or in a narrower box.
     let css = include_str!("../assets/style.css");
@@ -2298,4 +2311,156 @@ fn transcript_times_set_one_column_as_wide_as_the_widest() {
     let log = |sel: &str| css.lines().find(|l| l.starts_with(sel)).unwrap_or_default();
     assert!(log(".log {").contains("grid-template-columns: auto minmax(0, 1fr)"), "{css}");
     assert!(log(".log li {").contains("grid-template-columns: subgrid") && !log(".log li {").contains("em minmax"), "{css}");
+}
+
+fn mixed(names: &[(&str, Model)]) -> Sim {
+    let mut sim = setup(&[]);
+    for (i, (name, model)) in names.iter().enumerate() {
+        sim.join_as(name, &format!("friend{i}@example.com"), *model);
+    }
+    sim
+}
+
+#[test]
+fn an_accept_that_would_leave_no_slot_for_the_other_program_is_refused() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cl-b", Model::Claude), ("cl-c", Model::Claude), ("cx-a", Model::Codex)]);
+    let id = sim.request("alice-codex", 3);
+    sim.accept("cl-a", &id);
+    sim.accept("cl-b", &id);
+    assert!(!sim.task("cl-c").contains("accept_review"), "the offer is no longer shown to a third claude");
+    let err = sim.s.accept("cl-c", &id, sim.now).unwrap_err().to_string();
+    assert!(err.contains(&format!("{id} still needs a codex reviewer")), "{err}");
+    assert!(sim.task("cx-a").contains("accept_review"));
+    sim.accept("cx-a", &id);
+    assert_eq!(sim.phase(&id), Phase::Reviewing);
+}
+
+#[test]
+fn an_offer_deadline_with_only_one_program_fails() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cl-b", Model::Claude)]);
+    let id = sim.request("alice-codex", 3);
+    sim.accept("cl-a", &id);
+    sim.accept("cl-b", &id);
+    sim.advance(121);
+    assert_eq!(sim.phase(&id), Phase::Failed);
+    assert!(sim.events("alice-codex").contains("failed: no codex reviewer accepted before the offer deadline"));
+    assert!(sim.events("cl-a").contains("Review cancelled: no codex reviewer accepted"));
+    assert!(sim.s.busy_with("cl-a").is_none());
+    let page = amx::web::render_review(sim.s.review(&id).unwrap());
+    assert!(page.contains("<p class=\"vd\">No codex reviewer accepted in time; a review with more than one reviewer needs both claude and codex. cl-a and cl-b accepted. The author can request it again.</p>"), "{page}");
+    assert!(page.contains("<b>cl-a</b> <span class=\"pg\">claude</span> <span class=\"badge s-closed\">stopped</span>"), "{page}");
+    let index = amx::web::render_index(&sim.s, sim.now, |_| false);
+    assert!(index.contains("<span>no codex reviewer ·</span>") && !index.contains("dropped out"), "{index}");
+}
+
+#[test]
+fn named_reviewers_must_include_both_programs() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cl-b", Model::Claude), ("cx-a", Model::Codex)]);
+    let err = sim.s.request_review("alice-codex", pick(&["cl-a", "cl-b"], None), sim.now).unwrap_err().to_string();
+    assert!(err.contains("none of the reviewers you named is a codex reviewer"), "{err}");
+    assert!(sim.s.reviews.is_empty());
+    let one = sim.s.request_review("alice-codex", pick(&["cl-a", "cl-b"], Some(1)), sim.now).unwrap();
+    sim.s.cancel(&one, "alice", sim.now).unwrap();
+    sim.s.request_review("alice-codex", pick(&["cl-a", "cx-a"], None), sim.now).unwrap();
+}
+
+#[test]
+fn a_single_reviewer_needs_no_mix() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cl-b", Model::Claude)]);
+    let id = sim.request("alice-codex", 1);
+    sim.accept("cl-b", &id);
+    assert_eq!(sim.phase(&id), Phase::Reviewing);
+    sim.submit("cl-b", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+}
+
+#[test]
+fn a_reviewer_without_a_model_is_told_to_say_hello_again() {
+    let mut sim = setup(&[]);
+    sim.s.touch("rev-a", &who("friend1@example.com"), Some(Role::Reviewer), sim.now).unwrap();
+    sim.alive.push("rev-a".into());
+    let id = sim.request("alice-codex", 1);
+    let next = sim.s.next_actions("rev-a", sim.now);
+    assert!(next[0].urgent && next[0].text.contains("call `hello` with role \"reviewer\" and model \"claude\" or \"codex\""), "{}", next[0].text);
+    let err = sim.s.accept("rev-a", &id, sim.now).unwrap_err().to_string();
+    assert!(err.contains("model \"claude\" or \"codex\""), "{err}");
+    let mut named = pick(&["rev-a"], None);
+    named.pr_url = "https://github.com/rust-lang/rust/pull/2".into();
+    let err = sim.s.request_review("alice-codex", named, sim.now).unwrap_err().to_string();
+    assert!(err.contains("rev-a (hasn't said whether it is claude or codex)"), "{err}");
+    sim.s.set_model("rev-a", Model::Codex);
+    sim.s.tick(sim.now);
+    assert!(sim.events("rev-a").contains("Review offer"), "offered once it has said");
+    sim.accept("rev-a", &id);
+}
+
+#[test]
+fn a_rereview_reuses_reviewers_only_as_far_as_the_mix_allows() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex), ("cl-b", Model::Claude)]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("cl-a", &id);
+    sim.accept("cx-a", &id);
+    sim.submit("cl-a", &id, &[("major", "bug")]);
+    sim.submit("cx-a", &id, &[]);
+    sim.vote("cx-a", &id, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    sim.s.set_model("cx-a", Model::Claude);
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let r2 = sim.s.review(&id2).unwrap();
+    let assigned: Vec<&str> = r2.slots.iter().map(|s| s.agent.as_str()).collect();
+    assert_eq!((r2.phase, assigned), (Phase::Offering, vec!["cl-a"]), "a second claude would leave no room for codex");
+    assert!(!sim.task("cl-b").contains("accept_review"));
+    sim.join_as("cx-b", "friend7@example.com", Model::Codex);
+    assert!(sim.events("cx-b").contains("re-review"));
+    sim.accept("cx-b", &id2);
+    assert_eq!(sim.phase(&id2), Phase::Reviewing);
+}
+
+#[test]
+fn models_survive_a_snapshot_and_older_files_load_without_them() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("cl-a", &id);
+    let s = reload(&sim.s, sim.now, sim.now);
+    assert_eq!(s.agents.get("cx-a").unwrap().model, Some(Model::Codex));
+    assert_eq!(s.review(&id).unwrap().slot("cl-a").unwrap().model, Some(Model::Claude));
+    let page = amx::web::render_review(s.review(&id).unwrap());
+    assert!(page.contains("<b>cl-a</b> <span class=\"pg\">claude</span> <span class=\"badge s-waiting\">accepted</span>"), "{page}");
+    assert!(serde_json::to_string(&s.snapshot(sim.now)).unwrap().contains("\"model\":\"codex\""));
+
+    let mut v = serde_json::to_value(sim.s.snapshot(sim.now)).unwrap();
+    for a in v["agents"].as_array_mut().unwrap() {
+        a.as_object_mut().unwrap().remove("model");
+    }
+    for r in v["reviews"].as_array_mut().unwrap() {
+        for slot in r["slots"].as_array_mut().unwrap() {
+            slot.as_object_mut().unwrap().remove("model");
+        }
+    }
+    assert!(!v.to_string().contains("model"));
+    let mut old = State::new(Timing::default(), Consensus::default(), 50);
+    old.restore(serde_json::from_value(v).unwrap(), sim.now);
+    assert_eq!(old.agents.get("cx-a").unwrap().model, None);
+    assert!(old.next_actions("cx-a", sim.now)[0].text.contains("call `hello`"), "a restored reviewer says hello again before it can accept");
+    assert!(old.accept("cx-a", &id, sim.now).is_err());
+    let pages = amx::web::render_review(old.review(&id).unwrap()) + &amx::web::render_index(&old, sim.now, |_| false);
+    assert!(pages.contains("<b>cl-a</b> <span class=\"badge") && !pages.contains("class=\"pg\""), "no program, nothing shown: {pages}");
+}
+
+#[test]
+fn a_missing_program_failure_survives_a_snapshot_and_older_files_load_without_it() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cl-b", Model::Claude)]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("cl-a", &id);
+    sim.advance(121);
+    let s = reload(&sim.s, sim.now, sim.now);
+    assert_eq!(s.review(&id).unwrap().missing, Some(Model::Codex));
+    assert!(amx::web::render_review(s.review(&id).unwrap()).contains("No codex reviewer accepted in time; a review with more than one reviewer needs both claude and codex. cl-a accepted."));
+
+    let mut v = serde_json::to_value(sim.s.snapshot(sim.now)).unwrap();
+    v["reviews"][0].as_object_mut().unwrap().remove("missing").unwrap();
+    let mut old = State::new(Timing::default(), Consensus::default(), 50);
+    old.restore(serde_json::from_value(v).unwrap(), sim.now);
+    let r = old.review(&id).unwrap();
+    assert_eq!((r.phase, r.missing), (Phase::Failed, None));
 }

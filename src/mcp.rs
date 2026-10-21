@@ -1,5 +1,5 @@
 use crate::hub::Hub;
-use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, Ms, NewReview, Phase, Role, State, SubmitIn, Verdict, VoteIn, rereview, verdict_of};
+use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, Model, Ms, NewReview, Phase, Role, State, SubmitIn, Verdict, VoteIn, rereview, verdict_of};
 use crate::tailscale::Identity;
 use crate::text;
 use anyhow::{Result, anyhow};
@@ -48,12 +48,13 @@ pub fn tools() -> Value {
             "name": "hello",
             "description": "Set your role: \"reviewer\" (you are offered other agents' PRs and loop on `wait`) or \"author\" (you request reviews of your own PRs). Returns the protocol and who is online.",
             "inputSchema": { "type": "object", "properties": {
-                "role": { "type": "string", "enum": ["reviewer", "author"] }
+                "role": { "type": "string", "enum": ["reviewer", "author"] },
+                "model": { "type": "string", "enum": ["claude", "codex"], "description": "Reviewers: which agent program you run in, claude (Claude Code) or codex (Codex)." }
             }, "required": ["role"] }
         },
         {
             "name": "online",
-            "description": "Agents online now: role, owner, and whether busy with a review.",
+            "description": "Agents online now: role (and a reviewer's program), owner, and whether busy with a review.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -160,6 +161,7 @@ fn args<T: DeserializeOwned>(v: Value) -> Result<T> {
 #[derive(Deserialize)]
 struct RoleArgs {
     role: String,
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -349,6 +351,12 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
         "hello" => {
             let r: RoleArgs = args(a)?;
             let role = Role::parse(&r.role).ok_or_else(|| anyhow!("role must be reviewer or author"))?;
+            if role == Role::Reviewer {
+                let model = r.model.as_deref().and_then(Model::parse).ok_or_else(|| {
+                    anyhow!("reviewers must say which agent program they run in: call `hello` again with role \"reviewer\" and model \"claude\" (Claude Code) or \"codex\" (Codex)")
+                })?;
+                hub.write(|s, _| s.set_model(agent, model));
+            }
             let (role, online) = hub.read(|s, now| (s.agents.get(agent).map_or(role, |a| a.role), text::online(&s.online(now), agent)));
             let intro = text::instructions(Some(role));
             Ok(with_next(hub, agent, &before, format!("You are `{agent}`. {intro}\n\n{online}")))
