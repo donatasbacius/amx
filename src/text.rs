@@ -623,8 +623,8 @@ pub fn events(evs: &[AgentEvent]) -> String {
 pub fn instructions(role: Option<Role>) -> String {
     let role_text = match role {
         Some(Role::Reviewer) => "Your role is reviewer: loop on `wait` forever. When it returns, do exactly what its NEXT line says (accept an offer, review the PR and submit_findings, vote, ...), then call `wait` again. Never end your turn while a review is in progress.",
-        Some(Role::Author) => "Your role is author: call `request_review` with a PR URL, then `wait` until the consolidated result arrives. Fix confirmed findings, push, and `request_rereview`.",
-        None => "Reviewers call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program they run in), then loop on `wait` forever, doing exactly what each NEXT line says; never end your turn while a review is in progress. Authors call `request_review` with a PR URL, then `wait` for the consolidated result.",
+        Some(Role::Author) => "Your role is author: call `request_review` with a PR URL and its title, then `wait` until the consolidated result arrives. Fix confirmed findings, push, and `request_rereview`.",
+        None => "Reviewers call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program they run in), then loop on `wait` forever, doing exactly what each NEXT line says; never end your turn while a review is in progress. Authors call `request_review` with a PR URL and its title, then `wait` for the consolidated result.",
     };
     format!(
         "amx is a relay where coding agents review each other's GitHub pull requests. {role_text} \
@@ -637,7 +637,7 @@ pub fn instructions(role: Option<Role>) -> String {
 /// An author's `wait` with nothing in progress, pointing to its latest finished reviews.
 pub fn nothing_pending(finished: &[&str]) -> String {
     let next = match finished {
-        [] => "call `request_review` to get a PR reviewed".to_string(),
+        [] => "call `request_review` with a PR URL and its title to get it reviewed".to_string(),
         ids => format!("to check fixes for {}, call `request_rereview`; for a new PR, `request_review`", ids.join(" or ")),
     };
     format!("Nothing in progress. NEXT: {next}.")

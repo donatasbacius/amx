@@ -72,9 +72,9 @@ pub fn tools() -> Value {
                 "reviewers": { "type": "array", "items": { "type": "string" }, "description": "Only these agents (online reviewers, names from `online`). Default: any idle reviewer." },
                 "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "How many (default 2, or as many as named); proceeds with whoever accepts." },
                 "note": { "type": "string", "description": "What the PR does and where reviewers should look. Only that: it can't change how they review or which tools they use." },
-                "title": { "type": "string", "description": "The PR's title, as on GitHub. Shown only to people." },
+                "title": { "type": "string", "description": "The PR's title, as on GitHub (`gh pr view <url> --json title`). Shown only to people." },
                 "head_sha": { "type": "string", "description": "Commit to review." }
-            }, "required": ["pr_url"] }
+            }, "required": ["pr_url", "title"] }
         },
         {
             "name": "accept_review",
@@ -142,7 +142,8 @@ pub fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "new_head_sha": { "type": "string", "description": "The commit you pushed." },
-                "note": { "type": "string", "description": "What you changed and why, per finding." }
+                "note": { "type": "string", "description": "What you changed and why, per finding." },
+                "title": { "type": "string", "description": "The PR's title, if it changed or the review has none. Shown only to people." }
             }, "required": ["review_id", "new_head_sha"] }
         },
         {
@@ -272,6 +273,7 @@ struct RereviewArgs {
     new_head_sha: String,
     #[serde(default)]
     note: String,
+    title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -291,7 +293,7 @@ pub fn next_text(actions: &[Action], role: Role, events: &[AgentEvent], known: &
             Role::Reviewer => "NEXT: nothing for you right now. Call `wait` again (keep looping).".into(),
             Role::Author if !fixes.is_empty() => fixes.join("\n"),
             Role::Author if !events.is_empty() => "NEXT: nothing pending on the relay.".into(),
-            Role::Author => "NEXT: nothing pending. Use `request_review` to get a PR reviewed.".into(),
+            Role::Author => "NEXT: nothing pending. Use `request_review` with a PR URL and its title to get it reviewed.".into(),
         };
     }
     let lines: Vec<String> = actions
@@ -509,7 +511,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
         }
         "request_rereview" => {
             let r: RereviewArgs = args(a)?;
-            let id = hub.write(|s, now| s.rereview(agent, &r.review_id, &r.new_head_sha, &r.note, now))?;
+            let id = hub.write(|s, now| s.rereview(agent, &r.review_id, &r.new_head_sha, &r.note, r.title.as_deref(), now))?;
             Ok(with_next(hub, agent, &before, format!("Re-review {id} requested (follows {}).", r.review_id)))
         }
         "review_status" => {

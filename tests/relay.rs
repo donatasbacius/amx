@@ -18,6 +18,12 @@ fn who(login: &str) -> Identity {
     }
 }
 
+fn titled(pr_url: &str) -> NewReview {
+    let mut req = NewReview::new(pr_url);
+    req.title = Some("Add a cache".into());
+    req
+}
+
 struct Sim {
     s: State,
     now: Ms,
@@ -79,7 +85,7 @@ impl Sim {
     }
 
     fn request(&mut self, author: &str, reviewers: usize) -> String {
-        let mut req = NewReview::new(PR);
+        let mut req = titled(PR);
         req.reviewers = Some(reviewers);
         req.note = "Adds a cache".into();
         self.s.request_review(author, req, self.now).unwrap()
@@ -472,7 +478,7 @@ fn offers_respect_roles_and_busy_reviewers() {
 }
 
 fn pick(names: &[&str], count: Option<usize>) -> NewReview {
-    let mut req = NewReview::new(PR);
+    let mut req = titled(PR);
     req.picked = names.iter().map(|n| n.to_string()).collect();
     req.reviewers = count;
     req
@@ -534,9 +540,9 @@ fn rereview_rechecks_previous_findings() {
     assert_eq!(sim.status(&id, "F2"), Status::Disputed);
     assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
     sim.events("alice-codex");
-    assert!(sim.s.rereview("rev-a", &id, SHA2, "", sim.now).is_err(), "only the author");
+    assert!(sim.s.rereview("rev-a", &id, SHA2, "", None, sim.now).is_err(), "only the author");
 
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "invalidate on write", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "invalidate on write", None, sim.now).unwrap();
     let r2 = sim.s.review(&id2).unwrap();
     assert_eq!(r2.phase, Phase::Reviewing, "same reviewers reassigned");
     assert_eq!(r2.findings.len(), 2, "confirmed and disputed findings carried");
@@ -562,7 +568,7 @@ fn rereview_rechecks_previous_findings() {
     let page = amx::web::render_review(r2);
     assert!(page.contains(">fixed<") && !page.contains("0 of 2 agree") && !page.contains("disagrees"), "a fixed finding shows no votes: {page}");
     assert_eq!(amx::web::review_json(r2, &[], sim.now, "")["summary"][0]["outcome"], "resolved", "agents keep their word");
-    assert!(sim.s.rereview("alice-codex", &id, SHA2, "", sim.now).is_err(), "one re-review per review");
+    assert!(sim.s.rereview("alice-codex", &id, SHA2, "", None, sim.now).is_err(), "one re-review per review");
 }
 
 #[test]
@@ -575,7 +581,7 @@ fn rereview_with_previous_reviewers_gone_offers_new_ones() {
     sim.leave("rev-a");
     sim.advance(100);
     sim.join("rev-new", "friend5@example.com", Role::Reviewer);
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     assert_eq!(sim.phase(&id2), Phase::Offering);
     assert!(sim.events("rev-new").contains("re-review"));
     sim.accept("rev-new", &id2);
@@ -594,16 +600,16 @@ fn a_failed_rereview_can_be_retried_from_its_parent() {
     sim.submit("rev-a", &id, &[("major", "bug")]);
     sim.leave("rev-a");
     sim.advance(400);
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     sim.advance(121);
     assert_eq!(sim.phase(&id2), Phase::Failed);
     let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
     assert!(index.contains("<span>no reviewers free ·</span> <span>last: needs the author's call ·</span> <span>2 reviews ·</span> <span>alice-codex</span></span>"), "the PR still stands where it did: {index}");
     sim.join("rev-new", "friend5@example.com", Role::Reviewer);
-    let id3 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let id3 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     let r3 = sim.s.review(&id3).unwrap();
     assert_eq!((r3.parent.as_deref(), r3.findings.len()), (Some(id.as_str()), 1), "the carried finding comes along");
-    assert!(sim.s.rereview("alice-codex", &id, SHA2, "", sim.now).is_err(), "one live re-review per review");
+    assert!(sim.s.rereview("alice-codex", &id, SHA2, "", None, sim.now).is_err(), "one live re-review per review");
 }
 
 #[test]
@@ -619,7 +625,7 @@ fn rereview_does_not_reassign_dropped_reviewers() {
     sim.vote("rev-b", &id, &[("F1", "agree")]);
     sim.advance(601);
     assert!(sim.s.review(&id).unwrap().slot("rev-c").unwrap().dropped.is_some());
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     let assigned: Vec<String> = sim.s.review(&id2).unwrap().slots.iter().map(|s| s.agent.clone()).collect();
     assert_eq!(assigned, ["rev-a", "rev-b"]);
 }
@@ -632,7 +638,7 @@ fn rereview_keeps_the_parent_settings_even_if_the_config_is_out_of_range() {
     sim.accept("rev-a", &id);
     sim.submit("rev-a", &id, &[]);
     assert_eq!(sim.phase(&id), Phase::Done);
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     assert_eq!(sim.s.review(&id2).unwrap().params, sim.s.review(&id).unwrap().params);
 }
 
@@ -655,9 +661,9 @@ fn agent_names_are_bound_to_logins() {
 #[test]
 fn input_validation() {
     let mut sim = setup(&["rev-a"]);
-    assert!(sim.s.request_review("alice-codex", NewReview::new("https://example.com/x"), sim.now).is_err());
+    assert!(sim.s.request_review("alice-codex", titled("https://example.com/x"), sim.now).is_err());
     let id = sim.request("alice-codex", 1);
-    assert!(sim.s.request_review("alice-codex", NewReview::new(PR), sim.now).is_err(), "duplicate request");
+    assert!(sim.s.request_review("alice-codex", titled(PR), sim.now).is_err(), "duplicate request");
     sim.accept("rev-a", &id);
     let bad_url = SubmitIn {
         head_sha: SHA.into(),
@@ -921,7 +927,7 @@ fn reload(s: &State, saved: Ms, now: Ms) -> State {
 #[test]
 fn a_pr_title_is_cleaned_shown_to_people_and_kept_from_agents() {
     let mut sim = setup(&["rev-a"]);
-    let mut req = NewReview::new(PR);
+    let mut req = titled(PR);
     req.reviewers = Some(1);
     req.title = Some(format!("PRTITLE <b>x</b> &\u{202E} `y`\n\u{2028}  next\t{}", "z".repeat(300)));
     let id = sim.s.request_review("alice-codex", req, sim.now).unwrap();
@@ -940,22 +946,56 @@ fn a_pr_title_is_cleaned_shown_to_people_and_kept_from_agents() {
     agents += &amx::text::result(r, "");
     assert!(agents.contains(PR) && !agents.contains("PRTITLE"), "{agents}");
 
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "", None, sim.now).unwrap();
     let saved = reload(&sim.s, sim.now, sim.now);
     assert_eq!(saved.review(&id2).unwrap().title.as_deref(), Some(title.as_str()), "carried to the re-review and saved");
     assert!(amx::web::render_index(&saved, sim.now, &View::anyone()).contains(">PRTITLE &lt;b&gt;"));
 }
 
 #[test]
-fn a_review_without_a_title_is_named_by_its_number() {
+fn a_review_needs_a_title() {
     let mut sim = setup(&["rev-a"]);
-    let mut req = NewReview::new(PR);
-    req.title = Some(" \u{202E}\n ".into());
+    for title in [None, Some(" \u{202E}\n ")] {
+        let mut req = titled(PR);
+        req.title = title.map(Into::into);
+        let err = sim.s.request_review("alice-codex", req, sim.now).unwrap_err().to_string();
+        assert_eq!(err, format!("title is required: pass the PR's title as `title` (from `gh pr view {PR} --json title`)"));
+    }
+    assert!(sim.s.reviews.is_empty());
+}
+
+#[test]
+fn a_review_without_a_title_is_named_by_its_number_until_a_rereview_gives_one() {
+    let mut sim = setup(&["rev-a"]);
+    let mut req = titled(PR);
+    req.reviewers = Some(1);
     let id = sim.s.request_review("alice-codex", req, sim.now).unwrap();
+    sim.s.reviews[0].title = None;
     let json = serde_json::to_string(&sim.s.snapshot(sim.now)).unwrap();
     assert!(!json.contains("\"title\""), "old state files have none either: {json}");
     let page = amx::web::render_review(reload(&sim.s, sim.now, sim.now).review(&id).unwrap());
     assert!(page.contains("<span class=\"ref\">rust-lang/rust#1</span>") && page.contains("Pull request #1<span class=\"ext\">"), "{page}");
+
+    sim.accept("rev-a", &id);
+    sim.submit("rev-a", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    for title in [None, Some(" \n ")] {
+        let err = sim.s.rereview("alice-codex", &id, SHA2, "", title, sim.now).unwrap_err().to_string();
+        assert_eq!(err, format!("{id} has no title: pass the PR's title as `title` (from `gh pr view {PR} --json title`)"));
+    }
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "", Some(" Add\na cache "), sim.now).unwrap();
+    assert_eq!(sim.s.review(&id2).unwrap().title.as_deref(), Some("Add a cache"));
+}
+
+#[test]
+fn a_rereview_can_retitle_the_pr() {
+    let mut sim = setup(&["rev-a"]);
+    let id = sim.request("alice-codex", 1);
+    sim.accept("rev-a", &id);
+    sim.submit("rev-a", &id, &[]);
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "", Some("Add an LRU cache"), sim.now).unwrap();
+    assert_eq!(sim.s.review(&id2).unwrap().title.as_deref(), Some("Add an LRU cache"));
+    assert_eq!(sim.s.review(&id).unwrap().title.as_deref(), Some("Add a cache"));
 }
 
 #[test]
@@ -973,7 +1013,7 @@ fn state_survives_a_snapshot_and_the_review_carries_on() {
         sim.events(a);
     }
 
-    let mut req = NewReview::new("https://github.com/rust-lang/rust/pull/2");
+    let mut req = titled("https://github.com/rust-lang/rust/pull/2");
     req.reviewers = Some(2);
     let open = sim.s.request_review("alice-codex", req, sim.now).unwrap();
     sim.accept("rev-a", &open);
@@ -995,7 +1035,7 @@ fn state_survives_a_snapshot_and_the_review_carries_on() {
     }
     assert_eq!(s.agents.all().count(), sim.s.agents.all().count());
     assert!(s.touch("rev-a", &who("mallory@example.com"), None, sim.now).is_err(), "name stays bound to its login");
-    let next = s.request_review("rev-a", NewReview::new("https://github.com/rust-lang/rust/pull/3"), sim.now).unwrap();
+    let next = s.request_review("rev-a", titled("https://github.com/rust-lang/rust/pull/3"), sim.now).unwrap();
     assert_eq!(next, "r3");
 
     let later = sim.now + 3_600_000;
@@ -1163,7 +1203,7 @@ fn a_new_session_drops_events_about_reviews_it_is_no_longer_in() {
 
     sim.s.say("alice-codex", &id, "Thanks, fixing it.", sim.now).unwrap();
     assert!(!sim.s.has_undelivered("rev-a"), "closing remarks don't keep a reviewer from stopping");
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     assert!(sim.s.has_undelivered("rev-a"));
     sim.s = reload(&sim.s, sim.now, sim.now);
     sim.s.new_session("rev-a");
@@ -1277,7 +1317,7 @@ fn findings_nobody_else_backed_are_unverified() {
     assert!(!result.contains("Confirmed findings") && result.contains("\nUnverified (only their author vouches") && result.contains("\n> says blocker"), "{result}");
     assert!(result.contains("only their author vouches for F1: check them against the code yourself"), "{result}");
     assert!(amx::web::render_review(sim.s.review(&id).unwrap()).contains("unverified"));
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     assert_eq!(sim.s.review(&id2).unwrap().findings.len(), 1, "unverified findings are re-checked");
 }
 
@@ -1302,7 +1342,7 @@ fn review_page_asks_the_human_to_judge_a_disputed_finding() {
     assert!(page.contains(">disputed<") && page.contains("1 of 2 agree"), "{page}");
 
     // Once a re-review has carried the finding over, nobody is asked to decide it here.
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     let mut prs: Vec<_> = sim.s.reviews.clone();
     prs.sort_by_key(|x| x.created);
     let page = amx::web::render_review_page(sim.s.review(&id).unwrap(), &prs, sim.now, &|_| true);
@@ -1485,14 +1525,14 @@ fn a_lapsed_name_does_not_inherit_its_reviews() {
     sim.s.touch("rev-b", &mallory, Some(Role::Reviewer), sim.now).unwrap();
     let err = sim.s.say("alice-codex", &id, "I am alice", sim.now).unwrap_err();
     assert!(err.to_string().contains("another tailnet user"), "{err}");
-    assert!(sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).is_err());
+    assert!(sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).is_err());
     assert!(sim.s.say("rev-b", &id, "I am rev-b", sim.now).is_err());
     assert!(!sim.s.review(&id).unwrap().log.iter().any(|e| e.text.contains("I am")));
 
     sim.advance(91);
     sim.join("alice-codex", "alice@example.com", Role::Author);
     sim.s.say("alice-codex", &id, "Back, fixing it.", sim.now).unwrap();
-    sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
 }
 
 #[test]
@@ -1562,7 +1602,7 @@ fn agent_text_cannot_forge_relay_lines() {
 }
 
 fn pr(n: u32) -> NewReview {
-    let mut req = NewReview::new(&format!("https://github.com/rust-lang/rust/pull/{n}"));
+    let mut req = titled(&format!("https://github.com/rust-lang/rust/pull/{n}"));
     req.reviewers = Some(1);
     req
 }
@@ -1742,7 +1782,7 @@ fn failed_requests_do_not_push_finished_reviews_out_of_history() {
     let kept: Vec<&str> = sim.s.reviews.iter().filter(|r| r.phase == Phase::Done).map(|r| r.id.as_str()).collect();
     assert_eq!(kept.len(), 3);
     assert!(kept.contains(&done.as_str()), "the busiest login loses its oldest first: {kept:?}");
-    sim.s.rereview("alice-codex", &done, SHA2, "fixed", sim.now).unwrap();
+    sim.s.rereview("alice-codex", &done, SHA2, "fixed", None, sim.now).unwrap();
 }
 
 fn reasoned(finding: &str, vote: &str, reason: &str) -> VoteIn {
@@ -1930,7 +1970,7 @@ fn finding_urls_are_bounded_checked_and_counted() {
 #[test]
 fn over_long_free_text_is_refused_not_clipped() {
     let mut sim = setup(&["rev-a", "rev-b"]);
-    let mut req = NewReview::new(PR);
+    let mut req = titled(PR);
     req.note = "n".repeat(8001);
     let err = sim.s.request_review("alice-codex", req, sim.now).unwrap_err().to_string();
     assert!(err.contains("note") && err.contains("8000"), "{err}");
@@ -1998,17 +2038,17 @@ fn old_reviews_name_the_latest_and_while_it_runs_the_last_result() {
     sim.accept("rev-b", &r1);
     changes(&mut sim, &r1);
     assert_eq!(sim.verdict(&r1), Verdict::ChangesRequested);
-    let r2 = sim.s.rereview("alice-codex", &r1, SHA2, "fixed", sim.now).unwrap();
+    let r2 = sim.s.rereview("alice-codex", &r1, SHA2, "fixed", None, sim.now).unwrap();
     sim.submit("rev-a", &r2, &[]);
     sim.submit("rev-b", &r2, &[]);
     for a in ["rev-a", "rev-b"] {
         sim.vote(a, &r2, &[("C1", "disagree")]);
     }
     assert_eq!(sim.verdict(&r2), Verdict::Approve);
-    let r3 = sim.s.rereview("alice-codex", &r2, SHA, "again", sim.now).unwrap();
+    let r3 = sim.s.rereview("alice-codex", &r2, SHA, "again", None, sim.now).unwrap();
     changes(&mut sim, &r3);
     assert_eq!(sim.verdict(&r3), Verdict::ChangesRequested);
-    let r4 = sim.s.rereview("alice-codex", &r3, SHA2, "fixed again", sim.now).unwrap();
+    let r4 = sim.s.rereview("alice-codex", &r3, SHA2, "fixed again", None, sim.now).unwrap();
     let page = |sim: &Sim, id: &str| {
         let mut prs: Vec<_> = sim.s.reviews.clone();
         prs.sort_by_key(|x| x.created);
@@ -2093,7 +2133,7 @@ fn only_a_rereview_locks_rulings_and_undo_outlasts_the_ruling_cap() {
     assert_eq!(sim.status(&id, "F1"), Status::Disputed);
 
     // Another login's request for the same PR, in the same millisecond, doesn't freeze alice's rulings.
-    let other = sim.s.request_review("bob-claude", NewReview::new(PR), sim.now).unwrap();
+    let other = sim.s.request_review("bob-claude", titled(PR), sim.now).unwrap();
     assert_eq!(sim.s.review(&other).unwrap().created, sim.s.review(&id).unwrap().created);
     assert!(sim.s.review(&other).unwrap().seq() > sim.s.review(&id).unwrap().seq());
     for _ in 0..24 {
@@ -2127,7 +2167,7 @@ fn another_person_takes_one_slot_while_the_authors_own_agents_take_any() {
     sim.accept("alice-rev", &id);
     assert_eq!(sim.phase(&id), Phase::Reviewing, "rev-a and alice-rev are both the author's own");
     let pick = |names: &[&str]| {
-        let mut req = NewReview::new("https://github.com/rust-lang/rust/pull/2");
+        let mut req = titled("https://github.com/rust-lang/rust/pull/2");
         req.picked = names.iter().map(|n| n.to_string()).collect();
         req
     };
@@ -2168,7 +2208,7 @@ fn a_sole_reviewers_findings_are_unverified() {
 fn every_line_agents_write_reaches_other_agents_quoted() {
     let mut sim = setup(&["rev-a", "rev-b"]);
     let text = |what: &str| format!("ZZ {what} one\nZZ {what} two\u{2028}ZZ {what} three\u{2029}ZZ {what} four");
-    let mut req = NewReview::new(PR);
+    let mut req = titled(PR);
     req.reviewers = Some(2);
     req.note = text("note");
     let id = sim.s.request_review("alice-codex", req, sim.now).unwrap();
@@ -2303,7 +2343,7 @@ fn the_authors_note_opens_the_discussion() {
     let (note, said) = (page.find("<p>Adds a cache</p>").unwrap(), page.find("<p>On it.</p>").unwrap());
     assert!(page.contains("<h2>Discussion <span class=\"count\">2</span></h2>") && note < said, "{page}");
 
-    let mut req = NewReview::new("https://github.com/rust-lang/rust/pull/2");
+    let mut req = titled("https://github.com/rust-lang/rust/pull/2");
     req.reviewers = Some(1);
     let quiet = sim.s.request_review("alice-codex", req, sim.now).unwrap();
     assert!(!amx::web::render_review(sim.s.review(&quiet).unwrap()).contains("Discussion"), "no note, no messages");
@@ -2411,7 +2451,7 @@ fn a_rereview_reuses_reviewers_only_as_far_as_the_mix_allows() {
     sim.vote("cx-a", &id, &[("F1", "agree")]);
     assert_eq!(sim.phase(&id), Phase::Done);
     sim.s.set_model("cx-a", Model::Claude);
-    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", sim.now).unwrap();
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     let r2 = sim.s.review(&id2).unwrap();
     let assigned: Vec<&str> = r2.slots.iter().map(|s| s.agent.as_str()).collect();
     assert_eq!((r2.phase, assigned), (Phase::Offering, vec!["cl-a"]), "a second claude would leave no room for codex");
@@ -2472,7 +2512,7 @@ fn a_missing_program_failure_survives_a_snapshot_and_older_files_load_without_it
 }
 
 fn request_pr(sim: &mut Sim, author: &str, pr: u32, reviewers: usize) -> String {
-    let mut req = NewReview::new(&format!("https://github.com/rust-lang/rust/pull/{pr}"));
+    let mut req = titled(&format!("https://github.com/rust-lang/rust/pull/{pr}"));
     req.reviewers = Some(reviewers);
     sim.s.request_review(author, req, sim.now).unwrap()
 }
