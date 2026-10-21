@@ -185,7 +185,7 @@ async fn requests_take_the_hubs_rules_and_old_reviews_keep_theirs() {
         .unwrap();
     let props = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "request_review").unwrap()["inputSchema"]["properties"].clone();
     let names: Vec<&String> = props.as_object().unwrap().keys().collect();
-    assert_eq!(names, ["count", "head_sha", "note", "pr_url", "reviewers"]);
+    assert_eq!(names, ["count", "head_sha", "note", "pr_url", "reviewers", "title"]);
 
     let out = hub.friend("fa", "request_review", json!({"pr_url": pr(1), "confirm_fraction": 0.99, "vote_rounds": 1, "review_seconds": 9})).await;
     assert!(out.contains(" Ignored confirm_fraction, vote_rounds, review_seconds: the hub sets consensus rules."), "{out}");
@@ -219,7 +219,8 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 2).await;
     hub.owner("rv", "hello", json!({"role": "reviewer"})).await;
-    for n in 1..=5 {
+    hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 1, "title": "Drop the <v1> export"})).await;
+    for n in 2..=5 {
         hub.friend("fa", "request_review", json!({"pr_url": pr(n), "count": 1})).await;
     }
     hub.owner("rv", "accept_review", json!({"review_id": "r1"})).await;
@@ -336,10 +337,11 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
 
     let hub = hub.restart().await;
     let page = hub.page("friend", "r1").await;
-    assert!(page.contains("<title>Cancelled · example-org/demo#1</title>") && page.contains("<p class=\"vt\">Cancelled</p>"), "{page}");
+    assert!(page.contains("<title>Cancelled · Drop the &lt;v1&gt; export</title>") && page.contains("<p class=\"vt\">Cancelled</p>"), "{page}");
     assert!(page.contains("friend cancelled it. The author can request it again.") && !page.contains("id=\"cancel\""), "{page}");
     let index = browser("friend").get(format!("{}/", hub.tailnet)).send().await.unwrap().text().await.unwrap();
-    assert!(index.contains("demo#1<span class=\"sr\">, Cancelled</span>") && index.contains("Cancelled</span> ·</span> <span>by friend ·</span>"), "{index}");
+    assert!(index.contains("Drop the &lt;v1&gt; export<span class=\"sr\">, Cancelled</span>") && index.contains("example-org/demo#2</span>") && index.contains(">Pull request #2<span") && index.contains("Cancelled</span> ·</span> <span>by friend ·</span>"), "{index}");
+    assert_eq!(hub.api("r1").await["title"], "Drop the <v1> export");
     assert_eq!(hub.api("r1").await["timeline"].as_array().unwrap().last().unwrap()["name"], "Cancelled");
     assert!(page.contains("<b>rv</b> <span class=\"badge s-closed\">stopped</span>") && !page.contains(">reviewing<"), "{page}");
     assert!(hub.page("owner", "r2").await.contains("The hub owner cancelled it."));

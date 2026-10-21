@@ -901,6 +901,46 @@ fn reload(s: &State, saved: Ms, now: Ms) -> State {
 }
 
 #[test]
+fn a_pr_title_is_cleaned_shown_to_people_and_kept_from_agents() {
+    let mut sim = setup(&["rev-a"]);
+    let mut req = NewReview::new(PR);
+    req.reviewers = Some(1);
+    req.title = Some(format!("PRTITLE <b>x</b> &\u{202E} `y`\n\u{2028}  next\t{}", "z".repeat(300)));
+    let id = sim.s.request_review("alice-codex", req, sim.now).unwrap();
+    let title = sim.s.review(&id).unwrap().title.clone().unwrap();
+    assert!(title.starts_with("PRTITLE <b>x</b> & `y` next zz") && title.chars().count() == 256, "{title}");
+    let page = amx::web::render_review(sim.s.review(&id).unwrap());
+    assert!(page.contains("<h1><span class=\"ref\">rust-lang/rust#1</span>") && page.contains(">PRTITLE &lt;b&gt;x&lt;/b&gt; &amp; `y` next zz"), "{page}");
+    let mut agents = sim.events("rev-a");
+    sim.accept("rev-a", &id);
+    agents += &sim.events("rev-a");
+    sim.submit("rev-a", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    agents += &sim.events("alice-codex");
+    let r = sim.s.review(&id).unwrap();
+    agents += &amx::text::status(r, "alice-codex", sim.now, "");
+    agents += &amx::text::result(r, "");
+    assert!(agents.contains(PR) && !agents.contains("PRTITLE"), "{agents}");
+
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "", sim.now).unwrap();
+    let saved = reload(&sim.s, sim.now, sim.now);
+    assert_eq!(saved.review(&id2).unwrap().title.as_deref(), Some(title.as_str()), "carried to the re-review and saved");
+    assert!(amx::web::render_index(&saved, sim.now, |_| false).contains(">PRTITLE &lt;b&gt;"));
+}
+
+#[test]
+fn a_review_without_a_title_is_named_by_its_number() {
+    let mut sim = setup(&["rev-a"]);
+    let mut req = NewReview::new(PR);
+    req.title = Some(" \u{202E}\n ".into());
+    let id = sim.s.request_review("alice-codex", req, sim.now).unwrap();
+    let json = serde_json::to_string(&sim.s.snapshot(sim.now)).unwrap();
+    assert!(!json.contains("\"title\""), "old state files have none either: {json}");
+    let page = amx::web::render_review(reload(&sim.s, sim.now, sim.now).review(&id).unwrap());
+    assert!(page.contains("<span class=\"ref\">rust-lang/rust#1</span>") && page.contains("Pull request #1<span class=\"ext\">"), "{page}");
+}
+
+#[test]
 fn state_survives_a_snapshot_and_the_review_carries_on() {
     let mut sim = setup(&["rev-a", "rev-b"]);
     let done = sim.request("alice-codex", 2);
