@@ -1441,6 +1441,9 @@ impl State {
     fn new_review(&mut self, author: &str, req: NewReview, now: Ms) -> Result<Review> {
         let pr = crate::prurl::parse(&req.pr_url)
             .ok_or_else(|| anyhow!("not a GitHub pull request URL: {}", req.pr_url))?;
+        let title = req.title.as_deref().and_then(one_line).ok_or_else(|| {
+            anyhow!("title is required: pass the PR's title as `title` (from `gh pr view {} --json title`)", pr.url())
+        })?;
         let login = self.agents.get(author).map(|a| a.login.clone()).unwrap_or_default();
         if let Some(r) = self
             .reviews
@@ -1497,7 +1500,7 @@ impl State {
             author: author.to_string(),
             author_login: login,
             note: bounded(&req.note, "note", MAX_NOTE)?,
-            title: req.title.as_deref().and_then(one_line),
+            title: Some(title),
             params,
             created: now,
             ended: None,
@@ -1939,7 +1942,7 @@ impl State {
         Ok(())
     }
 
-    pub fn rereview(&mut self, author: &str, id: &str, head_sha: &str, note: &str, now: Ms) -> Result<String> {
+    pub fn rereview(&mut self, author: &str, id: &str, head_sha: &str, note: &str, title: Option<&str>, now: Ms) -> Result<String> {
         let head_sha = head_sha.trim();
         if !valid_sha(head_sha) {
             bail!("new_head_sha must be the hex SHA of the commit you pushed");
@@ -1966,7 +1969,10 @@ impl State {
             .or(prev.head_sha.clone());
         let mut req = NewReview::new(&prev.pr.url());
         req.note = note.to_string();
-        req.title = prev.title.clone();
+        req.title = title.and_then(one_line).or(prev.title.clone());
+        if req.title.is_none() {
+            bail!("{} has no title: pass the PR's title as `title` (from `gh pr view {} --json title`)", prev.id, prev.pr.url());
+        }
         req.head_sha = Some(head_sha.to_string());
         req.reviewers = Some(prev.params.reviewers);
         let mut r = self.new_review(author, req, now)?;

@@ -186,10 +186,13 @@ async fn requests_take_the_hubs_rules_and_old_reviews_keep_theirs() {
     let props = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "request_review").unwrap()["inputSchema"]["properties"].clone();
     let names: Vec<&String> = props.as_object().unwrap().keys().collect();
     assert_eq!(names, ["count", "head_sha", "note", "pr_url", "reviewers", "title"]);
+    let schema = |name: &str| tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["inputSchema"].clone();
+    assert_eq!(schema("request_review")["required"], json!(["pr_url", "title"]));
+    assert!(schema("request_rereview")["properties"]["title"].is_object() && schema("request_rereview")["required"] == json!(["review_id", "new_head_sha"]));
 
-    let out = hub.friend("fa", "request_review", json!({"pr_url": pr(1), "confirm_fraction": 0.99, "vote_rounds": 1, "review_seconds": 9})).await;
+    let out = hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(1), "confirm_fraction": 0.99, "vote_rounds": 1, "review_seconds": 9})).await;
     assert!(out.contains(" Ignored confirm_fraction, vote_rounds, review_seconds: the hub sets consensus rules."), "{out}");
-    let plain = hub.friend("fa", "request_review", json!({"pr_url": pr(2)})).await;
+    let plain = hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(2)})).await;
     let toml = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/contrib/config.toml")).unwrap();
     assert!(!toml.contains("override per request"), "{toml}");
     assert!(!plain.contains("Ignored"), "{plain}");
@@ -221,13 +224,13 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     hub.owner("rv", "hello", json!({"role": "reviewer", "model": "claude"})).await;
     hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 1, "title": "Drop the <v1> export"})).await;
     for n in 2..=5 {
-        hub.friend("fa", "request_review", json!({"pr_url": pr(n), "count": 1})).await;
+        hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(n), "count": 1})).await;
     }
     hub.owner("rv", "accept_review", json!({"review_id": "r1"})).await;
     assert_eq!(hub.api("r1").await["phase"], "reviewing");
     let full = Client::new()
         .post(format!("{}/mcp?agent=fa", hub.tailnet))
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_review","arguments":{"pr_url": pr(6)}}}))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_review","arguments":{"pr_url": pr(6), "title": "Add a cache"}}}))
         .send()
         .await
         .unwrap()
@@ -281,7 +284,7 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     assert_eq!(hub.api("r1").await["phase"], "reviewing", "nothing refused changed anything");
 
     // A tailnet login named local is not the hub owner.
-    let evil = call_as(browser("evil"), &hub.tailnet, "ea", "request_review", json!({"pr_url": pr(7), "count": 1})).await;
+    let evil = call_as(browser("evil"), &hub.tailnet, "ea", "request_review", json!({"title": "Add a cache", "pr_url": pr(7), "count": 1})).await;
     let ev_id = evil.split_whitespace().nth(1).unwrap().to_string();
     let (code, _) = hub.post("evil", "/r/r3/cancel", &[]).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
@@ -340,14 +343,14 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     assert!(page.contains("<title>Cancelled · Drop the &lt;v1&gt; export</title>") && page.contains("<p class=\"vt\">Cancelled</p>"), "{page}");
     assert!(page.contains("friend cancelled it. The author can request it again.") && !page.contains("id=\"cancel\""), "{page}");
     let index = browser("friend").get(format!("{}/", hub.tailnet)).send().await.unwrap().text().await.unwrap();
-    assert!(index.contains("Drop the &lt;v1&gt; export<span class=\"sr\">, Cancelled</span>") && index.contains("<span class=\"st s-failed\">Cancelled</span>") && index.contains(">Pull request #2<span") && index.contains("<span>example-org/demo#1 ·</span> <span>by friend ·</span>"), "{index}");
+    assert!(index.contains("Drop the &lt;v1&gt; export<span class=\"sr\">, Cancelled</span>") && index.contains("<span class=\"st s-failed\">Cancelled</span>") && index.contains(">Add a cache<span") && index.contains("<span>example-org/demo#1 ·</span> <span>by friend ·</span>"), "{index}");
     assert_eq!(hub.api("r1").await["title"], "Drop the <v1> export");
     assert_eq!(hub.api("r1").await["timeline"].as_array().unwrap().last().unwrap()["name"], "Cancelled");
     assert!(page.contains("<b>rv</b> <span class=\"pg\">claude</span> <span class=\"badge s-closed\">stopped</span>") && !page.contains(">reviewing<"), "{page}");
     assert!(hub.page("owner", "r2").await.contains("The hub owner cancelled it."));
     let r1 = hub.api("r1").await;
     assert_eq!((r1["phase"].as_str(), r1["cancelled_by"].as_str()), (Some("failed"), Some("friend")));
-    hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 1})).await;
+    hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(1), "count": 1})).await;
     let r = Client::new().get(format!("{}/r/r1", hub.local)).send().await.unwrap();
     assert_eq!(r.headers()["x-frame-options"], "DENY");
     assert_eq!(r.headers()["content-security-policy"], "frame-ancestors 'none'");
@@ -362,7 +365,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     for (r, model) in [("rv1", "claude"), ("rv2", "codex")] {
         hub.reviewer(r, "hello", json!({"role": "reviewer", "model": model})).await;
     }
-    hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 2})).await;
+    hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(1), "count": 2})).await;
     for r in ["rv1", "rv2"] {
         hub.reviewer(r, "accept_review", json!({"review_id": "r1"})).await;
     }
@@ -524,7 +527,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
 async fn every_page_names_its_viewer_as_tailscale_reports_them_and_is_not_cached() {
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 2).await;
-    hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 1})).await;
+    hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(1), "count": 1})).await;
     hub.running.hub.owner.lock().unwrap().as_mut().unwrap().login = "boss@example.com".into();
     let get = |who: &'static str, path: &'static str, proxy: Option<&'static str>| {
         let url = format!("{}{path}", hub.base(who));

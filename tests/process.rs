@@ -48,7 +48,7 @@ fn missing_explicit_config_is_an_error() {
 
 fn request_review(url: &str, pr: &str) -> Value {
     let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"request_review","arguments":{{"pr_url":"{pr}","reviewers":1}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"request_review","arguments":{{"pr_url":"{pr}","title":"Add a cache","reviewers":1}}}}}}"#
     );
     let out = Command::new("curl")
         .args(["-sS", "-H", "content-type: application/json", "-d", &body])
