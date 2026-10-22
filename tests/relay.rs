@@ -2658,3 +2658,90 @@ fn the_agents_panel_counts_each_program_and_names_the_one_short() {
     let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
     assert!(!index.contains("class=\"warn\"") && !index.contains("no codex idle"), "an idle codex reviewer can take it: {index}");
 }
+
+const EXAMPLE_PR: &str = "https://github.com/example-org/widgets/pull/7";
+
+fn example(sim: &mut Sim, reviewers: usize) -> String {
+    let mut req = titled(EXAMPLE_PR);
+    req.reviewers = Some(reviewers);
+    sim.s.request_review("alice-codex", req, sim.now).unwrap()
+}
+
+fn unlinked(sev: &str, text: &str) -> SubmitIn {
+    SubmitIn {
+        head_sha: SHA.into(),
+        verdict: "changes_requested".into(),
+        summary: "looked".into(),
+        findings: vec![FindingIn { severity: sev.into(), url: None, title: Some(format!("{sev} issue")), text: text.into() }],
+    }
+}
+
+#[test]
+fn a_must_fix_ruling_holds_while_the_rereview_finds_the_problem_still_there() {
+    let mut sim = setup(&["rev-a"]);
+    let id = example(&mut sim, 1);
+    sim.accept("rev-a", &id);
+    sim.s.submit("rev-a", &id, unlinked("minor", "stale cache after reload"), sim.now).unwrap();
+    assert_eq!(sim.status(&id, "F1"), Status::Unverified);
+    sim.s.rule(&id, "F1", "alice", Some(true), sim.now).unwrap();
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "", None, sim.now).unwrap();
+    sim.submit("rev-a", &id2, &[]);
+    sim.vote("rev-a", &id2, &[("C1", "agree")]);
+    assert_eq!(sim.status(&id2, "C1"), Status::Confirmed);
+    assert_eq!(sim.verdict(&id2), Verdict::ChangesRequested, "still there at minor, still must fix");
+    let id3 = sim.s.rereview("alice-codex", &id2, SHA, "", None, sim.now).unwrap();
+    sim.submit("rev-a", &id3, &[]);
+    sim.vote("rev-a", &id3, &[("C1", "disagree")]);
+    assert_eq!(sim.status(&id3, "C1"), Status::Rejected);
+    assert_eq!(sim.verdict(&id3), Verdict::Approve, "fixed releases the ruling");
+}
+
+#[test]
+fn an_offline_authors_unread_result_outlasts_the_forget_timeout() {
+    let mut sim = setup(&["rev-a"]);
+    let id = example(&mut sim, 1);
+    sim.accept("rev-a", &id);
+    sim.leave("alice-codex");
+    sim.submit("rev-a", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    sim.now += 25 * 3600 * 1000;
+    sim.s.tick(sim.now);
+    assert!(sim.events("alice-codex").contains(&format!("[{id}] Review result")), "the result waits for its author");
+    sim.now += 25 * 3600 * 1000;
+    sim.s.tick(sim.now);
+    assert!(sim.s.agents.get("alice-codex").is_none(), "forgotten once it has read it");
+}
+
+#[test]
+fn only_an_offered_review_can_be_accepted() {
+    let mut sim = setup(&["rev-a"]);
+    sim.leave("rev-a");
+    sim.advance(100);
+    let id = example(&mut sim, 1);
+    sim.s.touch("rev-a", &who("alice@example.com"), None, sim.now).unwrap();
+    let err = sim.s.accept("rev-a", &id, sim.now).unwrap_err();
+    assert!(err.to_string().contains("wasn't offered to you"), "{err}");
+    sim.s.tick(sim.now);
+    sim.accept("rev-a", &id);
+    assert_eq!(sim.phase(&id), Phase::Reviewing);
+}
+
+#[test]
+fn a_rereview_reassigns_a_reviewer_whatever_the_letter_case_of_its_login() {
+    let mut sim = Sim::new();
+    sim.join("alice-codex", "alice@example.com", Role::Author);
+    sim.join("rev-b", "Bob@example.com", Role::Reviewer);
+    let id = example(&mut sim, 1);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-b", &id, &[]);
+    sim.events("alice-codex");
+    sim.events("rev-b");
+    sim.now += 25 * 3600 * 1000;
+    sim.s.tick(sim.now);
+    assert!(sim.s.agents.get("rev-b").is_none());
+    sim.join("alice-codex", "alice@example.com", Role::Author);
+    sim.join("rev-b", "bob@example.com", Role::Reviewer);
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "", None, sim.now).unwrap();
+    assert_eq!(sim.phase(&id2), Phase::Reviewing, "assigned again");
+}

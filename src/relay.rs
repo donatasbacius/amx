@@ -432,9 +432,14 @@ pub struct Ruling {
 }
 
 impl Finding {
-    /// Its ruling, which counts only while the votes leave it disputed or unverified.
+    /// Its ruling, which counts only while the votes leave it disputed or unverified, or, carried
+    /// into a re-review, until they find it fixed.
     pub fn ruled(&self) -> Option<&Ruling> {
-        let open = self.outcome.as_ref().is_some_and(|o| matches!(o.status, Status::Disputed | Status::Unverified));
+        let open = self.outcome.as_ref().is_some_and(|o| match o.status {
+            Status::Disputed | Status::Unverified => true,
+            Status::Rejected | Status::Withdrawn => false,
+            Status::Confirmed | Status::Duplicate(_) => self.by.is_none(),
+        });
         self.ruling.as_ref().filter(|_| open)
     }
 
@@ -1613,6 +1618,9 @@ impl State {
         if let Some(m) = r.lacks(model) {
             bail!("{} still needs a {} reviewer: a review with more than one reviewer has both claude and codex. Call `wait`", r.id, m.as_str());
         }
+        if !r.offered.contains(agent) {
+            bail!("{} wasn't offered to you; call `wait` for your offers", r.id);
+        }
         r.declined.remove(agent);
         r.slots.push(Slot {
             agent: agent.to_string(),
@@ -2016,7 +2024,7 @@ impl State {
             s.active()
                 && self.agents.online(&s.agent, now)
                 && !busy.contains(&s.agent)
-                && self.agents.get(&s.agent).is_some_and(|a| a.role == Role::Reviewer && a.login == s.login)
+                && self.agents.get(&s.agent).is_some_and(|a| a.role == Role::Reviewer && a.login.eq_ignore_ascii_case(&s.login))
         }) {
             let author = s.login.eq_ignore_ascii_case(&r.author_login);
             let model = self.agents.get(&s.agent).and_then(|a| a.model);
@@ -2157,9 +2165,11 @@ impl State {
             .filter(|r| r.phase.active())
             .flat_map(|r| std::iter::once(r.author.clone()).chain(r.slots.iter().map(|s| s.agent.clone())))
             .collect();
+        let stale = |a: &Agent| now.saturating_sub(a.last_seen) >= FORGET_AGENT_MS;
+        let unread: HashSet<String> = self.agents.all().filter(|a| stale(a) && self.has_undelivered(&a.name)).map(|a| a.name.clone()).collect();
         let streams = &self.agents.streams;
         self.agents.map.retain(|name, a| {
-            engaged.contains(name) || a.waiting > 0 || streams.contains_key(name) || now.saturating_sub(a.last_seen) < FORGET_AGENT_MS
+            engaged.contains(name) || a.waiting > 0 || streams.contains_key(name) || unread.contains(name) || !stale(a)
         });
         stepped || before != self.fingerprint(now)
     }
