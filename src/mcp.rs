@@ -88,7 +88,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "submit_findings",
-            "description": "Submit your review once, after reading the PR read-only (`gh pr view`, `gh pr diff`); others' findings stay hidden until all have submitted. Each finding: severity (blocking = must not merge: bugs, data loss, security; major = fix before merge; minor = worth fixing; nit = taste), url of the exact line (https://github.com/<owner>/<repo>/blob/<head_sha>/<path>#L<line>), and text with the problem and the fix. Empty list if the PR is fine.",
+            "description": format!("Submit your review once, after reading the PR read-only (`gh pr view`, `gh pr diff`); others' findings stay hidden until all have submitted. Each finding: severity (blocking = must not merge: bugs, data loss, security; major = fix before merge; minor = worth fixing; nit = taste), url of the exact line (https://github.com/<owner>/<repo>/blob/<head_sha>/<path>#L<line>), title and text. Be terse: no preamble, don't restate the code or the title. Empty list if the PR is fine. {}", text::MARKDOWN),
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "head_sha": { "type": "string", "description": "The PR head commit you reviewed (headRefOid)." },
@@ -97,8 +97,9 @@ pub fn tools() -> Value {
                 "findings": { "type": "array", "items": { "type": "object", "properties": {
                     "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"] },
                     "url": { "type": "string" },
-                    "text": { "type": "string" }
-                }, "required": ["severity", "text"] } }
+                    "title": { "type": "string", "description": "What's wrong in a few words, at most 80 characters." },
+                    "text": { "type": "string", "description": "One to three sentences: where, why it matters, the fix." }
+                }, "required": ["severity", "title", "text"] } }
             }, "required": ["review_id", "head_sha", "verdict", "findings"] }
         },
         {
@@ -117,17 +118,18 @@ pub fn tools() -> Value {
         },
         {
             "name": "say",
-            "description": "Message everyone in a review (author and reviewers), e.g. to argue a finding or answer a question. Reviewers can talk once findings are revealed, the author any time. After the review ends, messages are closing remarks that don't change the result.",
+            "description": "Message everyone in a review (author and reviewers), e.g. to argue a finding or answer a question. Reviewers can talk once findings are revealed, the author any time. After the review ends, messages are closing remarks that don't change the result. Keep it brief.",
             "inputSchema": { "type": "object", "properties": { "review_id": rid, "text": { "type": "string" } }, "required": ["review_id", "text"] }
         },
         {
             "name": "amend_finding",
-            "description": "In the reply window before a later round's votes, change your own finding (text, severity, url) to answer objections; everyone votes on it again.",
+            "description": "In the reply window before a later round's votes, change your own finding (title, text, severity, url) to answer objections; everyone votes on it again.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "finding": { "type": "string" },
                 "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"] },
                 "url": { "type": "string" },
+                "title": { "type": "string" },
                 "text": { "type": "string" }
             }, "required": ["review_id", "finding"] }
         },
@@ -221,6 +223,7 @@ struct IdArgs {
 struct FindingArg {
     severity: String,
     url: Option<String>,
+    title: Option<String>,
     text: String,
 }
 
@@ -262,6 +265,7 @@ struct AmendArgs {
     finding: String,
     severity: Option<String>,
     url: Option<String>,
+    title: Option<String>,
     text: Option<String>,
     #[serde(default)]
     reason: String,
@@ -451,6 +455,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                 .map(|f| FindingIn {
                     severity: f.severity,
                     url: f.url,
+                    title: f.title,
                     text: f.text,
                 })
                 .collect();
@@ -493,6 +498,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
             let change = AmendIn {
                 severity: r.severity,
                 url: r.url,
+                title: r.title,
                 text: r.text,
             };
             hub.write(|s, now| s.amend(agent, &r.review_id, &r.finding, change, now))?;

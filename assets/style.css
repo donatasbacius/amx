@@ -149,7 +149,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .rv-when [data-deadline] { color: var(--run); }
 .rv-meta { grid-area: m; }
 #g-call .rv { box-shadow: inset 3px 0 0 var(--judge); }
-.rv:hover, .f > summary:hover { background: var(--bg); }
+.rv:hover, .f > summary:hover, .f[open] > summary { background: var(--bg); }
 .rv:hover .rv-pr { text-decoration: underline; }
 .rv:has(.rv-pr:focus-visible) { outline: 2px solid var(--link); outline-offset: -2px; }
 .rv-pr::after { content: ""; position: absolute; inset: 0; }
@@ -215,6 +215,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .sev-major { border-color: var(--text); }
 .sev-nit { color: var(--muted); font-weight: 600; }
 .ft { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.ft.w { white-space: normal; overflow-wrap: anywhere; }
 .fx { flex: none; display: flex; align-items: baseline; gap: var(--sp-3); }
 .fid { font-family: var(--mono); min-width: 2.2em; text-align: right; }
 .fb { padding: 0 var(--row-x) var(--sp-4) calc(var(--row-x) + var(--sev-w) + var(--sp-3)); }

@@ -218,7 +218,7 @@ async fn review_over_mcp_with_long_polls() {
         "friend-rev",
         "submit_findings",
         json!({"review_id":"r1","head_sha":"0123456789abcdef","verdict":"changes_requested","summary":"ok",
-               "findings":[{"severity":"major","url":"https://github.com/rust-lang/rust/blob/0123456/src/a.rs#L3","text":"<script>alert(1)</script> breaks `Vec<T>`"}]}),
+               "findings":[{"severity":"major","url":"https://github.com/rust-lang/rust/blob/0123456/src/a.rs#L3","title":"Short title","text":"<script>alert(1)</script> breaks `Vec<T>`"}]}),
     )
     .await;
     assert!(sub.contains("Submitted 1 finding"), "{sub}");
@@ -248,7 +248,7 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     }
     let index = get("/").await.unwrap().text().await.unwrap();
     assert!(index.contains("Agents: <span>2 reviewing ·</span> <span>1 author</span></a>") && index.contains("on <a href=\"/r/r1\">rust#1</a>"), "{index}");
-    let finding = json!([{"severity":"major","text":"SECRET until revealed\nsecond line"}]);
+    let finding = json!([{"severity":"major","title":"SECRET title","text":"SECRET until revealed\nsecond line"}]);
     ok_tool(&base, "rev-a", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","summary":"PRIVATE","findings":finding})).await;
 
     let r = get("/api/reviews/r1").await.unwrap();
@@ -267,10 +267,11 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     let v: Value = get("/api/reviews/r1").await.unwrap().json().await.unwrap();
     assert_eq!(v["phase"], "done");
     assert_eq!(v["verdict"], "changes_requested");
+    assert_eq!((v["findings"][0]["title"].as_str(), v["findings"][0]["text"].as_str()), (Some("SECRET title"), Some("SECRET until revealed\nsecond line")));
     assert_eq!(v["findings"][0]["votes"]["rev-b"]["choice"], "Agree");
     assert_eq!(v["findings"][0]["votes"]["rev-b"]["severity"], "major", "the severity the vote backs");
     assert!(v["log"].as_array().unwrap().iter().any(|e| e["text"] == "F1: agree (major)"), "{}", v["log"]);
-    assert_eq!(v["summary"][0], json!({"id":"F1","title":"SECRET until revealed","severity":"major","severity_split":null,"by":"rev-a","origin":null,"outcome":"confirmed","agree":2,"disagree":0}));
+    assert_eq!(v["summary"][0], json!({"id":"F1","title":"SECRET title","severity":"major","severity_split":null,"by":"rev-a","origin":null,"outcome":"confirmed","agree":2,"disagree":0}));
     assert!(v["result"]["text"].as_str().unwrap().contains("CHANGES REQUESTED"));
     assert!(v["log"].as_array().unwrap().iter().any(|e| e["kind"] == "result"));
     let stages: Vec<&str> = v["timeline"].as_array().unwrap().iter().map(|s| s["state"].as_str().unwrap()).collect();
@@ -481,11 +482,11 @@ async fn owed_tasks_are_given_in_full_once_per_result() {
     let acc = ok_tool(&base, "rev-a", "accept_review", json!({"review_id":"r1"})).await;
     assert!(acc.contains("gh pr diff") && acc.contains("at least 20m00s"), "starts at once: {acc}");
     ok_tool(&base, "rev-b", "accept_review", json!({"review_id":"r1"})).await;
-    let findings = json!([{"severity":"major","text":"cache never invalidated"},{"severity":"minor","text":"typo in docs"}]);
+    let findings = json!([{"severity":"major","title":"Short title","text":"cache never invalidated"},{"severity":"minor","title":"Short title","text":"typo in docs"}]);
     ok_tool(&base, "rev-a", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","findings":findings})).await;
     let idle = ok_tool(&base, "rev-a", "wait", json!({"timeout_seconds": 1})).await;
     assert!(idle.starts_with("No new events."), "no second copy of the task: {idle}");
-    let last = ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[{"severity":"nit","text":"rename x"}]})).await;
+    let last = ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[{"severity":"nit","title":"Short title","text":"rename x"}]})).await;
     assert!(last.contains("You must vote on: F1, F2.") && last.matches("cache never invalidated").count() == 1, "{last}");
     assert!(!last.contains("finding: \"F3\""), "the example never names your own finding: {last}");
     let said = ok_tool(&base, "rev-b", "say", json!({"review_id":"r1","text":"Looking at F1."})).await;
@@ -536,7 +537,7 @@ async fn a_closing_reply_window_wakes_waiting_reviewers() {
     ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev-a", "rev-b"]})).await;
     for (rev, text) in [("rev-a", "race on shutdown"), ("rev-b", "leaks a file handle")] {
         ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
-        let findings = json!([{"severity":"major","text":text}]);
+        let findings = json!([{"severity":"major","title":"Short title","text":text}]);
         ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","findings":findings})).await;
     }
     ok_tool(&base, "rev-a", "vote", json!({"review_id":"r1","votes":[{"finding":"F2","vote":"disagree","reason":"closed in Drop"}]})).await;

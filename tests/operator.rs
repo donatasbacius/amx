@@ -370,8 +370,8 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
         hub.reviewer(r, "accept_review", json!({"review_id": "r1"})).await;
     }
     let findings = json!([
-        {"severity": "major", "text": "The retry loop has no backoff."},
-        {"severity": "minor", "text": "Retries reuse one idempotency key."},
+        {"severity": "major", "title": "Short title", "text": "The retry loop has no backoff."},
+        {"severity": "minor", "title": "Short title", "text": "Retries reuse one idempotency key."},
     ]);
     hub.reviewer("rv1", "submit_findings", json!({"review_id": "r1", "head_sha": SHA, "verdict": "changes_requested", "findings": findings})).await;
     hub.reviewer("rv2", "submit_findings", json!({"review_id": "r1", "head_sha": SHA, "verdict": "approve", "findings": []})).await;
