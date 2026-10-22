@@ -236,7 +236,7 @@ fn votes(f: &Finding) -> (usize, usize) {
     }
 }
 
-/// The first line of a finding as plain text.
+/// The first line of a finding's title or text as plain text.
 pub fn title(text: &str) -> String {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     let line = line.trim_start_matches(['#', '>', '-', '*', ' ']).replace(['*', '`'], "");
@@ -821,12 +821,13 @@ fn render_finding(out: &mut String, r: &Review, f: &Finding, rule: bool) {
         None => "<span class=\"badge s-undecided\">undecided</span>".into(),
     };
     let new = if r.parent.is_some() && f.by.is_some() { "<span class=\"badge s-new\">new</span>" } else { "" };
-    let head = heading(&f.text).map_or_else(|| format!("Finding {}", esc(&f.id)), inline);
+    let head = f.title.as_deref().or_else(|| heading(&f.text)).map_or_else(|| format!("Finding {}", esc(&f.id)), inline);
     let _ = write!(
         out,
         "<details class=\"f{dim}\" id=\"{id}\"{open}><summary><span class=\"sev sev-{sev}\">{sev}</span>\
-         <span class=\"ft\" dir=\"auto\">{head}</span><span class=\"fx\">{new}{mark}<span class=\"fid\">{id}</span></span>{CHEVRON}</summary><div class=\"fb\">",
+         <span class=\"ft{wrap}\" dir=\"auto\">{head}</span><span class=\"fx\">{new}{mark}<span class=\"fid\">{id}</span></span>{CHEVRON}</summary><div class=\"fb\">",
         dim = if rank >= Rank::Fixed { " dim" } else { "" },
+        wrap = if f.title.is_some() { " w" } else { "" },
         id = esc(&f.id),
         open = if open { " open" } else { "" },
         sev = sev.as_str(),
@@ -1258,7 +1259,7 @@ fn summary_json(r: &Review, f: &Finding) -> Value {
     let (agree, disagree) = votes(f);
     json!({
         "id": f.id,
-        "title": title(&f.text),
+        "title": title(f.title.as_deref().unwrap_or(&f.text)),
         "severity": f.outcome.as_ref().map(|o| o.severity).unwrap_or(f.severity),
         "severity_split": split_range(f),
         "by": f.by,

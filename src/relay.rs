@@ -23,6 +23,8 @@ const MAX_WAIT_BYTES: usize = 64 * 1024;
 const MAX_NOTE: usize = 8000;
 /// GitHub's own limit.
 const MAX_TITLE: usize = 256;
+/// A finding's heading; longer ones are cut, as PR titles are.
+const MAX_FINDING_TITLE: usize = 100;
 const MAX_SAY: usize = 4000;
 const MAX_FINDING: usize = 2000;
 const MAX_REASON: usize = 1000;
@@ -407,6 +409,9 @@ pub struct Finding {
     pub by: Option<String>,
     pub severity: Severity,
     pub url: Option<String>,
+    /// `None` for findings raised before findings had titles: their text's first line stands in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub text: String,
     pub origin: Option<String>,
     pub withdrawn: Option<String>,
@@ -431,6 +436,11 @@ impl Finding {
     pub fn ruled(&self) -> Option<&Ruling> {
         let open = self.outcome.as_ref().is_some_and(|o| matches!(o.status, Status::Disputed | Status::Unverified));
         self.ruling.as_ref().filter(|_| open)
+    }
+
+    /// Its title, or its text's first line for a finding without one.
+    pub fn heading(&self) -> &str {
+        self.title.as_deref().unwrap_or_else(|| self.text.trim().lines().next().unwrap_or(""))
     }
 
     /// Votes cast on its current revision; an amendment needs fresh ones.
@@ -783,12 +793,14 @@ pub struct SubmitIn {
 pub struct AmendIn {
     pub severity: Option<String>,
     pub url: Option<String>,
+    pub title: Option<String>,
     pub text: Option<String>,
 }
 
 pub struct FindingIn {
     pub severity: String,
     pub url: Option<String>,
+    pub title: Option<String>,
     pub text: String,
 }
 
@@ -952,23 +964,27 @@ fn bounded(s: &str, what: &str, max: usize) -> Result<String> {
     Ok(s.to_string())
 }
 
-/// One line of at most `MAX_TITLE` characters, without control or bidi characters; `None` if empty.
-fn one_line(s: &str) -> Option<String> {
+/// One line of at most `max` characters, without control or bidi characters; `None` if empty.
+fn one_line(s: &str, max: usize) -> Option<String> {
     let s: String = s.chars().filter(|&c| !text::bidi(c)).map(|c| if c.is_control() { ' ' } else { c }).collect();
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let s: String = s.chars().take(MAX_TITLE).collect();
+    let s: String = s.chars().take(max).collect();
     (!s.is_empty()).then(|| s.trim_end().to_string())
 }
 
-fn finding_size(text: &str, url: Option<&str>) -> usize {
-    text.chars().count() + url.map_or(0, |u| u.chars().count())
+fn finding_title(s: Option<&str>) -> Option<String> {
+    s.and_then(|t| one_line(t, MAX_FINDING_TITLE))
+}
+
+fn finding_size(title: Option<&str>, text: &str, url: Option<&str>) -> usize {
+    [title, Some(text), url].into_iter().flatten().map(|s| s.chars().count()).sum()
 }
 
 /// What `agent` has put in front of the other reviewers of `r`: its live findings with their links, and its summary.
 fn reviewer_text(r: &Review, agent: &str) -> usize {
     let findings = r.findings.iter().filter(|f| f.by.as_deref() == Some(agent) && f.withdrawn.is_none());
     let summary = r.slot(agent).and_then(|s| s.submission.as_ref()).map_or(0, |s| s.summary.chars().count());
-    findings.map(|f| finding_size(&f.text, f.url.as_deref())).sum::<usize>() + summary
+    findings.map(|f| finding_size(f.title.as_deref(), &f.text, f.url.as_deref())).sum::<usize>() + summary
 }
 
 fn check_reviewer_text(n: usize) -> Result<()> {
@@ -1441,7 +1457,7 @@ impl State {
     fn new_review(&mut self, author: &str, req: NewReview, now: Ms) -> Result<Review> {
         let pr = crate::prurl::parse(&req.pr_url)
             .ok_or_else(|| anyhow!("not a GitHub pull request URL: {}", req.pr_url))?;
-        let title = req.title.as_deref().and_then(one_line).ok_or_else(|| {
+        let title = req.title.as_deref().and_then(|t| one_line(t, MAX_TITLE)).ok_or_else(|| {
             anyhow!("title is required: pass the PR's title as `title` (from `gh pr view {} --json title`)", pr.url())
         })?;
         let login = self.agents.get(author).map(|a| a.login.clone()).unwrap_or_default();
@@ -1661,18 +1677,22 @@ impl State {
                 .ok_or_else(|| anyhow!("finding {}: severity must be blocking, major, minor or nit", i + 1))?;
             let url = f.url.as_deref().map(str::trim).filter(|u| !u.is_empty());
             let url = url.map(|u| check_url(&r.pr, u)).transpose().map_err(|e| anyhow!("finding {}: {e}", i + 1))?;
+            let title = finding_title(f.title.as_deref()).ok_or_else(|| {
+                anyhow!("finding {}: title is required: pass a short heading saying what's wrong as `title`, and the details as `text`", i + 1)
+            })?;
             let text = need_text(&f.text, &format!("finding {}", i + 1))?;
-            parsed.push((severity, url, text));
+            parsed.push((severity, url, title, text));
         }
         let summary = bounded(&summary, "summary", MAX_FINDING)?;
-        check_reviewer_text(parsed.iter().map(|(_, u, t)| finding_size(t, u.as_deref())).sum::<usize>() + summary.chars().count())?;
-        for (severity, url, text) in parsed {
+        check_reviewer_text(parsed.iter().map(|(_, u, h, t)| finding_size(Some(h), t, u.as_deref())).sum::<usize>() + summary.chars().count())?;
+        for (severity, url, title, text) in parsed {
             r.next_finding += 1;
             r.findings.push(Finding {
                 id: format!("F{}", r.next_finding),
                 by: Some(agent.to_string()),
                 severity,
                 url,
+                title: Some(title),
                 text,
                 origin: None,
                 withdrawn: None,
@@ -1876,6 +1896,7 @@ impl State {
         let severity = change.severity.as_deref();
         let url = change.url.as_deref();
         let new_text = change.text.as_deref();
+        let title = finding_title(change.title.as_deref());
         let login = self.login_of(agent);
         let r = self.review_mut(id)?;
         r.check_login(agent, &login)?;
@@ -1887,8 +1908,8 @@ impl State {
             .transpose()?;
         let url = url.map(str::trim).filter(|u| !u.is_empty()).map(|u| check_url(&pr, u)).transpose()?;
         let new_text = new_text.map(|t| need_text(t, "text")).transpose()?;
-        if severity.is_none() && url.is_none() && new_text.is_none() {
-            bail!("nothing to amend: give severity, url and/or text");
+        if severity.is_none() && url.is_none() && title.is_none() && new_text.is_none() {
+            bail!("nothing to amend: give severity, url, title and/or text");
         }
         let total = reviewer_text(r, agent);
         check_talk(r, agent, 1, now)?;
@@ -1896,8 +1917,8 @@ impl State {
         if f.revision >= AMENDS_PER_FINDING {
             bail!("you have amended {} {AMENDS_PER_FINDING} times; withdraw it or `say` why it stands", f.id);
         }
-        let after = finding_size(new_text.as_deref().unwrap_or(&f.text), url.as_deref().or(f.url.as_deref()));
-        check_reviewer_text(total - finding_size(&f.text, f.url.as_deref()) + after)?;
+        let after = finding_size(title.as_deref().or(f.title.as_deref()), new_text.as_deref().unwrap_or(&f.text), url.as_deref().or(f.url.as_deref()));
+        check_reviewer_text(total - finding_size(f.title.as_deref(), &f.text, f.url.as_deref()) + after)?;
         if !replying {
             bail!("findings can be amended only in the reply window before a later round's votes open; `say` why it stands or `withdraw_finding`");
         }
@@ -1907,12 +1928,18 @@ impl State {
         if url.is_some() {
             f.url = url;
         }
+        if title.is_some() {
+            f.title = title;
+        }
         if let Some(t) = new_text {
             f.text = t;
         }
         f.revision += 1;
         f.open_round = round;
-        let line = format!("amended {} [{}]: {}", f.id, f.severity.as_str(), f.text);
+        let line = match &f.title {
+            Some(t) => format!("amended {} [{}]: {t}\n{}", f.id, f.severity.as_str(), f.text),
+            None => format!("amended {} [{}]: {}", f.id, f.severity.as_str(), f.text),
+        };
         let fid = f.id.clone();
         r.log(now, agent, "amend", line);
         r.replied.insert(agent.to_string());
@@ -1969,7 +1996,7 @@ impl State {
             .or(prev.head_sha.clone());
         let mut req = NewReview::new(&prev.pr.url());
         req.note = note.to_string();
-        req.title = title.and_then(one_line).or(prev.title.clone());
+        req.title = title.and_then(|t| one_line(t, MAX_TITLE)).or(prev.title.clone());
         if req.title.is_none() {
             bail!("{} has no title: pass the PR's title as `title` (from `gh pr view {} --json title`)", prev.id, prev.pr.url());
         }
@@ -2013,6 +2040,7 @@ impl State {
                 by: None,
                 severity: o.severity,
                 url: f.url.clone(),
+                title: f.title.clone(),
                 text: f.text.clone(),
                 origin: Some(format!("{}/{}", prev.id, f.id)),
                 withdrawn: None,
