@@ -157,11 +157,27 @@ fn viewer_tag(v: &Viewer) -> String {
     }
 }
 
+pub const STYLE: &str = include_str!("../assets/style.css");
+pub const SCRIPT: &str = include_str!("../assets/app.js");
+const STYLE_V: u32 = version(STYLE.as_bytes());
+const SCRIPT_V: u32 = version(SCRIPT.as_bytes());
+
+/// FNV-1a of an asset, put in its URL so browsers can keep it until it changes.
+const fn version(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c9dc5;
+    let mut i = 0;
+    while i < bytes.len() {
+        h = (h ^ bytes[i] as u32).wrapping_mul(0x01000193);
+        i += 1;
+    }
+    h
+}
+
 /// `live` pages poll for changes and show a line while they can't; others load no script.
 fn page(title: &str, main: &str, live: bool, viewer: &Viewer) -> String {
     let (script, status, tag) = if live {
         (
-            "<script src=\"/static/app.js\" defer></script>\n",
+            format!("<script src=\"/static/app.js?v={SCRIPT_V:08x}\" defer></script>\n"),
             "<span class=\"live\" role=\"status\" aria-atomic=\"false\"><span id=\"live\"></span><span id=\"said\" class=\"sr\"></span></span>",
             format!(" data-etag='{}'", etag(main)),
         )
@@ -176,7 +192,7 @@ fn page(title: &str, main: &str, live: bool, viewer: &Viewer) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>{title}</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v={STYLE_V:08x}">
 {script}</head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -745,24 +761,23 @@ fn severity_note(f: &Finding) -> Option<String> {
     }
 }
 
-/// The finding's heading line and the rest of its text. A first line that starts a paragraph is the
-/// heading; otherwise the first paragraph's first line is, and the body is the whole text.
-fn heading(text: &str) -> (Option<&str>, &str) {
+/// The finding's heading line: its first line if that starts a paragraph, otherwise the first
+/// paragraph's first line.
+fn heading(text: &str) -> Option<&str> {
     use pulldown_cmark::{Event, Parser, Tag};
     let text = text.trim();
     let mut depth = 0;
     for (e, at) in Parser::new_ext(text, options()).into_offset_iter() {
         match e {
             Event::Start(Tag::Paragraph) if depth == 0 => {
-                let line = text[at.start..].lines().next().unwrap_or("").trim_end();
-                return (Some(line), if at.start == 0 { text[line.len()..].trim() } else { text });
+                return text[at.start..].lines().next().map(str::trim_end);
             }
             Event::Start(_) => depth += 1,
             Event::End(_) => depth -= 1,
             _ => {}
         }
     }
-    (None, text)
+    None
 }
 
 /// A line of agent text as inline markdown without links, as it sits in a `<summary>`, or as plain
@@ -806,24 +821,17 @@ fn render_finding(out: &mut String, r: &Review, f: &Finding, rule: bool) {
         None => "<span class=\"badge s-undecided\">undecided</span>".into(),
     };
     let new = if r.parent.is_some() && f.by.is_some() { "<span class=\"badge s-new\">new</span>" } else { "" };
-    let raised = match &f.outcome {
-        Some(o) if o.severity != f.severity => format!("<span class=\"was\">raised {}</span>", f.severity.as_str()),
-        _ => String::new(),
-    };
-    let (head, body) = heading(&f.text);
-    let head = head.map_or_else(|| format!("Finding {}", esc(&f.id)), inline);
+    let head = heading(&f.text).map_or_else(|| format!("Finding {}", esc(&f.id)), inline);
     let _ = write!(
         out,
         "<details class=\"f{dim}\" id=\"{id}\"{open}><summary><span class=\"sev sev-{sev}\">{sev}</span>\
-         <span class=\"ft\" dir=\"auto\">{head}</span><span class=\"fx\">{raised}{new}{mark}<span class=\"fid\">{id}</span></span>{CHEVRON}</summary><div class=\"fb\">",
+         <span class=\"ft\" dir=\"auto\">{head}</span><span class=\"fx\">{new}{mark}<span class=\"fid\">{id}</span></span>{CHEVRON}</summary><div class=\"fb\">",
         dim = if rank >= Rank::Fixed { " dim" } else { "" },
         id = esc(&f.id),
         open = if open { " open" } else { "" },
         sev = sev.as_str(),
     );
-    if !body.is_empty() {
-        let _ = write!(out, "<div class=\"md\" dir=\"auto\">{}</div>", markdown(body));
-    }
+    let _ = write!(out, "<div class=\"md\" dir=\"auto\">{}</div>", markdown(f.text.trim()));
     let mut facts = vec![match (&f.by, &f.origin) {
         (Some(b), _) => format!("Raised by <b>{}</b>", esc(b)),
         (None, Some(o)) => {
@@ -1527,6 +1535,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn asset_versions_follow_their_content() {
+        assert_eq!(version(b""), 0x811c9dc5);
+        assert_eq!(version(b"a"), 0xe40c292c);
+        assert_ne!(version(b"body{}"), version(b"body{ }"));
+    }
+
+    #[test]
     fn escapes_html() {
         assert_eq!(esc("<a href=\"x\">'&'</a>"), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;");
         assert_eq!(esc("\u{202E}live\u{2066}"), "live");
@@ -1563,25 +1578,25 @@ mod tests {
 
     #[test]
     fn headings_take_the_first_line_when_it_starts_a_paragraph() {
-        assert_eq!(heading("Off by one\n\nThe loop ends early."), (Some("Off by one"), "The loop ends early."));
-        assert_eq!(heading("Uses `a.b()` twice. Cache it."), (Some("Uses `a.b()` twice. Cache it."), ""));
-        assert_eq!(heading("No stop here\nand more"), (Some("No stop here"), "and more"));
+        assert_eq!(heading("Off by one\n\nThe loop ends early."), Some("Off by one"));
+        assert_eq!(heading("Uses `a.b()` twice. Cache it."), Some("Uses `a.b()` twice. Cache it."));
+        assert_eq!(heading("No stop here\nand more"), Some("No stop here"));
         let link = "See [foo. bar](https://example.invalid/x) for the problem. Second sentence.";
-        assert_eq!(heading(link), (Some(link), ""), "never cut at a full stop");
-        assert_eq!(heading("Use e.g. a mutex here. The rest of the text."), (Some("Use e.g. a mutex here. The rest of the text."), ""));
+        assert_eq!(heading(link), Some(link), "never cut at a full stop");
+        assert_eq!(heading("Use e.g. a mutex here. The rest of the text."), Some("Use e.g. a mutex here. The rest of the text."));
     }
 
     #[test]
     fn headings_never_split_a_block() {
         let fence = "```rust\nfn main() { let x = 1; }\n```\nCode block first.";
-        assert_eq!(heading(fence), (Some("Code block first."), fence), "the first plain line, the body unchanged");
+        assert_eq!(heading(fence), Some("Code block first."), "the first plain line");
         let list = "1. ordered first\n2. ordered second";
-        assert_eq!(heading(list), (None, list));
+        assert_eq!(heading(list), None);
         let table = "| a | b |\n|---|---|\n| 1 | 2 |";
-        assert_eq!(heading(table), (None, table));
+        assert_eq!(heading(table), None);
         let quoted = "> quoted\n\n## Title\n\n- item\n\nThen prose.";
-        assert_eq!(heading(quoted), (Some("Then prose."), quoted));
-        assert_eq!(heading("Setext title\n---\nbody"), (Some("body"), "Setext title\n---\nbody"));
+        assert_eq!(heading(quoted), Some("Then prose."));
+        assert_eq!(heading("Setext title\n---\nbody"), Some("body"));
     }
 
     #[test]

@@ -315,18 +315,15 @@ async fn identify(
     next.run(req).await
 }
 
+/// Pages link assets by a URL that changes with their content, so browsers may keep each for good.
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
 async fn static_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../assets/style.css"),
-    )
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8"), (header::CACHE_CONTROL, IMMUTABLE)], crate::web::STYLE)
 }
 
 async fn static_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../assets/app.js"),
-    )
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, IMMUTABLE)], crate::web::SCRIPT)
 }
 
 #[derive(Deserialize)]

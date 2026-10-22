@@ -311,6 +311,14 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     for page in [&page, &index] {
         well_formed_for_screen_readers(page);
     }
+    for (attr, path, kind) in [("href=\"", "/static/style.css?v=", "text/css"), ("src=\"", "/static/app.js?v=", "text/javascript")] {
+        let rest = &page[page.find(&format!("{attr}{path}")).expect(path) + attr.len()..];
+        let url = &rest[..rest.find('"').unwrap()];
+        assert_eq!(url.len(), path.len() + 8, "the page links each asset by its version: {url}");
+        let asset = get(url).await.unwrap();
+        assert_eq!(asset.headers()["cache-control"], "public, max-age=31536000, immutable", "{url}");
+        assert!(asset.headers()["content-type"].to_str().unwrap().starts_with(kind), "{url}");
+    }
     let partial = http.get(format!("{base}/r/r1")).header("X-Amx-Partial", "1").send().await.unwrap();
     assert_eq!(partial.headers()["cache-control"], "no-store");
     let tag = partial.headers()["etag"].clone();
