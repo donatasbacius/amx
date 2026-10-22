@@ -584,6 +584,32 @@ async fn delivered_events_are_saved_before_wait_returns() {
     running.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_review_and_a_result_a_session_waits_for_are_saved_before_the_reply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.json");
+    let cfg = Config {
+        port: 0,
+        tailnet: false,
+        state: Some(path.clone()),
+        ..Config::default()
+    };
+    let running = amx::start(cfg).await.unwrap();
+    let base = format!("http://{}", running.local_addr);
+    let saved = || -> Value { serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap() };
+    ok_tool(&base, "rev", "hello", json!({"role":"reviewer","model":"claude"})).await;
+    let (author, _) = initialize(&base, "agent=author").await;
+    let pr = "https://github.com/example-org/widgets/pull/7";
+    session_rpc(&base, &author, call(1, "request_review", json!({"title": "Add a cache", "pr_url": pr, "reviewers": ["rev"]})), false).await;
+    assert_eq!(saved()["reviews"][0]["id"], "r1", "a crash now must not lose the review");
+    ok_tool(&base, "rev", "accept_review", json!({"review_id":"r1"})).await;
+    ok_tool(&base, "rev", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+    let result = session_rpc(&base, &author, call(2, "wait", json!({})), false).await;
+    assert!(text_of(&result).contains("Review result"), "{result}");
+    assert!(saved()["reviews"][0]["result"].is_object(), "a crash now must not take back the result");
+    running.stop().await;
+}
+
 /// Starts an MCP session as Claude Code would; returns its id and the instructions.
 async fn initialize(base: &str, query: &str) -> (String, String) {
     let r = reqwest::Client::new()

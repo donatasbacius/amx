@@ -374,10 +374,11 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
             let (events, reached) = hub.wait(agent, Duration::from_secs(secs), w.progress, c.session).await;
             if c.session {
                 *seq = Some(reached);
-            } else if !events.is_empty()
+            }
+            if !events.is_empty()
                 && let Err(e) = hub.save()
             {
-                // Saved before replying, so a crash doesn't hand the same events out again.
+                // Saved before replying, so a crash can neither repeat nor take back what was handed out.
                 tracing::error!("{e:#}");
             }
             let (next, urgent, idle) = hub.read(|s, now| {
@@ -416,7 +417,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                 picked,
             };
             let retired: Vec<&str> = RETIRED.iter().copied().filter(|k| r.rest.contains_key(*k)).collect();
-            let id = hub.write(|s, now| s.request_review(agent, req, now))?;
+            let id = hub.write_saved(|s, now| s.request_review(agent, req, now))??;
             let (idle, picked) = hub.read(|s, now| {
                 let picked = s.review(&id).map(|r| r.picked.clone()).unwrap_or_default();
                 let idle = s
@@ -517,7 +518,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
         }
         "request_rereview" => {
             let r: RereviewArgs = args(a)?;
-            let id = hub.write(|s, now| s.rereview(agent, &r.review_id, &r.new_head_sha, &r.note, r.title.as_deref(), now))?;
+            let id = hub.write_saved(|s, now| s.rereview(agent, &r.review_id, &r.new_head_sha, &r.note, r.title.as_deref(), now))??;
             Ok(with_next(hub, agent, &before, format!("Re-review {id} requested (follows {}).", r.review_id)))
         }
         "review_status" => {
