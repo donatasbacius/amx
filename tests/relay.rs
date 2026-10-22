@@ -769,6 +769,7 @@ fn two_reviewers_split_on_severity_confirm_the_lower() {
     assert!(result.contains("rev-b: agree, as major (round 2):\n> real, but overstated") && !result.contains("Disputed"), "{result}");
     let page = amx::web::render_review(sim.s.review(&id).unwrap());
     assert!(page.contains("Raised as blocking; rev-b rated it major, and the lower rating counts."), "{page}");
+    assert!(page.contains("<span class=\"fx\"><span class=\"fid\">F1</span></span>") && !page.contains("raised blocking"), "the header keeps to one line: {page}");
 }
 
 #[test]
@@ -829,8 +830,9 @@ fn review_page_puts_confirmed_findings_first_and_closes_the_rest() {
     let page = amx::web::render_review(sim.s.review(&id).unwrap());
     assert!(page.find("<details class=\"f\" id=\"F2\" open>").unwrap() < page.find("<details class=\"f dim\" id=\"F1\">").unwrap(), "{page}");
     assert!(page.contains("Changes requested") && page.contains("<span>1 to fix</span></p>"), "{page}");
-    assert!(page.contains("<span class=\"ft\" dir=\"auto\">Lock held across await</span>") && !page.contains("<p>Lock held across await</p>"), "the headline is not repeated: {page}");
-    assert!(page.contains("<span class=\"ft\" dir=\"auto\">should use a BTreeMap</span>") && !page.contains("<p>should use a BTreeMap</p>"), "{page}");
+    assert!(page.contains("<span class=\"ft\" dir=\"auto\">Lock held across await</span>"), "{page}");
+    assert!(page.contains("<div class=\"fb\"><div class=\"md\" dir=\"auto\"><p>Lock held across await</p>\n<p>The guard"), "the body has the whole text: {page}");
+    assert!(page.contains("<span class=\"ft\" dir=\"auto\">should use a BTreeMap</span>") && page.contains("<p>should use a BTreeMap</p>"), "{page}");
     assert!(page.contains("rev-c</b> agrees") && !page.contains("agrees, as blocking"), "{page}");
     assert!(!page.contains("summary-table") && !page.contains("local"), "{page}");
     assert!(!page.contains("Consensus rules") && !page.contains("voting round"), "only unusual settings are named: {page}");

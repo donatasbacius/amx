@@ -7,8 +7,7 @@
   --row-y: 12px; --row-x: 16px;
   --radius: 8px;
   --page: 1180px;
-  --measure: 72ch;
-  --sev-w: 6.4em;
+  --sev-w: 74px;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 
@@ -61,7 +60,7 @@ b { font-weight: 600; }
 code, pre { font-family: var(--mono); font-size: .875em; }
 code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; overflow-wrap: anywhere; }
 pre { background: var(--code-bg); padding: var(--sp-3) var(--sp-4); border-radius: 6px; overflow-x: auto; line-height: 1.45; }
-pre code { background: none; padding: 0; overflow-wrap: normal; }
+pre code, .ft code { background: none; padding: 0; overflow-wrap: normal; }
 :focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-radius: 3px; }
 .skip { position: absolute; left: -9999px; }
 .skip:focus { left: 16px; top: 8px; z-index: 3; background: var(--panel); padding: 4px 8px; }
@@ -79,12 +78,12 @@ summary > .i:first-child { margin: 0 .3em 0 -.3em; }
 details[open] > summary > .i { transform: rotate(90deg); }
 
 /* Relay chrome: small and grey. */
-.live, .meta, .newer, .ref, .rv-meta, .rv-when, .note, .foot, .prog, .key, .warn, .ag-sum, .vw, .fid, .was, .facts, .h-gist, .h-when, .log li, .rule .q {
+.live, .meta, .newer, .ref, .rv-meta, .rv-when, .note, .foot, .prog, .key, .warn, .ag-sum, .vw, .fid, .facts, .h-gist, .h-when, .log li, .rule .q {
   color: var(--muted); font-size: var(--fs-1); line-height: var(--lh-1);
 }
 .th time, .side-d > summary, .more > summary, .key dd, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role, .pg { color: var(--muted); }
 .th, .me, .agents, .side-d, .vbox > summary, .aside, .badge, .st { font-size: var(--fs-1); line-height: var(--lh-1); }
-.rv-when, .vw, .was, .h-when, .badge, .st, .log time, .me { white-space: nowrap; }
+.rv-when, .vw, .h-when, .badge, .st, .log time, .me { white-space: nowrap; }
 .meta b, .facts b, .et b { color: var(--text); }
 
 .top {
@@ -109,7 +108,6 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .md p { margin: 0 0 .6em; }
 .md table { border-collapse: collapse; display: block; overflow-x: auto; }
 .md th, .md td { border: 1px solid var(--line); padding: 3px 8px; }
-.md, .meta, .vd, .facts, .newer, .empty { max-width: var(--measure); }
 
 .badge, .st { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-weight: 600; }
 .badge { padding: 0 9px 0 8px; border-radius: 999px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); }
@@ -205,13 +203,9 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .aside { font-weight: 400; margin-left: var(--sp-2); }
 
 .f { scroll-margin-top: var(--sp-4); }
-.f > summary {
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-3);
-  padding: var(--row-y) var(--row-x);
-}
+.f > summary { display: flex; align-items: baseline; gap: var(--sp-3); padding: var(--row-y) var(--row-x); }
 .f > summary > .i { color: var(--muted); align-self: center; }
 .f > summary:focus-visible { outline-offset: -2px; }
-.f[open] > summary { padding-bottom: var(--sp-2); }
 .sev {
   flex: none; width: var(--sev-w); align-self: center; text-align: center;
   font-size: 11.5px; line-height: 18px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
@@ -220,12 +214,8 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .sev-blocking { background: var(--text); color: var(--panel); }
 .sev-major { border-color: var(--text); }
 .sev-nit { color: var(--muted); font-weight: 600; }
-.ft {
-  flex: 1 1 16em; min-width: 0; overflow-wrap: anywhere;
-  display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden;
-}
-.f[open] .ft { display: block; -webkit-line-clamp: unset; font-weight: 600; }
-.fx { flex: none; display: flex; align-items: baseline; gap: var(--sp-3); margin-left: auto; }
+.ft { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.fx { flex: none; display: flex; align-items: baseline; gap: var(--sp-3); }
 .fid { font-family: var(--mono); min-width: 2.2em; text-align: right; }
 .fb { padding: 0 var(--row-x) var(--sp-4) calc(var(--row-x) + var(--sev-w) + var(--sp-3)); }
 .facts { margin: var(--sp-2) 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -261,7 +251,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
   .ag-sum { display: block; color: var(--link); margin-top: var(--sp-4); padding: var(--sp-2) var(--sp-3); background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
 }
 @media (max-width: 600px) {
-  :root { --row-y: 8px; --row-x: 12px; --sev-w: 5.8em; --fs-4: 20px; --lh-4: 26px; }
+  :root { --row-y: 8px; --row-x: 12px; --sev-w: 60px; --fs-4: 20px; --lh-4: 26px; }
   .rv, .f > summary { min-height: 44px; }
   .rv { grid-template: "st w" "t t" "m m" / minmax(0, 1fr) auto; }
   .rv-pr, .rv-meta { white-space: normal; }
@@ -276,11 +266,10 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
   .verdict { padding: var(--sp-3); }
   .btn { min-height: 44px; }
   .rule .q { flex-basis: 100%; }
-  .f > summary { display: grid; grid-template: "sev fx chev" "ft ft ft" / auto minmax(0, 1fr) auto; align-items: center; }
-  .f > summary > .sev { grid-area: sev; }
-  .f > summary > .ft { grid-area: ft; -webkit-line-clamp: 2; }
-  .f > summary > .fx { grid-area: fx; flex-wrap: wrap; justify-content: end; gap: var(--sp-2); }
-  .f > summary > .i { grid-area: chev; }
+  .f > summary, .f > summary > .fx { align-items: center; gap: 5px; }
+  .f > summary .badge { padding: 0; background: none; box-shadow: none; gap: 4px; font-size: 12px; }
+  .f > summary > .sev { font-size: 10.5px; letter-spacing: .02em; }
+  .fid { min-width: 0; }
   .fb { padding: 0 var(--row-x) var(--sp-3); }
   .log { column-gap: var(--sp-2); }
   .history li { grid-template: "id st when" "id gist gist" / 2.5em minmax(0, 1fr) auto; row-gap: 0; }
