@@ -37,8 +37,6 @@ const SAYS_PER_MINUTE: usize = 10;
 const TALK: &[&str] = &["say", "amend", "revote"];
 const CLOSING_REMARKS: usize = 3;
 const AMENDS_PER_FINDING: u32 = 3;
-/// Offers listed in full in an idle reviewer's next actions.
-const OFFERS_SHOWN: usize = 2;
 /// Reviews that failed before anyone took them, kept on top of `history`.
 const FAILED_KEPT: usize = 10;
 /// Unfinished reviews one Tailscale login may have requested at a time.
@@ -47,6 +45,8 @@ const AGENTS_PER_LOGIN: usize = 20;
 const MAX_AGENTS: usize = 200;
 const MAX_FINDINGS: usize = 60;
 const FORGET_AGENT_MS: Ms = 24 * 3600 * 1000;
+/// How long a reviewer's decline keeps it from being offered that review again.
+pub const DECLINE_MS: Ms = 10 * 60 * 1000;
 const NO_MODEL: &str = "call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program you run in) before you can take reviews.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -261,7 +261,12 @@ impl Agents {
         self.push(name, AgentEvent::new(review, text, now));
     }
 
+    /// Queues a task, in place of a copy of it the agent hasn't received yet.
     fn notify_task(&mut self, name: &str, review: &str, task: String, text: String, due: Option<Ms>, now: Ms) {
+        if let Some(a) = self.map.get_mut(name) {
+            let delivered = a.delivered;
+            a.events.retain(|e| e.seq <= delivered || e.task.as_ref() != Some(&task));
+        }
         self.push(name, AgentEvent { task: Some(task), due, ..AgentEvent::new(review, text, now) });
     }
 
@@ -313,7 +318,7 @@ impl Phase {
 
     pub fn label(self) -> String {
         match self {
-            Phase::Offering => "offering".into(),
+            Phase::Offering => "queued".into(),
             Phase::Reviewing => "independent review".into(),
             Phase::Voting(r) => format!("cross-examination round {r}"),
             Phase::Done => "done".into(),
@@ -331,6 +336,9 @@ pub struct ReviewParams {
     pub vote_secs: u64,
     #[serde(default = "default_reply_secs")]
     pub reply_secs: u64,
+    /// 0 in a file 0.14.1 saved, where an offering review's deadline was its offer's.
+    #[serde(default)]
+    pub queue_secs: u64,
 }
 
 fn default_reply_secs() -> u64 {
@@ -359,6 +367,11 @@ pub struct Slot {
 impl Slot {
     pub fn active(&self) -> bool {
         self.dropped.is_none()
+    }
+
+    /// In a forming team: holds findings it brought from 0.14.1, so it is never released.
+    fn kept(&self) -> bool {
+        self.submission.is_some()
     }
 }
 
@@ -485,7 +498,11 @@ pub struct Review {
     pub phase: Phase,
     pub deadline: Ms,
     pub offered: BTreeSet<String>,
+    /// Who declined it, until `declined_until`.
     pub declined: BTreeSet<String>,
+    /// Who left its offer unanswered, until they next call `wait`.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub lapsed: BTreeSet<String>,
     /// The reviewers the author asked for; empty offers it to every idle reviewer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub picked: Vec<String>,
@@ -570,6 +587,11 @@ impl Review {
             .collect()
     }
 
+    /// Whether it failed once under way because reviewers dropped out, not by a human's cancel.
+    pub fn broke_off(&self) -> bool {
+        self.phase == Phase::Failed && self.cancelled_by.is_none() && self.slots.iter().any(|s| s.dropped.is_some())
+    }
+
     /// Whether `login` may cancel or rule on it: its author's login, or the hub owner (`owner`).
     pub fn may_act(&self, login: &str, owner: bool) -> bool {
         owner || self.author_login.eq_ignore_ascii_case(login)
@@ -596,6 +618,19 @@ impl Review {
         self.deadline.saturating_sub(now)
     }
 
+    /// When `agent`'s decline stops counting and it may be offered the review again.
+    pub fn declined_until(&self, agent: &str) -> Option<Ms> {
+        let at = self.log.iter().rev().find(|e| e.kind == "decline" && e.who == agent).map_or(0, |e| e.at);
+        self.declined.contains(agent).then_some(at + DECLINE_MS)
+    }
+
+    /// Who it isn't offered to for now, and why.
+    fn held_back(&self, now: Ms) -> Vec<String> {
+        let lapsed = self.lapsed.iter().map(|a| format!("{a} didn't answer its offer; it's asked again when it next calls `wait`"));
+        let declined = self.declined.iter().filter_map(|a| Some(format!("{a} declined; it's asked again in {}", text::dur(self.declined_until(a)?.saturating_sub(now)))));
+        lapsed.chain(declined).collect()
+    }
+
     /// Whether `login` already holds a slot. Other people take one slot each; the author's own
     /// agents may take any number.
     fn login_taken(&self, login: &str) -> bool {
@@ -620,6 +655,57 @@ impl Review {
     fn lacks(&self, model: Model) -> Option<Model> {
         let open = self.params.reviewers.saturating_sub(self.active_slots().count() + 1);
         self.missing_model().filter(|m| *m != model && open == 0)
+    }
+
+    /// The program a review of two or more reviewers would still lack if a `model` reviewer joined.
+    fn missing_with(&self, model: Option<Model>) -> Option<Model> {
+        if self.params.reviewers < 2 {
+            return None;
+        }
+        Model::ALL.into_iter().find(|m| model != Some(*m) && !self.active_slots().any(|s| s.model == Some(*m)))
+    }
+
+    /// Whether reviewer `a` may join its team, busy or not.
+    fn can_join(&self, a: &Agent) -> bool {
+        self.phase == Phase::Offering
+            && a.role == Role::Reviewer
+            && a.name != self.author
+            && self.slot(&a.name).is_none()
+            && !self.declined.contains(&a.name)
+            && !self.lapsed.contains(&a.name)
+            && (self.picked.is_empty() || self.picked.contains(&a.name))
+            && self.active_slots().count() < self.params.reviewers
+            && !self.login_taken(&a.login)
+            && self.fits(a.model)
+    }
+
+    /// Whether a team it can start with could form from its members, `a` and the `free`
+    /// reviewers: a program `a` leaves missing must come from a free reviewer of another login.
+    fn fillable(&self, a: &Agent, free: &[&Agent]) -> bool {
+        let Some(m) = self.missing_with(a.model) else { return true };
+        let own = |l: &str| self.author_login.eq_ignore_ascii_case(l);
+        free.iter().any(|y| {
+            y.name != a.name && y.model == Some(m) && self.can_join(y) && (own(&y.login) || !y.login.eq_ignore_ascii_case(&a.login))
+        })
+    }
+
+    /// When its forming team must be complete, else it is released (or, for three or more
+    /// reviewers, starts with the two or more it has if both programs are in).
+    pub fn team_due(&self) -> Option<Ms> {
+        self.active_slots().filter(|s| !s.kept()).map(|s| s.joined).min().map(|t| t + self.params.offer_secs * 1000)
+    }
+
+    fn can_start_short(&self) -> bool {
+        self.params.reviewers >= 3 && self.active_slots().count() >= 2 && self.missing_model().is_none()
+    }
+
+    /// Who its team still needs, e.g. "1 more reviewer(s) (a codex one)".
+    fn wanted(&self) -> String {
+        let more = self.params.reviewers.saturating_sub(self.active_slots().count());
+        match self.missing_model() {
+            Some(m) => format!("{more} more reviewer(s) (a {} one)", m.as_str()),
+            None => format!("{more} more reviewer(s)"),
+        }
     }
 
     /// Refuses `agent` if its name now belongs to a different login than the one that took part.
@@ -748,9 +834,19 @@ pub fn decide(findings: &mut [Finding], c: &Consensus) {
     }
 }
 
-/// The re-review of review `id` that hasn't failed, which locks its rulings.
+/// The re-review that took over review `id`, directly or through re-reviews that failed, which
+/// locks its rulings.
 pub fn rereview<'a>(reviews: &'a [Review], id: &str) -> Option<&'a Review> {
-    reviews.iter().find(|o| o.parent.as_deref() == Some(id) && o.phase != Phase::Failed)
+    let mut ids = vec![id];
+    while let Some(id) = ids.pop() {
+        for o in reviews.iter().filter(|o| o.parent.as_deref() == Some(id)) {
+            if o.phase != Phase::Failed {
+                return Some(o);
+            }
+            ids.push(&o.id);
+        }
+    }
+    None
 }
 
 /// Changes are requested by a confirmed blocking or major finding, or one a human ruled must fix.
@@ -898,6 +994,9 @@ pub struct State {
     /// Base URL of the web page, for links in results.
     pub web_url: String,
     next_review: u64,
+    /// The review each free reviewer was last offered and since when, so it is told again when
+    /// that changes, and the offer lapses if it doesn't answer.
+    offers: BTreeMap<String, (String, Ms)>,
 }
 
 fn valid_sha(s: &str) -> bool {
@@ -1028,6 +1127,7 @@ impl State {
             history,
             web_url: String::new(),
             next_review: 0,
+            offers: BTreeMap::new(),
         }
     }
 
@@ -1053,7 +1153,9 @@ impl State {
     }
 
     /// Loads a snapshot as if the relay's clock had stopped while it was down: unfinished
-    /// deadlines and agents' silence resume where they were.
+    /// deadlines, forming teams' timers and agents' silence resume where they were. A review
+    /// 0.14.1 was offering queues from its request, and its reviewers, findings and all, form
+    /// its team.
     pub fn restore(&mut self, snap: Snapshot, now: Ms) {
         let down = now.saturating_sub(snap.saved_at);
         self.next_review = snap.next_review;
@@ -1066,8 +1168,33 @@ impl State {
             })
             .collect();
         self.reviews = snap.reviews;
-        for r in self.reviews.iter_mut().filter(|r| r.phase.active()) {
-            r.deadline += down;
+        let queue_secs = self.consensus.queue_secs.clamp(60, 24 * 3600);
+        for r in &mut self.reviews {
+            let old = r.params.queue_secs == 0;
+            if old {
+                r.params.queue_secs = queue_secs;
+            }
+            if r.phase == Phase::Offering {
+                if old {
+                    r.deadline = r.created + r.params.queue_secs * 1000;
+                }
+                if r.params.reviewers < 2 {
+                    r.params.reviewers = 2;
+                    if r.picked.len() < 2 {
+                        r.picked.clear();
+                    }
+                }
+                for s in &mut r.slots {
+                    s.joined += down;
+                }
+            }
+            if r.phase.active() {
+                r.deadline += down;
+            }
+        }
+        let queued: HashSet<String> = self.reviews.iter().filter(|r| r.phase == Phase::Offering).map(|r| offer_task(&r.id)).collect();
+        for a in self.agents.map.values_mut() {
+            a.events.retain(|e| e.task.as_ref().is_none_or(|t| !queued.contains(t)));
         }
     }
 
@@ -1195,11 +1322,18 @@ impl State {
         self.agents.get(name).map(|a| a.login.clone()).unwrap_or_default()
     }
 
-    pub fn set_waiting(&mut self, name: &str, delta: i32, now: Ms) {
+    /// Counts a `wait` starting or ending. One starting shows a reviewer is looping again, so the
+    /// offers it left unanswered may be made again; returns whether that changed anything.
+    pub fn set_waiting(&mut self, name: &str, delta: i32, now: Ms) -> bool {
         if let Some(a) = self.agents.map.get_mut(name) {
             a.waiting = a.waiting.saturating_add_signed(delta);
             a.last_seen = now;
         }
+        let mut back = false;
+        for r in self.reviews.iter_mut().filter(|_| delta > 0) {
+            back |= r.lapsed.remove(name);
+        }
+        back && self.advance(now)
     }
 
     /// Whether `name` is the author of, or an active reviewer on, an unfinished review.
@@ -1207,6 +1341,17 @@ impl State {
         self.reviews
             .iter()
             .any(|r| r.phase.active() && r.participant(name))
+    }
+
+    /// The review free reviewer `name` is offered now.
+    pub fn offered(&self, name: &str) -> Option<&str> {
+        self.offers.get(name).map(|(id, _)| id.as_str())
+    }
+
+    /// When the offer `name` has now lapses unanswered.
+    pub fn offer_lapses(&self, name: &str) -> Option<Ms> {
+        let (id, at) = self.offers.get(name)?;
+        Some(at + self.review(id)?.params.offer_secs * 1000)
     }
 
     /// The unfinished review `name` is assigned to as a reviewer.
@@ -1330,7 +1475,6 @@ impl State {
         let idle = self.busy_with(name).is_none();
         let reviewer = self.agents.get(name).is_some_and(|a| a.role == Role::Reviewer);
         let model = self.agents.get(name).and_then(|a| a.model);
-        let mut offers = 0;
         if reviewer && idle && model.is_none() {
             out.push(Action {
                 review: String::new(),
@@ -1345,21 +1489,23 @@ impl State {
             let id = &r.id;
             if let Some(slot) = r.slot(name).filter(|s| s.active()) {
                 match r.phase {
-                    Phase::Offering | Phase::Reviewing if slot.submission.is_none() => {
-                        let left = if r.phase == Phase::Offering {
-                            format!("at least {}", text::dur(r.params.review_secs * 1000))
-                        } else {
-                            left.clone()
+                    Phase::Offering => {
+                        let then = if r.can_start_short() { "it starts with the team it has" } else { "the team is released" };
+                        let text = match r.team_due() {
+                            _ if slot.kept() => "Your findings are kept; the review starts once the team is complete.".to_string(),
+                            Some(t) => format!("You get the review task once the team is complete; if it isn't within {}, {then}.", text::dur(t.saturating_sub(now))),
+                            None => "You get the review task once the team is complete.".to_string(),
                         };
-                        out.push(Action {
-                            review: id.clone(),
-                            urgent: true,
-                            text: text::review_task(r, &left),
-                            task: Some(review_task(id)),
-                            short: Some(format!("{id}: review the PR as described above, then call `submit_findings`.")),
-                        });
+                        out.push(Action::info(id, format!("{id}: you are in its team, waiting for {}. {text} Call `wait`.", r.wanted())));
                     }
-                    Phase::Offering | Phase::Reviewing => out.push(Action::info(
+                    Phase::Reviewing if slot.submission.is_none() => out.push(Action {
+                        review: id.clone(),
+                        urgent: true,
+                        text: text::review_task(r, &left),
+                        task: Some(review_task(id)),
+                        short: Some(format!("{id}: review the PR as described above, then call `submit_findings`.")),
+                    }),
+                    Phase::Reviewing => out.push(Action::info(
                         id,
                         format!("{id}: your findings are in; everyone's are revealed once all reviewers have submitted. Call `wait`."),
                     )),
@@ -1408,29 +1554,31 @@ impl State {
                     }
                     Phase::Done | Phase::Failed => {}
                 }
-            } else if r.phase == Phase::Offering
-                && r.offered.contains(name)
-                && !r.declined.contains(name)
-                && reviewer
-                && idle
-                && r.fits(model)
-            {
-                offers += 1;
-                if offers <= OFFERS_SHOWN {
-                    out.push(Action {
-                        review: id.clone(),
-                        urgent: true,
-                        text: format!(
-                            "{id}: review offer for {} from {}. Call `accept_review` (review_id \"{id}\") to take it or `decline_review` if you can't. Offer closes in {left}.",
-                            r.pr.url(),
-                            r.author
-                        ),
-                        task: Some(offer_task(id)),
-                        short: Some(format!("{id}: accept or decline the offer above.")),
-                    });
-                }
+            } else if self.offered(name) == Some(id) {
+                out.push(Action {
+                    review: id.clone(),
+                    urgent: true,
+                    text: format!(
+                        "{id}: review offer for {} from {}. Call `accept_review` (review_id \"{id}\") to join its team or `decline_review` if you can't.",
+                        r.pr.url(),
+                        r.author
+                    ),
+                    task: Some(offer_task(id)),
+                    short: Some(format!("{id}: accept or decline the offer above.")),
+                });
             }
-            if r.author == name {
+            if r.author == name && r.phase == Phase::Offering {
+                let held: String = r.held_back(now).iter().map(|h| format!(" {h}.")).collect();
+                out.push(Action::info(
+                    id,
+                    format!(
+                        "{id}: your review of {} is queued: it starts once a full team of reviewers has accepted it ({} of {} so far; older requests go first), and fails if none has within {left}.{held} Keep calling `wait`; the consolidated result will arrive as an event.",
+                        r.pr.short(),
+                        r.active_slots().count(),
+                        r.params.reviewers
+                    ),
+                ));
+            } else if r.author == name {
                 out.push(Action::info(
                     id,
                     format!(
@@ -1441,17 +1589,17 @@ impl State {
                 ));
             }
         }
-        if offers > OFFERS_SHOWN {
-            out.push(Action::info(
-                "",
-                format!("{} more review offers are open; they are shown once you have answered the ones above.", offers - OFFERS_SHOWN),
-            ));
-        }
         out.sort_by_key(|a| !a.urgent);
         out
     }
 
+    /// Queues a review, or returns the one `author` already has of the same PR and head.
     pub fn request_review(&mut self, author: &str, req: NewReview, now: Ms) -> Result<String> {
+        let pr = crate::prurl::parse(&req.pr_url);
+        let same_head = |r: &Review| req.head_sha.as_ref().is_none_or(|h| r.head_sha.as_ref().is_some_and(|x| x.eq_ignore_ascii_case(h)));
+        if let Some(r) = self.reviews.iter().find(|r| r.phase.active() && r.author == author && Some(&r.pr) == pr.as_ref() && same_head(r)) {
+            return Ok(r.id.clone());
+        }
         let r = self.new_review(author, req, now)?;
         let id = r.id.clone();
         self.reviews.push(r);
@@ -1496,19 +1644,23 @@ impl State {
             None if picked.is_empty() => c.reviewers,
             None => picked.len(),
         };
-        if !(1..=5).contains(&reviewers) {
-            bail!("the number of reviewers must be between 1 and 5");
+        if picked.len() == 1 {
+            bail!("name at least 2 reviewers: every review has at least one claude and one codex reviewer");
         }
-        if reviewers >= 2 && !picked.is_empty() {
+        if !(2..=5).contains(&reviewers) {
+            bail!("count must be 2 to 5: every review has at least one claude and one codex reviewer");
+        }
+        if !picked.is_empty() {
             let models: BTreeSet<Model> = picked.iter().filter_map(|p| self.agents.get(p)?.model).collect();
             if let Some(m) = Model::ALL.into_iter().find(|m| !models.contains(m)) {
-                bail!("none of the reviewers you named is a {} reviewer: a review with more than one reviewer needs both claude and codex; call `online` to see who runs which", m.as_str());
+                bail!("none of the reviewers you named is a {} reviewer: every review needs both claude and codex; call `online` to see who runs which", m.as_str());
             }
         }
         let t = self.timing;
         let params = ReviewParams {
             reviewers,
             consensus: c,
+            queue_secs: c.queue_secs.clamp(60, 24 * 3600),
             offer_secs: t.offer_secs.clamp(5, 3600),
             review_secs: t.review_secs.clamp(10, 4 * 3600),
             vote_secs: t.vote_secs.clamp(10, 4 * 3600),
@@ -1526,9 +1678,10 @@ impl State {
             created: now,
             ended: None,
             phase: Phase::Offering,
-            deadline: now + params.offer_secs * 1000,
+            deadline: now + params.queue_secs * 1000,
             offered: BTreeSet::new(),
             declined: BTreeSet::new(),
+            lapsed: BTreeSet::new(),
             picked,
             slots: Vec::new(),
             findings: Vec::new(),
@@ -1583,6 +1736,7 @@ impl State {
         let role = self.agents.get(agent).map(|a| a.role);
         let model = self.agents.get(agent).and_then(|a| a.model);
         let login = self.login_of(agent);
+        let offer = self.offered(agent).map(str::to_string);
         let r = self.review_mut(id)?;
         r.check_login(agent, &login)?;
         if r.slot(agent).is_some_and(Slot::active) {
@@ -1616,12 +1770,15 @@ impl State {
             bail!("call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program you run in) first");
         };
         if let Some(m) = r.lacks(model) {
-            bail!("{} still needs a {} reviewer: a review with more than one reviewer has both claude and codex. Call `wait`", r.id, m.as_str());
+            bail!("{} still needs a {} reviewer: every review has both claude and codex. Call `wait`", r.id, m.as_str());
         }
-        if !r.offered.contains(agent) {
-            bail!("{} wasn't offered to you; call `wait` for your offers", r.id);
+        match offer {
+            Some(o) if o == r.id => {}
+            Some(o) => bail!("you are offered {o} now; accept or decline that first"),
+            None => bail!("{} wasn't offered to you: a free reviewer is offered a review once a full team can form for it; call `wait` for your offers", r.id),
         }
         r.declined.remove(agent);
+        r.lapsed.remove(agent);
         r.slots.push(Slot {
             agent: agent.to_string(),
             login,
@@ -1646,6 +1803,7 @@ impl State {
         if !r.declined.insert(agent.to_string()) {
             return Ok(());
         }
+        r.lapsed.remove(agent);
         r.log(now, agent, "decline", if reason.is_empty() { "declined".to_string() } else { format!("declined: {reason}") });
         self.advance(now);
         Ok(())
@@ -1668,7 +1826,7 @@ impl State {
         if slot.submission.is_some() {
             bail!("you already submitted findings for {}; amend them during cross-examination", r.id);
         }
-        if !matches!(r.phase, Phase::Offering | Phase::Reviewing) {
+        if r.phase != Phase::Reviewing {
             bail!("{} is not in the independent review phase ({})", r.id, r.phase.label());
         }
         let head_sha = head_sha.trim();
@@ -1986,22 +2144,34 @@ impl State {
             .review(id)
             .ok_or_else(|| anyhow!("no review {id} (the relay may have restarted; use request_review)"))?
             .clone();
-        if prev.author != author {
-            bail!("only {} (the author of {}) can request a re-review", prev.author, prev.id);
+        let login = self.login_of(author);
+        let same_person = self.agents.get(author).is_some_and(|a| a.role == Role::Author) && prev.author_login.eq_ignore_ascii_case(&login);
+        if prev.author != author && !same_person {
+            bail!("only {} (the author of {}) or another author agent of its login can request a re-review", prev.author, prev.id);
         }
-        prev.check_login(author, &self.login_of(author))?;
-        if prev.phase != Phase::Done {
+        prev.check_login(author, &login)?;
+        let failed = prev.broke_off();
+        if let (Phase::Failed, false, None, Some(p)) = (prev.phase, failed, &prev.cancelled_by, &prev.parent) {
+            bail!("{} failed before it ran; to try again, call `request_rereview` with review_id \"{p}\"", prev.id);
+        }
+        if prev.phase != Phase::Done && !failed {
             bail!("{} has not finished ({})", prev.id, prev.phase.label());
         }
         if let Some(r) = rereview(&self.reviews, &prev.id) {
+            if r.phase.active() && r.head_sha.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(head_sha)) {
+                return Ok(r.id.clone());
+            }
             bail!("{} is already re-reviewed as {}", prev.id, r.id);
         }
-        let reviewed = prev
-            .slots
-            .iter()
-            .filter_map(|s| s.submission.as_ref().map(|x| x.head_sha.clone()))
-            .next()
-            .or(prev.head_sha.clone());
+        let reviewed = if failed {
+            prev.since_sha.clone()
+        } else {
+            prev.slots
+                .iter()
+                .filter_map(|s| s.submission.as_ref().map(|x| x.head_sha.clone()))
+                .next()
+                .or(prev.head_sha.clone())
+        };
         let mut req = NewReview::new(&prev.pr.url());
         req.note = note.to_string();
         req.title = title.and_then(|t| one_line(t, MAX_TITLE)).or(prev.title.clone());
@@ -2009,10 +2179,10 @@ impl State {
             bail!("{} has no title: pass the PR's title as `title` (from `gh pr view {} --json title`)", prev.id, prev.pr.url());
         }
         req.head_sha = Some(head_sha.to_string());
-        req.reviewers = Some(prev.params.reviewers);
+        req.reviewers = Some(prev.params.reviewers.max(2));
         let mut r = self.new_review(author, req, now)?;
-        r.params = prev.params;
-        r.deadline = now + r.params.offer_secs * 1000;
+        r.params = ReviewParams { reviewers: r.params.reviewers, ..prev.params };
+        r.deadline = now + r.params.queue_secs * 1000;
         let busy: HashSet<String> = self
             .reviews
             .iter()
@@ -2038,25 +2208,28 @@ impl State {
         r.iteration = prev.iteration + 1;
         r.since_sha = reviewed;
         for f in prev.findings.iter() {
-            let Some(o) = &f.outcome else { continue };
-            if !matches!(o.status, Status::Confirmed | Status::Disputed | Status::Unverified) || f.ruled().is_some_and(|r| !r.must_fix) {
-                continue;
-            }
+            let (severity, origin, ruling) = match &f.outcome {
+                _ if failed && f.origin.is_some() => (f.severity, f.origin.clone(), f.ruling.clone()),
+                _ if failed => continue,
+                None => continue,
+                Some(o) if !matches!(o.status, Status::Confirmed | Status::Disputed | Status::Unverified) || f.ruled().is_some_and(|r| !r.must_fix) => continue,
+                Some(o) => (o.severity, Some(format!("{}/{}", prev.id, f.id)), f.ruled().cloned()),
+            };
             r.next_finding += 1;
             r.findings.push(Finding {
                 id: format!("C{}", r.next_finding),
                 by: None,
-                severity: o.severity,
+                severity,
                 url: f.url.clone(),
                 title: f.title.clone(),
                 text: f.text.clone(),
-                origin: Some(format!("{}/{}", prev.id, f.id)),
+                origin,
                 withdrawn: None,
                 revision: 0,
                 open_round: 1,
                 votes: BTreeMap::new(),
                 outcome: None,
-                ruling: f.ruled().cloned(),
+                ruling,
             });
         }
         for (agent, login, model) in candidates {
@@ -2073,14 +2246,20 @@ impl State {
             });
             r.log(now, &agent, "accept", format!("assigned again (reviewed {})", prev.id));
         }
-        let left = format!("at least {}", text::dur(r.params.review_secs * 1000));
-        for s in &r.slots {
-            let text = format!("[{}] You are assigned again (you reviewed {}).\n{}", r.id, prev.id, text::review_task(&r, &left));
-            self.agents.notify_task(&s.agent, &r.id, review_task(&r.id), text, None, now);
-        }
         let new_id = r.id.clone();
         self.reviews.push(r);
         self.advance(now);
+        if let Some(r) = self.reviews.iter().find(|r| r.id == new_id && r.phase == Phase::Offering) {
+            let text = format!(
+                "[{new_id}] You are in its team again, as you reviewed {}: waiting for {}. You get the review task once the team is complete. Call `wait`.",
+                prev.id,
+                r.wanted()
+            );
+            let team: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
+            for a in team {
+                self.agents.notify(&a, &new_id, text.clone(), now);
+            }
+        }
         Ok(new_id)
     }
 
@@ -2226,61 +2405,141 @@ impl State {
                 changed = true;
             }
         }
+        self.queue(now) || changed
+    }
+
+    /// Reviewers free to join a team: online, with a program, and in no unfinished review.
+    fn free_reviewers(&self, now: Ms) -> Vec<&Agent> {
+        self.agents
+            .all()
+            .filter(|a| a.role == Role::Reviewer && a.model.is_some() && self.agents.online(&a.name, now) && self.busy_with(&a.name).is_none())
+            .collect()
+    }
+
+    /// The review each free reviewer is offered.
+    fn allocate(&self, now: Ms) -> BTreeMap<String, usize> {
+        assign(&self.reviews, self.free_reviewers(now))
+    }
+
+    /// Free reviewers that left the offer they have unanswered for `offer_secs` aren't offered it
+    /// again until they next call `wait`.
+    fn lapse_offers(&mut self, now: Ms) -> bool {
+        let lapsed: Vec<(String, String)> = self
+            .offers
+            .iter()
+            .filter(|(a, _)| self.agents.online(a, now) && self.busy_with(a).is_none())
+            .filter(|(a, _)| self.offer_lapses(a).is_some_and(|t| now >= t))
+            .map(|(a, (id, _))| (a.clone(), id.clone()))
+            .collect();
+        for (a, id) in &lapsed {
+            let Some(r) = self.reviews.iter_mut().find(|r| r.id == *id && r.phase == Phase::Offering) else { continue };
+            let within = text::dur(r.params.offer_secs * 1000);
+            r.lapsed.insert(a.clone());
+            r.log(now, a, "lapse", format!("didn't answer the offer within {within}"));
+            self.agents.progress(a, id, format!("[{id}] The offer lapsed: you didn't answer it within {within}. It is made again when you next call `wait`, if it still needs you."), now);
+        }
+        !lapsed.is_empty()
+    }
+
+    /// A forming team's member to release: its team can no longer be completed from the free
+    /// reviewers, or an older review would be offered it if it and the members of every younger
+    /// forming team were free.
+    fn to_release(&self, now: Ms) -> Option<(usize, String, String)> {
+        let free = self.free_reviewers(now);
+        let forming = || self.reviews.iter().enumerate().filter(|(_, r)| r.phase == Phase::Offering);
+        let team = |r: &Review| -> Vec<&Agent> { r.active_slots().filter(|s| !s.kept()).filter_map(|s| self.agents.get(&s.agent)).collect() };
+        let members = forming().flat_map(|(_, r)| team(r));
+        let wanted = assign(&self.reviews, free.iter().copied().chain(members).collect());
+        for (i, r) in forming() {
+            for a in team(r) {
+                if !r.fillable(a, &free) {
+                    return Some((i, a.name.clone(), "no free reviewer can complete the team now".into()));
+                }
+                if let Some(&j) = wanted.get(&a.name) {
+                    return Some((i, a.name.clone(), format!("the older review {} needs you", self.reviews[j].id)));
+                }
+            }
+        }
+        None
+    }
+
+    /// Runs the queue of reviews waiting for reviewers: forms each one's team, oldest first,
+    /// starts it once complete, lapses unanswered offers, and offers the free reviewers out.
+    fn queue(&mut self, now: Ms) -> bool {
+        let mut changed = false;
+        for i in 0..self.reviews.len() {
+            let State { agents, reviews, .. } = self;
+            let r = &mut reviews[i];
+            if r.phase != Phase::Offering {
+                continue;
+            }
+            let expired: Vec<String> = r.declined.iter().filter(|a| r.declined_until(a).is_some_and(|t| now >= t)).cloned().collect();
+            for a in &expired {
+                r.declined.remove(a);
+                changed = true;
+            }
+            let gone: Vec<String> = r.active_slots().filter(|s| !s.kept() && !agents.online(&s.agent, now)).map(|s| s.agent.clone()).collect();
+            for a in &gone {
+                release(r, agents, a, "you went offline", now);
+                changed = true;
+            }
+            let n = r.active_slots().count();
+            let late = r.team_due().is_some_and(|t| now >= t);
+            if n >= r.params.reviewers || ((late || now >= r.deadline) && r.can_start_short()) {
+                start_reviewing(r, agents, now);
+                changed = true;
+            } else if now >= r.deadline {
+                let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
+                for a in &names {
+                    release(r, agents, a, "the review waited too long", now);
+                }
+                let mix = if r.params.reviewers >= 2 { ", claude and codex," } else { "" };
+                let why = format!(
+                    "no full team of {} reviewer(s){mix} accepted it within {}",
+                    r.params.reviewers,
+                    text::dur(r.params.queue_secs * 1000)
+                );
+                fail(r, agents, &why, now);
+                changed = true;
+            } else if late {
+                let names: Vec<String> = r.active_slots().filter(|s| !s.kept()).map(|s| s.agent.clone()).collect();
+                for a in &names {
+                    release(r, agents, a, "the team didn't fill in time", now);
+                }
+                changed = true;
+            }
+        }
+        changed |= self.lapse_offers(now);
+        while let Some((i, a, why)) = self.to_release(now) {
+            release(&mut self.reviews[i], &mut self.agents, &a, &why, now);
+            changed = true;
+        }
+        let mut sent = BTreeMap::new();
+        for (a, i) in self.allocate(now) {
+            let r = &mut self.reviews[i];
+            let since = match self.offers.get(&a) {
+                Some((id, at)) if *id == r.id => *at,
+                _ => {
+                    r.offered.insert(a.clone());
+                    self.agents.notify_task(&a, &r.id, offer_task(&r.id), text::offer(r), None, now);
+                    changed = true;
+                    now
+                }
+            };
+            sent.insert(a, (r.id.clone(), since));
+        }
+        self.offers = sent;
         changed
     }
 
     /// One transition of review `i`, if due. Returns whether anything changed.
     fn step(&mut self, i: usize, now: Ms) -> bool {
-        let busy: HashSet<String> = self
-            .reviews
-            .iter()
-            .filter(|r| r.phase.active())
-            .flat_map(|r| r.active_slots().map(|s| s.agent.clone()))
-            .collect();
         let drop_ms = self.timing.drop_after_secs * 1000;
         let web = self.web_url.clone();
         let State { agents, reviews, .. } = self;
         let r = &mut reviews[i];
         match r.phase {
-            Phase::Offering => {
-                let mut changed = false;
-                let eligible: Vec<String> = agents
-                    .all()
-                    .filter(|a| {
-                        a.role == Role::Reviewer
-                            && a.name != r.author
-                            && agents.online(&a.name, now)
-                            && !busy.contains(&a.name)
-                            && !r.offered.contains(&a.name)
-                            && r.slot(&a.name).is_none()
-                            && !r.login_taken(&a.login)
-                            && r.fits(a.model)
-                            && (r.picked.is_empty() || r.picked.contains(&a.name))
-                    })
-                    .map(|a| a.name.clone())
-                    .collect();
-                for a in eligible {
-                    r.offered.insert(a.clone());
-                    agents.notify_task(&a, &r.id, offer_task(&r.id), text::offer(r, text::LEFT), Some(r.deadline), now);
-                    changed = true;
-                }
-                let n = r.active_slots().count();
-                let missing = r.missing_model();
-                if n >= r.params.reviewers || (now >= r.deadline && n > 0 && missing.is_none()) {
-                    start_reviewing(r, agents, now);
-                    return true;
-                }
-                if let Some(m) = missing.filter(|_| now >= r.deadline && n > 0) {
-                    r.missing = Some(m);
-                    fail(r, agents, &format!("no {} reviewer accepted before the offer deadline, and a review with more than one reviewer needs both claude and codex", m.as_str()), now);
-                    return true;
-                }
-                if now >= r.deadline {
-                    fail(r, agents, "no reviewers available: not enough idle reviewers accepted before the offer deadline", now);
-                    return true;
-                }
-                changed
-            }
+            Phase::Offering => false,
             Phase::Reviewing => {
                 let mut changed = drop_silent(r, agents, drop_ms, now);
                 if now >= r.deadline {
@@ -2294,6 +2553,9 @@ impl State {
                     }
                     changed = true;
                 }
+                if lose_mix(r, agents, now) {
+                    return true;
+                }
                 if r.active_slots().all(|s| s.submission.is_some()) {
                     start_voting(r, agents, 1, &web, now);
                     return true;
@@ -2302,6 +2564,9 @@ impl State {
             }
             Phase::Voting(round) => {
                 let mut changed = drop_silent(r, agents, drop_ms, now);
+                if lose_mix(r, agents, now) {
+                    return true;
+                }
                 if r.replying {
                     let waiting = r
                         .active_slots()
@@ -2318,6 +2583,9 @@ impl State {
                 if late {
                     for a in &owing {
                         drop_slot(r, agents, a, &format!("missed the round {round} voting deadline"), now);
+                    }
+                    if lose_mix(r, agents, now) {
+                        return true;
                     }
                     changed = true;
                 }
@@ -2351,6 +2619,20 @@ impl State {
     }
 }
 
+/// The review of `reviews` each of `pool` is offered: oldest first, each review takes the
+/// reviewers it can form a team with, and younger ones count only those left. A review's own
+/// team members in `pool` are only for older reviews.
+fn assign(reviews: &[Review], mut pool: Vec<&Agent>) -> BTreeMap<String, usize> {
+    let mut offers = BTreeMap::new();
+    for (i, r) in reviews.iter().enumerate() {
+        pool.retain(|a| r.phase != Phase::Offering || !r.active_slots().any(|s| s.agent == a.name));
+        let takers: Vec<String> = pool.iter().filter(|a| r.can_join(a) && r.fillable(a, &pool)).map(|a| a.name.clone()).collect();
+        pool.retain(|a| !takers.contains(&a.name));
+        offers.extend(takers.into_iter().map(|a| (a, i)));
+    }
+    offers
+}
+
 fn drop_silent(r: &mut Review, agents: &mut Agents, drop_ms: Ms, now: Ms) -> bool {
     let gone: Vec<String> = r
         .active_slots()
@@ -2369,7 +2651,30 @@ fn drop_slot(r: &mut Review, agents: &mut Agents, agent: &str, why: &str, now: M
     }
     r.log(now, agent, "drop", format!("dropped: {why}"));
     agents.notify(agent, &r.id, format!("[{}] You were dropped from the review ({why}). You are free for other reviews; call `wait`.", r.id), now);
-    agents.progress(&r.author, &r.id, format!("[{}] {agent} was dropped ({why}); the review continues with the others.", r.id), now);
+    if r.missing_model().is_none() {
+        agents.progress(&r.author, &r.id, format!("[{}] {agent} was dropped ({why}); the review continues with the others.", r.id), now);
+    }
+}
+
+/// Fails a review under way whose drops left it without one of the programs, so it never gives
+/// one program's verdict.
+fn lose_mix(r: &mut Review, agents: &mut Agents, now: Ms) -> bool {
+    let Some(m) = r.missing_model().filter(|_| r.active_slots().next().is_some()) else { return false };
+    let who = match r.slots.iter().filter(|s| s.model == Some(m)).count() {
+        1 => format!("the only {} reviewer", m.as_str()),
+        _ => format!("every {} reviewer", m.as_str()),
+    };
+    fail(r, agents, &format!("{who} dropped out"), now);
+    true
+}
+
+/// Takes `agent` out of a forming team, with any findings it brought from 0.14.1; it may join
+/// again later.
+fn release(r: &mut Review, agents: &mut Agents, agent: &str, why: &str, now: Ms) {
+    r.slots.retain(|s| s.agent != agent);
+    r.findings.retain(|f| f.by.as_deref() != Some(agent));
+    r.log(now, agent, "release", format!("released from the team: {why}"));
+    agents.progress(agent, &r.id, format!("[{}] You were released from its team ({why}). You are free for other reviews; call `wait`.", r.id), now);
 }
 
 fn start_reviewing(r: &mut Review, agents: &mut Agents, now: Ms) {
@@ -2377,6 +2682,14 @@ fn start_reviewing(r: &mut Review, agents: &mut Agents, now: Ms) {
     r.deadline = now + r.params.review_secs * 1000;
     let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
     r.log(now, "relay", "phase", format!("independent review started with {}", names.join(", ")));
+    let team = match names.len() {
+        n if n < r.params.reviewers => format!("Starting with {n} of {} reviewers ({})", r.params.reviewers, names.join(", ")),
+        _ => format!("Your team is complete ({})", names.join(", ")),
+    };
+    for a in &names {
+        let text = format!("[{}] {team}.\n{}", r.id, text::review_task(r, text::LEFT));
+        agents.notify_task(a, &r.id, review_task(&r.id), text, Some(r.deadline), now);
+    }
     for a in r.offered.clone() {
         if !names.contains(&a) && !r.declined.contains(&a) {
             agents.progress(&a, &r.id, format!("[{}] Offer closed: the review has its reviewers. Call `wait`.", r.id), now);
@@ -2494,10 +2807,19 @@ fn fail(r: &mut Review, agents: &mut Agents, why: &str, now: Ms) {
             format!("[{}] {by} (a human) cancelled the review of {}.\nNEXT: don't request it again unless your human asks.", r.id, r.pr.url()),
             format!("[{}] Review cancelled by {by} (a human). Call `wait`.", r.id),
         ),
-        None => (
-            format!("[{}] Review of {} failed: {why}. You can try `request_review` again later.", r.id, r.pr.url()),
-            format!("[{}] Review cancelled: {why}. Call `wait`.", r.id),
-        ),
+        None => {
+            let retry = match &r.parent {
+                _ if r.broke_off() => format!("call `request_rereview` with review_id \"{}\" and new_head_sha (the same commit if nothing changed).", r.id),
+                Some(p) => format!(
+                    "to try again later, call `request_rereview` with review_id \"{p}\" and new_head_sha (the same commit if nothing changed), which carries its findings over; `request_review` would start afresh without them."
+                ),
+                None => "you can try `request_review` again later.".to_string(),
+            };
+            (
+                format!("[{}] Review of {} failed: {why}.\nNEXT: {retry}", r.id, r.pr.url()),
+                format!("[{}] Review {} failed: {why}. Nothing more to do; call `wait`.", r.id, r.id),
+            )
+        }
     };
     agents.outcome(&r.author, &r.id, author, now);
     let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();

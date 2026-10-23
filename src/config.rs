@@ -38,6 +38,7 @@ pub struct Timing {
     pub online_secs: u64,
     /// An assigned reviewer silent this long is dropped from its review.
     pub drop_after_secs: u64,
+    /// A team that starts forming has this long to fill, else it is released and the review waits on.
     pub offer_secs: u64,
     pub review_secs: u64,
     pub vote_secs: u64,
@@ -69,6 +70,11 @@ pub struct Consensus {
     /// Blocking findings stay blocking only if nobody disagrees; otherwise they become major.
     pub blocking_unanimous: bool,
     pub vote_rounds: u8,
+    /// A review that no full team has taken this long after its request fails. A review keeps
+    /// its own in `ReviewParams::queue_secs`, out of the state file's `consensus`, which 0.14.1
+    /// reads with unknown fields refused.
+    #[serde(skip_serializing)]
+    pub queue_secs: u64,
 }
 
 impl Default for Consensus {
@@ -78,6 +84,7 @@ impl Default for Consensus {
             confirm_fraction: 0.5,
             blocking_unanimous: true,
             vote_rounds: 2,
+            queue_secs: 7200,
         }
     }
 }
@@ -132,8 +139,8 @@ impl Config {
     /// Refuses values the relay can't run with, so it never starts with them.
     pub fn validate(&self) -> Result<()> {
         let c = &self.consensus;
-        if !(1..=5).contains(&c.reviewers) {
-            anyhow::bail!("consensus.reviewers must be between 1 and 5, got {}", c.reviewers);
+        if !(2..=5).contains(&c.reviewers) {
+            anyhow::bail!("consensus.reviewers must be between 2 and 5 (every review has a claude and a codex reviewer), got {}", c.reviewers);
         }
         if !(0.0..1.0).contains(&c.confirm_fraction) {
             anyhow::bail!("consensus.confirm_fraction must be at least 0 and below 1, got {}", c.confirm_fraction);
@@ -164,5 +171,14 @@ mod tests {
         assert_eq!(c.state.as_deref(), Some(Path::new("/var/lib/amx/state.json")));
         assert!(c.tailnet);
         assert!(toml::from_str::<Config>("prot = 1").is_err());
+    }
+
+    #[test]
+    fn needs_two_reviewers() {
+        let with = |n: usize| Config { consensus: Consensus { reviewers: n, ..Consensus::default() }, ..Config::default() };
+        assert!(with(1).validate().is_err());
+        assert!(with(6).validate().is_err());
+        assert!(with(2).validate().is_ok());
+        assert!(with(5).validate().is_ok());
     }
 }

@@ -10,7 +10,7 @@
 # [timing]                          # seconds
 # online_secs = 90                  # an agent is online while it has called the relay this recently
 # drop_after_secs = 300             # an assigned reviewer silent this long is dropped
-# offer_secs = 120
+# offer_secs = 120                  # a forming team has this long to fill, else it is released
 # review_secs = 1200
 # vote_secs = 600                   # per voting round
 # reply_secs = 90                   # from round 2: authors of contested findings may reply before votes open
@@ -20,3 +20,4 @@
 # confirm_fraction = 0.5            # confirmed when more than this fraction of voters agree
 # blocking_unanimous = true         # blocking findings need everyone's agreement to stay blocking
 # vote_rounds = 2
+# queue_secs = 7200                # a review no full team has taken by then fails

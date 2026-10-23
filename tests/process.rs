@@ -48,7 +48,7 @@ fn missing_explicit_config_is_an_error() {
 
 fn request_review(url: &str, pr: &str) -> Value {
     let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"request_review","arguments":{{"pr_url":"{pr}","title":"Add a cache","reviewers":1}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"request_review","arguments":{{"pr_url":"{pr}","title":"Add a cache","count":2}}}}}}"#
     );
     let out = Command::new("curl")
         .args(["-sS", "-H", "content-type: application/json", "-d", &body])
@@ -137,6 +137,8 @@ fn a_crash_during_a_long_wait_loses_nothing() {
     let (_relay, url) = relay_with(port, &["--state", state]);
     let retry = curl(&url, &headers, &wait(3)).stdout(Stdio::piped()).spawn().unwrap();
     std::thread::sleep(Duration::from_millis(500));
+    let codex = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{"role":"reviewer","model":"codex"}}}"#;
+    Command::new("curl").args(["-sS", "-H", "content-type: application/json", "-d", codex]).arg(format!("{url}/mcp?agent=local-codex")).output().unwrap();
     assert_eq!(request_review(&url, "https://github.com/rust-lang/rust/pull/9")["result"]["isError"], false);
     let again = String::from_utf8(retry.wait_with_output().unwrap().stdout).unwrap();
     assert!(again.contains("Review offer"), "the same session, and name, after the restart: {again}");
