@@ -84,9 +84,15 @@ pub fn check(pre: &State, s: &State, now: Ms) -> Result<(), String> {
         if let Some(p) = was.filter(|p| !p.active() && *p != r.phase) {
             return fail("S7", format!("{} went from {p:?} to {:?}", r.id, r.phase));
         }
+        if let Some(p) = prev.filter(|p| p.phase == Phase::Done && p.verdict() != r.verdict())
+            && !r.log.iter().skip(p.log.len()).any(|e| e.kind == "ruling")
+        {
+            return fail("S20", format!("{}'s verdict went from {:?} to {:?} with no ruling", r.id, p.verdict(), r.verdict()));
+        }
         let results = s.peek_events(&r.author, 0).0.into_iter().filter(|e| e.result && e.review.as_deref() == Some(&r.id)).count();
-        if results != usize::from(!r.phase.active()) {
-            return fail("S7", format!("{} ({:?}) has {results} result notices", r.id, r.phase));
+        let rulings = r.log.iter().filter(|e| e.kind == "ruling").count();
+        if results != usize::from(!r.phase.active()) + rulings {
+            return fail("S7", format!("{} ({:?}) has {results} result notices after {rulings} rulings", r.id, r.phase));
         }
     }
     let live: Vec<&Review> = s.reviews.iter().filter(|r| r.phase.active()).collect();

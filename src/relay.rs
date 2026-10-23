@@ -82,10 +82,6 @@ impl Severity {
         }
     }
 
-    /// Whether a confirmed finding of this severity holds back approval: all but nits.
-    pub fn blocks(self) -> bool {
-        self != Severity::Nit
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -565,6 +561,10 @@ pub struct Review {
     /// The program the review failed for want of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing: Option<Model>,
+    /// Set when it finishes: the least severity of a confirmed finding that holds back approval.
+    /// Major in reviews that finished before 0.15.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocks_from: Option<Severity>,
 }
 
 impl Review {
@@ -635,16 +635,31 @@ impl Review {
         owner || self.author_login.eq_ignore_ascii_case(login)
     }
 
-    /// The verdict of a finished review, from its findings and rulings as they stand now: a
-    /// stored one may predate a ruling, or a relay that dropped it.
+    /// The verdict of a finished review, as it finished or a human's ruling since changed it.
     pub fn verdict(&self) -> Option<Verdict> {
-        self.result.as_ref().map(|_| verdict_of(&self.findings))
+        self.result.as_ref().map(|x| x.verdict)
     }
 
-    /// Its result as `verdict` and the findings now give it.
+    /// Its result with its text as the findings and rulings now word it.
     pub fn result_now(&self, web: &str) -> Option<ReviewResult> {
-        let at = self.result.as_ref()?.at;
-        Some(ReviewResult { verdict: verdict_of(&self.findings), at, text: text::result(self, web) })
+        let res = self.result.as_ref()?;
+        Some(ReviewResult { verdict: res.verdict, at: res.at, text: text::result(self, web) })
+    }
+
+    /// Whether a confirmed finding of severity `s` holds back its approval: all but nits, or in a
+    /// review that finished before 0.15.1, blocking and major ones.
+    pub fn blocks(&self, s: Severity) -> bool {
+        s <= self.blocks_from.unwrap_or(Severity::Minor)
+    }
+
+    /// The verdict its findings and rulings give now: changes are requested by a confirmed finding
+    /// that `blocks`, or one a human ruled must fix.
+    pub fn judged(&self) -> Verdict {
+        let blocks = self.findings.iter().any(|f| {
+            f.ruled().is_some_and(|r| r.must_fix)
+                || f.outcome.as_ref().is_some_and(|o| o.status == Status::Confirmed && self.blocks(o.severity))
+        });
+        if blocks { Verdict::ChangesRequested } else { Verdict::Approve }
     }
 
     /// Its place in the order reviews were requested.
@@ -885,15 +900,6 @@ pub fn rereview<'a>(reviews: &'a [Review], id: &str) -> Option<&'a Review> {
         }
     }
     None
-}
-
-/// Changes are requested by a confirmed blocking, major or minor finding, or one a human ruled must fix.
-pub fn verdict_of(findings: &[Finding]) -> Verdict {
-    let blocks = findings.iter().any(|f| {
-        f.ruled().is_some_and(|r| r.must_fix)
-            || f.outcome.as_ref().is_some_and(|o| o.status == Status::Confirmed && o.severity.blocks())
-    });
-    if blocks { Verdict::ChangesRequested } else { Verdict::Approve }
 }
 
 pub struct NewReview {
@@ -1194,7 +1200,9 @@ impl State {
     /// Loads a snapshot as if the relay's clock had stopped while it was down: unfinished
     /// deadlines, forming teams' timers and agents' silence resume where they were. A review
     /// 0.14.1 was offering queues from its request, and its reviewers, findings and all, form
-    /// its team.
+    /// its team. A finished review's verdict is the one its findings and rulings give under the
+    /// rule it finished by, which a file without `blocks_from` implies: 0.15.1 timed its
+    /// reviewers, and earlier relays held only blocking and major findings against approval.
     pub fn restore(&mut self, snap: Snapshot, now: Ms) {
         let down = now.saturating_sub(snap.saved_at);
         self.next_review = snap.next_review;
@@ -1236,6 +1244,14 @@ impl State {
                     s.tasked = s.tasked.map(|t| t + down);
                 }
             }
+            if r.result.is_some() {
+                let since = r.slots.iter().any(|s| s.tasked.is_some());
+                r.blocks_from.get_or_insert(if since { Severity::Minor } else { Severity::Major });
+                let verdict = r.judged();
+                if let Some(res) = &mut r.result {
+                    res.verdict = verdict;
+                }
+            }
         }
         let queued: HashSet<String> = self.reviews.iter().filter(|r| r.phase == Phase::Offering).map(|r| offer_task(&r.id)).collect();
         for a in self.agents.map.values_mut() {
@@ -1253,7 +1269,7 @@ impl State {
         self.reviews
             .iter_mut()
             .find(|r| r.id.eq_ignore_ascii_case(id))
-            .ok_or_else(|| anyhow!("no review {id} (the relay may have restarted)"))
+            .ok_or_else(|| anyhow!("no review {id} in the hub's history (older reviews are trimmed)"))
     }
 
     /// Records that `name` is alive and binds the name to the caller's Tailscale login, with the
@@ -1759,6 +1775,7 @@ impl State {
             replied: BTreeSet::new(),
             cancelled_by: None,
             missing: None,
+            blocks_from: None,
         };
         let from = if r.picked.is_empty() { String::new() } else { format!(" from {}", r.picked.join(", ")) };
         r.log(now, author, "request", format!("requested {reviewers} reviewer(s){from}. {}", r.note));
@@ -2212,7 +2229,7 @@ impl State {
         }
         let prev = self
             .review(id)
-            .ok_or_else(|| anyhow!("no review {id} (the relay may have restarted; use request_review)"))?
+            .ok_or_else(|| anyhow!("no review {id} in the hub's history (older reviews are trimmed); use request_review"))?
             .clone();
         let login = self.login_of(author);
         let same_person = self.agents.get(author).is_some_and(|a| a.role == Role::Author) && prev.author_login.eq_ignore_ascii_case(&login);
@@ -2389,8 +2406,12 @@ impl State {
             None => "ruling undone",
         };
         r.log(now, by, "ruling", format!("{fid}: {what}"));
+        let verdict = r.judged();
+        if let Some(res) = &mut r.result {
+            res.verdict = verdict;
+        }
         r.result = r.result_now(&web);
-        let v = match verdict_of(&r.findings) {
+        let v = match verdict {
             Verdict::Approve => "approve",
             Verdict::ChangesRequested => "changes requested",
         };
@@ -2426,7 +2447,8 @@ impl State {
 
     /// Keeps `history` finished reviews that someone took part in and `FAILED_KEPT` that nobody
     /// did, dropping the oldest of whichever login has the most, so one caller's requests can't
-    /// push out everyone else's.
+    /// push out everyone else's. The failed reviews of a PR go with any later review of it, so
+    /// none outlives the review that followed it.
     fn trim_history(&mut self) {
         let unattended = |r: &Review| r.phase == Phase::Failed && r.slots.is_empty();
         for (kind, cap) in [(false, self.history), (true, FAILED_KEPT.min(self.history))] {
@@ -2444,10 +2466,9 @@ impl State {
                     .reviews
                     .iter()
                     .position(|r| of_kind(r) && per_login[&r.author_login.to_ascii_lowercase()] == most);
-                match oldest {
-                    Some(i) => self.reviews.remove(i),
-                    None => break,
-                };
+                let Some(i) = oldest else { break };
+                let gone = self.reviews.remove(i);
+                self.reviews.retain(|r| r.phase != Phase::Failed || r.pr != gone.pr || r.seq() > gone.seq());
             }
         }
     }
@@ -2858,7 +2879,8 @@ fn finish(r: &mut Review, agents: &mut Agents, web: &str, now: Ms) {
     }
     let c = r.params.consensus;
     decide(&mut r.findings, &c);
-    let verdict = verdict_of(&r.findings);
+    r.blocks_from = Some(Severity::Minor);
+    let verdict = r.judged();
     r.phase = Phase::Done;
     r.ended = Some(now);
     let body = text::result(r, web);

@@ -414,7 +414,7 @@ fn program(m: Option<Model>) -> String {
     m.map(|m| format!(" <span class=\"pg\">{}</span>", m.as_str())).unwrap_or_default()
 }
 
-/// Confirmed blocking, major and minor findings, those the reviewers left undecided, and confirmed nits.
+/// Confirmed findings that block, those the reviewers left undecided, and the other confirmed ones.
 fn to_do(r: &Review) -> (usize, usize, usize) {
     let (mut fix, mut decide, mut optional) = (0, 0, 0);
     for f in &r.findings {
@@ -422,7 +422,7 @@ fn to_do(r: &Review) -> (usize, usize, usize) {
         match (&o.status, o.severity) {
             _ if f.ruled().is_some_and(|x| x.must_fix) => fix += 1,
             _ if f.ruled().is_some() => {}
-            (Status::Confirmed, s) if s.blocks() => fix += 1,
+            (Status::Confirmed, s) if r.blocks(s) => fix += 1,
             (Status::Confirmed, _) => optional += 1,
             (Status::Disputed | Status::Unverified, _) => decide += 1,
             _ => {}
@@ -799,11 +799,11 @@ fn connect(url: &str, login: &str, open: bool) -> String {
 /// What a finding asks of the human, in page order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Rank {
-    /// Confirmed blocking, major or minor, or still present.
+    /// Confirmed and blocking, or still present.
     Fix,
     /// Disputed, unverified or undecided, or still being voted on.
     Judge,
-    /// Confirmed nit.
+    /// Confirmed, not blocking.
     Optional,
     /// Carried over and voted down.
     Fixed,
@@ -811,12 +811,12 @@ enum Rank {
     Closed,
 }
 
-fn rank(f: &Finding) -> Rank {
+fn rank(r: &Review, f: &Finding) -> Rank {
     if f.withdrawn.is_some() {
         return Rank::Closed;
     }
     match f.outcome.as_ref().map(|o| (&o.status, o.severity)) {
-        Some((Status::Confirmed, s)) if s.blocks() => Rank::Fix,
+        Some((Status::Confirmed, s)) if r.blocks(s) => Rank::Fix,
         Some((Status::Confirmed, _)) => Rank::Optional,
         Some((Status::Disputed | Status::Unverified, _)) | None => Rank::Judge,
         Some((Status::Rejected, _)) if f.by.is_none() => Rank::Fixed,
@@ -891,12 +891,12 @@ fn rule_button(class: &str, value: &str, label: &str, fid: &str) -> String {
 
 /// `rule`: the viewer may rule on this review's open findings now.
 fn render_finding(out: &mut String, r: &Review, f: &Finding, rule: bool) {
-    let rank = rank(f);
+    let rank = rank(r, f);
     let sev = severity(f);
     let disputed = matches!(f.outcome.as_ref().map(|o| &o.status), Some(Status::Disputed | Status::Unverified));
     let open = match rank {
         Rank::Fix => true,
-        Rank::Judge => f.outcome.is_some() || !r.phase.active() || sev.blocks(),
+        Rank::Judge => f.outcome.is_some() || !r.phase.active() || r.blocks(sev),
         _ => false,
     };
     let mark = match outcome(f) {
@@ -1013,8 +1013,8 @@ fn render_findings(out: &mut String, r: &Review, rule: bool) {
     if shown.is_empty() && !hiding {
         return;
     }
-    shown.sort_by_key(|&(i, f)| (rank(f), severity(f), i));
-    let n = shown.iter().filter(|(_, f)| rank(f) < Rank::Fixed).count();
+    shown.sort_by_key(|&(i, f)| (rank(r, f), severity(f), i));
+    let n = shown.iter().filter(|(_, f)| rank(r, f) < Rank::Fixed).count();
     let count = if n > 0 { format!(" <span class=\"count\">{n}</span>") } else { String::new() };
     let since = since_link(r).map(|l| format!(" <span class=\"aside\">{l}</span>")).unwrap_or_default();
     let _ = write!(out, "<h2 id=\"findings\">Findings{count}{since}</h2>");
@@ -1043,7 +1043,7 @@ fn render_verdict(out: &mut String, r: &Review, q: Option<&Queue>, old: bool, ca
     let detail = match r.phase {
         Phase::Done => {
             let (fix, decide, optional) = to_do(r);
-            let fixed = r.findings.iter().filter(|f| rank(f) == Rank::Fixed).count();
+            let fixed = r.findings.iter().filter(|f| rank(r, f) == Rank::Fixed).count();
             let mut parts = Vec::new();
             if fix > 0 {
                 parts.push(format!("{fix} to fix"));
@@ -1063,8 +1063,16 @@ fn render_verdict(out: &mut String, r: &Review, q: Option<&Queue>, old: bool, ca
             }
             dotted(&parts)
         }
-        Phase::Failed if r.broke_off() => esc(&format!("{} The author can request a re-review.", failure(r).1)),
-        Phase::Failed => esc(&format!("{} The author can request it again.", failure(r).1)),
+        Phase::Failed => {
+            let again = match &r.parent {
+                _ if r.broke_off() => "The author can request a re-review.".into(),
+                Some(p) => format!("The author can re-review it from {p}."),
+                None => "The author can request it again.".into(),
+            };
+            let sent: Vec<&String> = r.slots.iter().filter(|s| s.submission.is_some()).map(|s| &s.agent).collect();
+            let lost = if sent.is_empty() { String::new() } else { format!(" What {} submitted was discarded with it.", names(&sent)) };
+            esc(&format!("{} {again}{lost}", failure(r).1))
+        }
         Phase::Offering => {
             let joined = r.active_slots().count();
             let left = plural(&r.params.reviewers.saturating_sub(joined).to_string(), "reviewer");
@@ -1630,7 +1638,7 @@ pub async fn review_page(
     let taken = hub.read(|s, now| s.review(&id).map(|r| (r.clone(), siblings(s, r), (r.phase == Phase::Offering).then(|| Queue::of(s, now)), now)));
     let Some((r, prs, q, now)) = taken else {
         let main = format!(
-            "<h1>No review {}</h1><p class=\"empty\">The relay may have restarted. <a href=\"/\">All reviews</a></p>",
+            "<h1>No review {0}</h1><p class=\"empty\">{0} isn't in the hub's history any more (older reviews are trimmed). <a href=\"/\">All reviews</a></p>",
             esc(&id)
         );
         let body = if partial(&headers) { titled("amx", &main) } else { page("amx", &main, false, &viewer) };

@@ -1,5 +1,5 @@
 use crate::hub::Hub;
-use crate::relay::{Action, AgentEvent, AmendIn, DECLINE_MS, FindingIn, Model, Ms, NewReview, Phase, Role, State, SubmitIn, Verdict, VoteIn, rereview, verdict_of};
+use crate::relay::{Action, AgentEvent, AmendIn, DECLINE_MS, FindingIn, Model, Ms, NewReview, Phase, Role, State, SubmitIn, Verdict, VoteIn, rereview};
 use crate::tailscale::Identity;
 use crate::text;
 use anyhow::{Result, anyhow};
@@ -324,7 +324,7 @@ fn next_after(s: &State, agent: &str, events: &[AgentEvent], known: &[String], n
     let fixes: Vec<String> = ids
         .into_iter()
         .filter_map(|id| s.review(id))
-        .filter(|r| r.phase == Phase::Done && verdict_of(&r.findings) == Verdict::ChangesRequested && rereview(&s.reviews, &r.id).is_none())
+        .filter(|r| r.verdict() == Some(Verdict::ChangesRequested) && rereview(&s.reviews, &r.id).is_none())
         .map(text::next_step)
         .collect();
     (next_text(&actions, role, events, known, &fixes), actions.iter().any(|a| a.urgent))

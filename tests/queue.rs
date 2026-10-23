@@ -5,7 +5,7 @@
 mod props;
 
 use amx::config::{Consensus, Timing};
-use amx::relay::{FindingIn, Model, Ms, NewReview, Phase, Role, State, SubmitIn, VoteIn};
+use amx::relay::{FindingIn, Model, Ms, NewReview, Phase, Role, State, Status, SubmitIn, VoteIn};
 use amx::tailscale::Identity;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -123,6 +123,14 @@ impl World {
                     None => "cancel nothing".into(),
                 }
             }
+            77..=78 => self.rule(),
+            79 => {
+                let json = serde_json::to_string(&self.s.snapshot(self.now)).unwrap();
+                let mut fresh = State::new(self.s.timing, self.s.consensus, self.s.history);
+                fresh.restore(serde_json::from_str(&json).unwrap(), self.now);
+                self.s = fresh;
+                "restart".into()
+            }
             _ => {
                 let secs = if self.rng.chance(10) { 600 } else { 1 + self.rng.below(120) as u64 };
                 return self.advance(secs);
@@ -167,6 +175,20 @@ impl World {
         let sha = SHAS[self.rng.below(2)];
         let res = self.s.rereview(&author, &id, sha, "fixed", None, self.now);
         format!("{author} re-reviews {id}: {res:?}")
+    }
+
+    /// A human rules on, or undoes the ruling on, an open finding of a finished review.
+    fn rule(&mut self) -> String {
+        let open: Vec<(String, String)> = self
+            .s
+            .reviews
+            .iter()
+            .filter(|r| r.phase == Phase::Done)
+            .flat_map(|r| r.findings.iter().filter(|f| f.outcome.as_ref().is_some_and(|o| matches!(o.status, Status::Disputed | Status::Unverified))).map(|f| (r.id.clone(), f.id.clone())))
+            .collect();
+        let Some((id, fid)) = self.rng.pick(&open).cloned() else { return "no ruling".into() };
+        let must_fix = [Some(true), Some(false), None][self.rng.below(3)];
+        format!("rule {id}/{fid} {must_fix:?}: {:?}", self.s.rule(&id, &fid, "a human", must_fix, self.now))
     }
 
     fn reviewer_acts(&mut self) -> String {
@@ -265,6 +287,9 @@ fn random_actors_never_break_the_queue_rules() {
                 let why = if e.text.contains("older review") { "released for an older review" } else { "released" };
                 *seen.entry(why).or_default() += 1;
             }
+            if r.log.iter().any(|e| e.kind == "ruling") {
+                *seen.entry("ruled").or_default() += 1;
+            }
             if r.log.iter().any(|e| e.kind == "lapse") {
                 *seen.entry("lapsed").or_default() += 1;
             }
@@ -274,7 +299,7 @@ fn random_actors_never_break_the_queue_rules() {
             }
         }
     }
-    for kind in ["done", "cancelled", "queue timeout", "dropped out", "re-review", "started with fewer", "released", "released for an older review", "lapsed", "asked again after declining"] {
+    for kind in ["done", "cancelled", "queue timeout", "dropped out", "re-review", "started with fewer", "released", "released for an older review", "lapsed", "asked again after declining", "ruled"] {
         assert!(seen.get(kind).is_some_and(|n| *n > 0), "no run reached {kind}: {seen:?}");
     }
 }
