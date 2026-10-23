@@ -130,7 +130,8 @@ async fn a_shared_name_stays_a_reviewer_while_a_reviewer_session_holds_it() {
     let started = std::time::Instant::now();
     session_rpc(&base, &rev, call(2, "wait", json!({"timeout_seconds": 1})), false).await;
     assert!(started.elapsed() >= Duration::from_secs(1), "the reviewer session doesn't spin");
-    ok_tool(&base, "alice", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["team"]})).await;
+    ok_tool(&base, "team-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&base, "alice", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["team", "team-cx"]})).await;
     relay.running.stop().await;
 }
 
@@ -192,6 +193,7 @@ async fn review_over_mcp_with_long_polls() {
     let (author, reviewer) = (relay.local.clone(), relay.tailnet.clone());
     let hello = ok_tool(&reviewer, "friend-rev", "hello", json!({"role":"reviewer","model":"claude"})).await;
     assert!(hello.contains("loop on `wait`"), "{hello}");
+    ok_tool(&author, "owner-rev", "hello", json!({"role":"reviewer","model":"codex"})).await;
 
     let waiting = tokio::spawn({
         let reviewer = reviewer.clone();
@@ -202,12 +204,13 @@ async fn review_over_mcp_with_long_polls() {
         &author,
         "owner-codex",
         "request_review",
-        json!({"pr_url": format!("{PR}/files"), "title": "Add a cache", "reviewers": 1, "note": "please look"}),
+        json!({"pr_url": format!("{PR}/files"), "title": "Add a cache", "count": 2, "note": "please look"}),
     )
     .await;
-    assert!(req.contains("Review r1 requested; offered to 1 idle reviewer"), "{req}");
+    assert!(req.contains("Review r1 queued; 2 idle reviewer(s) online now."), "{req}");
     let offer = tokio::time::timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap();
     assert!(offer.contains("Review offer") && offer.contains("accept_review"), "{offer}");
+    ok_tool(&author, "owner-rev", "accept_review", json!({"review_id":"r1"})).await;
 
     let acc = ok_tool(&reviewer, "friend-rev", "accept_review", json!({"review_id":"r1"})).await;
     assert!(acc.contains("gh pr diff"), "{acc}");
@@ -222,8 +225,10 @@ async fn review_over_mcp_with_long_polls() {
     )
     .await;
     assert!(sub.contains("Submitted 1 finding"), "{sub}");
+    ok_tool(&author, "owner-rev", "submit_findings", json!({"review_id":"r1","head_sha":"0123456789abcdef","verdict":"approve","findings":[]})).await;
+    ok_tool(&author, "owner-rev", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree"}]})).await;
     let result = ok_tool(&author, "owner-codex", "wait", json!({"timeout_seconds": 5})).await;
-    assert!(result.contains("NEEDS YOUR CALL") && result.contains("only their author vouches for F1: check them against the code yourself"), "a sole reviewer's finding is unverified: {result}");
+    assert!(result.contains("CHANGES REQUESTED") && result.contains("Short title"), "{result}");
 
     let page = reqwest::get(format!("{author}/r/r1")).await.unwrap().text().await.unwrap();
     assert!(!page.contains("<script>alert"), "escaped");
@@ -278,20 +283,20 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     assert_eq!(stages, ["done", "done", "done", "done"]);
     assert!(v.get("next_finding").is_none());
 
-    ok_tool(&base, "author", "request_review", json!({"title": "Fix the parser", "pr_url": "https://github.com/rust-lang/rust/pull/2", "reviewers": 1})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Fix the parser", "pr_url": "https://github.com/rust-lang/rust/pull/2", "count": 2})).await;
     let list: Value = get("/api/reviews").await.unwrap().json().await.unwrap();
     let ids: Vec<&str> = list["reviews"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
     assert_eq!(ids, ["r2", "r1"], "newest first");
     assert_eq!(list["reviews"][0]["active"], true);
     assert_eq!(list["reviews"][1]["verdict"], "changes_requested");
-    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": 1})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "count": 2})).await;
     let page = get("/r/r1").await.unwrap().text().await.unwrap();
-    assert!(page.contains("<p class=\"newer\">Newer review: <a href=\"/r/r3\">r3</a> (waiting for reviewers)&nbsp;· last result: changes requested</p>"), "{page}");
+    assert!(page.contains("<p class=\"newer\">Newer review: <a href=\"/r/r3\">r3</a> (queued)&nbsp;· last result: changes requested</p>"), "{page}");
     assert!(page.contains("<li aria-current=\"page\"><span class=\"h-id\"><b>r1</b>") && page.contains("<a href=\"/r/r3\">r3</a></span>"), "{page}");
     let index = get("/").await.unwrap().text().await.unwrap();
-    assert!(page.contains("<span class=\"h-gist\">0 of 1 accepted</span>"), "the history says what the index row says: {page}");
-    assert!(index.contains("<span>0 of 1 accepted ·</span> <span>last: changes requested ·</span> <span>2 reviews ·</span> <span>author</span>") && !index.contains("href=\"/r/r1\""), "one row per PR: {index}");
-    assert!(index.contains("<title>amx · 2 running</title>") && index.contains(">Fix the parser<span class=\"sr\">, Waiting for reviewers</span></a>"), "{index}");
+    assert!(page.contains("<span class=\"h-gist\">0 of 2 joined</span>"), "the history says what the index row says: {page}");
+    assert!(index.contains("<span>0 of 2 joined ·</span> <span>last: changes requested ·</span> <span>2 reviews ·</span> <span>author</span>") && !index.contains("href=\"/r/r1\""), "one row per PR: {index}");
+    assert!(index.contains("<title>amx · 2 queued</title>") && index.contains(">Fix the parser<span class=\"sr\">, Queued</span></a>"), "{index}");
     assert!(index.contains("<span>2 reviewers idle ·</span> <span>1 author</span></a>"), "zero counts left out: {index}");
 
     let missing = get("/api/reviews/r9").await.unwrap();
@@ -387,7 +392,7 @@ async fn state_is_saved_while_running_and_restored() {
     };
     let running = amx::start(cfg.clone()).await.unwrap();
     let base = format!("http://{}", running.local_addr);
-    ok_tool(&base, "owner-codex", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": 1})).await;
+    ok_tool(&base, "owner-codex", "request_review", json!({"title": "Add a cache", "pr_url": PR, "count": 2})).await;
     let mut saved = String::new();
     for _ in 0..50 {
         saved = std::fs::read_to_string(&path).unwrap();
@@ -434,7 +439,7 @@ async fn authors_name_reviewers_and_links_use_the_public_url() {
     };
     let running = amx::start(cfg).await.unwrap();
     let base = format!("http://{}", running.local_addr);
-    for (rev, model) in [("rev-a", "claude"), ("rev-b", "codex")] {
+    for (rev, model) in [("rev-a", "claude"), ("rev-b", "codex"), ("rev-c", "claude")] {
         ok_tool(&base, rev, "hello", json!({"role":"reviewer","model":model})).await;
     }
     for args in [json!({"pr_url": PR}), json!({"pr_url": PR, "title": " \n "})] {
@@ -443,9 +448,11 @@ async fn authors_name_reviewers_and_links_use_the_public_url() {
     }
     let (err, text) = tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev-a", "nobody"]})).await;
     assert!(err && text.contains("nobody (unknown agent)"), "{text}");
-    let req = ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev-b"]})).await;
-    assert!(req.contains("Review r1 requested from rev-b; 1 of them idle now"), "{req}");
-    let (err, text) = tool(&base, "rev-a", "accept_review", json!({"review_id":"r1"})).await;
+    let (err, text) = tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev-b"]})).await;
+    assert!(err && text.contains("name at least 2 reviewers"), "{text}");
+    let req = ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev-a", "rev-b"]})).await;
+    assert!(req.contains("Review r1 queued for rev-a, rev-b; 2 of them idle now."), "{req}");
+    let (err, text) = tool(&base, "rev-c", "accept_review", json!({"review_id":"r1"})).await;
     assert!(err && text.contains("picked"), "{text}");
     ok_tool(&base, "rev-b", "accept_review", json!({"review_id":"r1"})).await;
 
@@ -480,8 +487,9 @@ async fn owed_tasks_are_given_in_full_once_per_result() {
     assert!(offer.ends_with("NEXT: r1: accept or decline the offer above.") && offer.matches(PR).count() == 1, "{offer}");
 
     let acc = ok_tool(&base, "rev-a", "accept_review", json!({"review_id":"r1"})).await;
-    assert!(acc.contains("gh pr diff") && acc.contains("at least 20m00s"), "starts at once: {acc}");
-    ok_tool(&base, "rev-b", "accept_review", json!({"review_id":"r1"})).await;
+    assert!(acc.contains("you are in its team") && !acc.contains("gh pr diff"), "no task before the team is complete: {acc}");
+    let full = ok_tool(&base, "rev-b", "accept_review", json!({"review_id":"r1"})).await;
+    assert!(full.contains("gh pr diff") && full.contains("Deadline: 20m00s"), "the accept that completes the team gives the task: {full}");
     let findings = json!([{"severity":"major","title":"Short title","text":"cache never invalidated"},{"severity":"minor","title":"Short title","text":"typo in docs"}]);
     ok_tool(&base, "rev-a", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","findings":findings})).await;
     let idle = ok_tool(&base, "rev-a", "wait", json!({"timeout_seconds": 1})).await;
@@ -535,8 +543,10 @@ async fn a_closing_reply_window_wakes_waiting_reviewers() {
         ok_tool(&base, rev, "hello", json!({"role":"reviewer","model":model})).await;
     }
     ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev-a", "rev-b"]})).await;
-    for (rev, text) in [("rev-a", "race on shutdown"), ("rev-b", "leaks a file handle")] {
+    for rev in ["rev-a", "rev-b"] {
         ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
+    }
+    for (rev, text) in [("rev-a", "race on shutdown"), ("rev-b", "leaks a file handle")] {
         let findings = json!([{"severity":"major","title":"Short title","text":text}]);
         ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","findings":findings})).await;
     }
@@ -570,7 +580,8 @@ async fn delivered_events_are_saved_before_wait_returns() {
     let running = amx::start(cfg).await.unwrap();
     let base = format!("http://{}", running.local_addr);
     ok_tool(&base, "rev", "hello", json!({"role":"reviewer","model":"claude"})).await;
-    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev"]})).await;
+    ok_tool(&base, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev", "rev-cx"]})).await;
     for _ in 0..50 {
         if agent_in(&path, "rev")["next_seq"] == 1 {
             break;
@@ -585,7 +596,7 @@ async fn delivered_events_are_saved_before_wait_returns() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_review_and_a_result_a_session_waits_for_are_saved_before_the_reply() {
+async fn a_new_review_and_a_result_a_wait_hands_out_are_saved_before_the_reply() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("state.json");
     let cfg = Config {
@@ -598,15 +609,38 @@ async fn a_new_review_and_a_result_a_session_waits_for_are_saved_before_the_repl
     let base = format!("http://{}", running.local_addr);
     let saved = || -> Value { serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap() };
     ok_tool(&base, "rev", "hello", json!({"role":"reviewer","model":"claude"})).await;
-    let (author, _) = initialize(&base, "agent=author").await;
-    let pr = "https://github.com/example-org/widgets/pull/7";
-    session_rpc(&base, &author, call(1, "request_review", json!({"title": "Add a cache", "pr_url": pr, "reviewers": ["rev"]})), false).await;
-    assert_eq!(saved()["reviews"][0]["id"], "r1", "a crash now must not lose the review");
-    ok_tool(&base, "rev", "accept_review", json!({"review_id":"r1"})).await;
-    ok_tool(&base, "rev", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
-    let result = session_rpc(&base, &author, call(2, "wait", json!({})), false).await;
-    assert!(text_of(&result).contains("Review result"), "{result}");
-    assert!(saved()["reviews"][0]["result"].is_object(), "a crash now must not take back the result");
+    ok_tool(&base, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    let (sid, _) = initialize(&base, "agent=author").await;
+    for (i, session) in [true, false].into_iter().enumerate() {
+        let (id, pr) = (format!("r{}", i + 1), format!("https://github.com/example-org/widgets/pull/{}", i + 7));
+        let request = json!({"title": "Add a cache", "pr_url": pr, "reviewers": ["rev", "rev-cx"]});
+        if session {
+            session_rpc(&base, &sid, call(1, "request_review", request), false).await;
+        } else {
+            ok_tool(&base, "author", "request_review", request).await;
+        }
+        assert_eq!(saved()["reviews"][i]["id"], id.as_str(), "a crash now must not lose the review");
+        for rev in ["rev", "rev-cx"] {
+            ok_tool(&base, rev, "accept_review", json!({"review_id": id})).await;
+        }
+        for rev in ["rev", "rev-cx"] {
+            ok_tool(&base, rev, "submit_findings", json!({"review_id": id,"head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+        }
+        let result = if session {
+            text_of(&session_rpc(&base, &sid, call(2, "wait", json!({})), false).await)
+        } else {
+            ok_tool(&base, "author", "wait", json!({})).await
+        };
+        assert!(result.contains("Review result"), "{result}");
+        let review = &saved()["reviews"][i];
+        assert!(review["result"].is_object(), "a crash now must not take back the result of {id}");
+        let author = agent_in(&path, "author");
+        let event = author["events"].as_array().unwrap().iter().find(|e| e["review"] == id.as_str() && e["result"] == true).cloned().unwrap_or_default();
+        assert!(event["seq"].is_u64(), "the result event of {id} is kept: {author}");
+        if !session {
+            assert!(author["delivered"].as_u64() >= event["seq"].as_u64(), "and saved as received, so a crash doesn't hand it out again: {author}");
+        }
+    }
     running.stop().await;
 }
 
@@ -655,8 +689,10 @@ async fn events_stay_until_the_session_acknowledges_them() {
     let base = relay.local.clone();
     let (sid, _) = initialize(&base, "agent=rev").await;
     ok_tool(&base, "rev", "hello", json!({"role":"reviewer","model":"claude"})).await;
-    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev"]})).await;
+    ok_tool(&base, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev", "rev-cx"]})).await;
     ok_tool(&base, "rev", "accept_review", json!({"review_id":"r1"})).await;
+    ok_tool(&base, "rev-cx", "accept_review", json!({"review_id":"r1"})).await;
     ok_tool(&base, "author", "say", json!({"review_id":"r1","text":"Mind the cache."})).await;
     let cancel = |id: u64| json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}});
     let owed = || relay.running.hub.read(|s, _| s.has_undelivered("rev"));
@@ -684,7 +720,8 @@ async fn a_wait_cancelled_while_it_runs_is_not_taken_as_received() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     session_rpc(&base, &sid, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}), false).await;
-    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev"]})).await;
+    ok_tool(&base, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev", "rev-cx"]})).await;
     assert!(text_of(&running.await.unwrap()).contains("Review offer"), "answered after the client gave up on it");
     let next = session_rpc(&base, &sid, call(2, "wait", json!({})), false).await;
     assert!(text_of(&next).contains("Review offer"), "so it comes again: {next}");
@@ -707,7 +744,8 @@ async fn a_dropped_stream_returns_its_events() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     drop(resp);
-    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev"]})).await;
+    ok_tool(&base, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev", "rev-cx"]})).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let next = session_rpc(&base, &sid, call(2, "wait", json!({})), true).await;
     assert!(text_of(&next).contains("Review offer"), "{next}");
@@ -730,7 +768,8 @@ async fn a_streamed_wait_sends_progress_until_an_event() {
         .unwrap();
     assert_eq!(resp.headers()["content-type"], "text/event-stream");
     tokio::time::sleep(Duration::from_secs(21)).await;
-    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": 1})).await;
+    ok_tool(&base, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "count": 2})).await;
     let body = tokio::time::timeout(Duration::from_secs(5), resp.text()).await.unwrap().unwrap();
     assert!(body.contains("notifications/progress") && body.contains("Review offer"), "outlasts timeout_seconds: {body}");
     relay.running.stop().await;
@@ -796,11 +835,14 @@ async fn after_a_restart_sessions_get_back_the_names_of_their_role() {
     let base = format!("http://{}", running.local_addr);
     let (rev, _) = initialize(&base, "").await;
     session_rpc(&base, &rev, call(1, "hello", json!({"role":"reviewer","model":"claude"})), false).await;
-    let (author, _) = initialize(&base, "role=reviewer").await;
-    let req = session_rpc(&base, &author, call(1, "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["local-claude"]})), false).await;
+    ok_tool(&base, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    let (author, _) = initialize(&base, "").await;
+    let req = session_rpc(&base, &author, call(1, "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["local-claude", "rev-cx"]})), false).await;
     assert!(text_of(&req).starts_with("You are `local-claude-2`."), "{req}");
     session_rpc(&base, &rev, call(2, "accept_review", json!({"review_id":"r1"})), false).await;
+    ok_tool(&base, "rev-cx", "accept_review", json!({"review_id":"r1"})).await;
     session_rpc(&base, &rev, call(3, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})), false).await;
+    ok_tool(&base, "rev-cx", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
     running.stop().await;
 
     let running = amx::start(cfg).await.unwrap();
@@ -814,7 +856,7 @@ async fn after_a_restart_sessions_get_back_the_names_of_their_role() {
     let hello = session_rpc(&base, &rev, call(1, "hello", json!({"role":"reviewer","model":"claude"})), false).await;
     assert!(text_of(&hello).starts_with("You are `local-claude`."), "{hello}");
     let result = session_rpc(&base, &author, call(3, "wait", json!({})), false).await;
-    assert!(text_of(&result).contains("Review result"), "a reviewer session's request still gets its result: {result}");
+    assert!(text_of(&result).contains("Review result"), "the session that requested it gets its result: {result}");
     running.stop().await;
 }
 
@@ -876,9 +918,14 @@ async fn an_author_with_nothing_in_progress_is_answered_at_once() {
     let idle = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 20})).await;
     assert!(idle.starts_with("Nothing in progress.") && idle.contains("call `request_review`"), "{idle}");
     ok_tool(&base, "rev", "hello", json!({"role":"reviewer","model":"claude"})).await;
-    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev"]})).await;
-    ok_tool(&base, "rev", "accept_review", json!({"review_id":"r1"})).await;
-    ok_tool(&base, "rev", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+    ok_tool(&base, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev", "rev-cx"]})).await;
+    for rev in ["rev", "rev-cx"] {
+        ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
+    }
+    for rev in ["rev", "rev-cx"] {
+        ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+    }
     let result = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 20})).await;
     assert!(result.contains("Review result"), "{result}");
     let idle = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 20})).await;
@@ -895,14 +942,16 @@ async fn an_acknowledgement_from_before_a_restart_acknowledges_nothing() {
     let relay = start(None, vec![]).await;
     let (sid, _) = initialize(&relay.local, "agent=rev&role=reviewer").await;
     session_rpc(&relay.local, &sid, call(0, "hello", json!({"role":"reviewer","model":"claude"})), false).await;
-    ok_tool(&relay.local, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev"]})).await;
+    ok_tool(&relay.local, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&relay.local, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev", "rev-cx"]})).await;
     let offer = session_rpc(&relay.local, &sid, call(1, "wait", json!({})), false).await;
     assert!(text_of(&offer).contains("Review offer"), "{offer}");
     relay.running.stop().await;
 
     let relay = start(None, vec![]).await;
     ok_tool(&relay.local, "rev", "hello", json!({"role":"reviewer","model":"claude"})).await;
-    ok_tool(&relay.local, "author", "request_review", json!({"title": "Add a cache", "pr_url": format!("{PR}0"), "reviewers": ["rev"]})).await;
+    ok_tool(&relay.local, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&relay.local, "author", "request_review", json!({"title": "Add a cache", "pr_url": format!("{PR}0"), "reviewers": ["rev", "rev-cx"]})).await;
     let after = reqwest::Client::new().post(format!("{}/mcp?agent=rev", relay.local)).header("Mcp-Session-Id", &sid).json(&call(2, "wait", json!({})));
     let after: Value = after.send().await.unwrap().json().await.unwrap();
     assert!(text_of(&after).contains(&format!("{PR}0")), "the new relay's offer is not taken as received: {after}");
@@ -938,7 +987,7 @@ async fn downtime_after_a_crash_is_counted_from_the_last_heartbeat() {
     };
     let running = amx::start(cfg.clone()).await.unwrap();
     let base = format!("http://{}", running.local_addr);
-    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": 1})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "count": 2})).await;
     assert!(alive.exists(), "the relay records that it is alive");
     running.stop().await;
 
@@ -950,7 +999,7 @@ async fn downtime_after_a_crash_is_counted_from_the_last_heartbeat() {
     let again = amx::start(cfg).await.unwrap();
     let r: Value = reqwest::get(format!("http://{}/api/reviews/r1", again.local_addr)).await.unwrap().json().await.unwrap();
     let left = r["deadline_left_ms"].as_u64().unwrap();
-    assert!(left <= 120_000, "a quiet spell before the crash is not downtime: {left}");
+    assert!(left <= 7_200_000, "a quiet spell before the crash is not downtime: {left}");
     again.stop().await;
 }
 
@@ -1053,7 +1102,7 @@ async fn loopback_waits_for_the_owner_then_takes_over_local_names() {
         ..Config::default()
     };
     let running = amx::start(cfg.clone()).await.unwrap();
-    ok_tool(&format!("http://{}", running.local_addr), "own-au", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": 1})).await;
+    ok_tool(&format!("http://{}", running.local_addr), "own-au", "request_review", json!({"title": "Add a cache", "pr_url": PR, "count": 2})).await;
     running.stop().await;
 
     let down = write_script(tmp.path(), "ts-down", "echo 'Tailscale is stopped.' >&2; exit 1");
@@ -1119,5 +1168,53 @@ async fn reviewers_say_which_program_they_run_in() {
     ok_tool(&base, "author", "hello", json!({"role":"author"})).await;
     let online = ok_tool(&base, "author", "online", json!({})).await;
     assert!(online.contains("- rev (reviewer, codex, "), "{online}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_successful_request_makes_a_session_an_author() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    let req = json!({"title": "Add a cache", "pr_url": PR});
+    let (rev, _) = initialize(&base, "agent=rev&role=reviewer").await;
+    session_rpc(&base, &rev, call(1, "hello", json!({"role":"reviewer","model":"claude"})), false).await;
+    let refused = session_rpc(&base, &rev, call(2, "request_review", req.clone()), false).await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(text_of(&refused).contains("`rev` is a reviewer: request reviews from an author session"), "{refused}");
+    let (err, text) = tool(&base, "rev", "request_rereview", json!({"review_id": "r1", "new_head_sha": "abc1234"})).await;
+    assert!(err && text.contains("`rev` is a reviewer"), "{text}");
+    let online = ok_tool(&base, "rev", "online", json!({})).await;
+    assert!(online.contains("rev (you) (reviewer,"), "a refused call leaves the role alone: {online}");
+    reqwest::Client::new().delete(format!("{base}/mcp")).header("Mcp-Session-Id", &rev).send().await.unwrap();
+
+    let (fresh, _) = initialize(&base, "agent=rev").await;
+    let failed = session_rpc(&base, &fresh, call(1, "request_review", json!({"pr_url": PR})), false).await;
+    assert_eq!(failed["result"]["isError"], true, "{failed}");
+    let online = text_of(&session_rpc(&base, &fresh, call(2, "online", json!({})), false).await);
+    assert!(online.contains("rev (you) (reviewer,"), "a failed request doesn't make it an author: {online}");
+    let done = session_rpc(&base, &fresh, call(3, "request_review", req), false).await;
+    assert!(text_of(&done).starts_with("Review r1 queued"), "{done}");
+    let online = text_of(&session_rpc(&base, &fresh, call(4, "online", json!({})), false).await);
+    assert!(online.contains("rev (you) (author,"), "a session that hadn't said its role becomes an author: {online}");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_rereview_says_who_asked_and_gets_the_result() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    ok_tool(&base, "rev", "hello", json!({"role":"reviewer","model":"claude"})).await;
+    ok_tool(&base, "rev-cx", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    ok_tool(&base, "author", "request_review", json!({"title": "Add a cache", "pr_url": PR, "reviewers": ["rev", "rev-cx"]})).await;
+    for rev in ["rev", "rev-cx"] {
+        ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
+    }
+    for rev in ["rev", "rev-cx"] {
+        ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+    }
+    let again = json!({"review_id": "r1", "new_head_sha": "def5678"});
+    assert!(ok_tool(&base, "author", "request_rereview", again.clone()).await.starts_with("Re-review r2 queued"));
+    let other = ok_tool(&base, "author-2", "request_rereview", again).await;
+    assert!(other.starts_with("author already requested this re-review as r2; it is not queued twice, and its result goes to author."), "{other}");
     relay.running.stop().await;
 }

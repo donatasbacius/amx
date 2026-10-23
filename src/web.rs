@@ -9,7 +9,7 @@ use crate::server::{Owner, Viewer};
 use crate::tailscale::Identity;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -119,12 +119,33 @@ fn dotted(parts: &[String]) -> String {
     spans.join(" ")
 }
 
-/// A running review's deadline, counted down by the page script, else when it ended.
+/// How close a queued review's failure is before its time turns amber.
+const SOON_MS: Ms = 15 * 60 * 1000;
+
+/// `m` minutes, at least one, as "35m" or "1h28m".
+fn mins(m: Ms) -> String {
+    match m.max(1) {
+        m @ ..60 => format!("{m}m"),
+        m => format!("{}h{:02}m", m / 60, m % 60),
+    }
+}
+
+/// Rounded as the page script rounds `<time>` tags, so it never reads "1m" beside "just now".
+fn queued(r: &Review, now: Ms) -> String {
+    match now.saturating_sub(r.created) {
+        ..45_000 => "queued just now".into(),
+        ms => format!("queued {}", mins((ms + 30_000) / 60_000)),
+    }
+}
+
+/// How long a queued review has waited, or how soon it fails once that is near; a running
+/// review's deadline, counted down by the page script; else when it ended.
 fn when(r: &Review, now: Ms) -> String {
-    if r.phase.active() {
-        format!("<span data-deadline=\"{}\">until {}</span>", r.deadline, utc(r.deadline, now))
-    } else {
-        time_tag(r.ended.unwrap_or(r.created), now)
+    match r.phase {
+        Phase::Offering if r.deadline_left(now) <= SOON_MS => format!("<span class=\"needs\">fails in {}</span>", mins(r.deadline_left(now).div_ceil(60_000))),
+        Phase::Offering => queued(r, now),
+        p if p.active() => format!("<span data-deadline=\"{}\">until {}</span>", r.deadline, utc(r.deadline, now)),
+        _ => time_tag(r.ended.unwrap_or(r.created), now),
     }
 }
 
@@ -133,7 +154,7 @@ fn when(r: &Review, now: Ms) -> String {
 /// viewer may decide them.
 fn status(r: &Review, locked: bool, can: bool) -> (&'static str, String) {
     match r.phase {
-        Phase::Offering => ("waiting", "Waiting for reviewers".into()),
+        Phase::Offering => ("queued", "Queued".into()),
         Phase::Reviewing => ("inreview", "Reviewing".into()),
         Phase::Voting(_) if r.replying => ("voting", "Replying".into()),
         Phase::Voting(1) => ("voting", "Voting".into()),
@@ -358,9 +379,17 @@ fn failure(r: &Review) -> (String, String) {
     if let Some(by) = &r.cancelled_by {
         let by = if by == "the hub owner" { "The hub owner" } else { by };
         ("cancelled".into(), format!("{by} cancelled it."))
+    } else if r.failure.as_deref().is_some_and(|f| f.starts_with("no full team")) {
+        let n = r.params.reviewers;
+        let mix = if n >= 2 { ", claude and codex," } else { "" };
+        let within = span(r.params.queue_secs);
+        (format!("no team within {within}"), format!("No team of {}{mix} joined within {within}.", plural(&n.to_string(), "reviewer")))
     } else if let Some(m) = r.missing.map(|m| m.as_str()) {
-        let why = format!("No {m} reviewer accepted in time; a review with more than one reviewer needs both claude and codex. {} accepted.", names(&who));
+        let why = format!("No {m} reviewer accepted in time; every review needs both claude and codex. {} accepted.", names(&who));
         (format!("no {m} reviewer"), why)
+    } else if let Some(m) = r.missing_model().filter(|_| r.active_slots().next().is_some()).map(|m| m.as_str()) {
+        let gone: Vec<&String> = r.slots.iter().filter(|s| s.dropped.is_some()).map(|s| &s.agent).collect();
+        (format!("no {m} reviewer left"), format!("No {m} reviewer was left to finish it, so it gave no verdict. Dropped: {}.", names(&gone)))
     } else if !who.is_empty() {
         ("reviewers dropped out".into(), format!("All reviewers dropped out: {}.", names(&who)))
     } else if r.offered.is_empty() {
@@ -368,6 +397,11 @@ fn failure(r: &Review) -> (String, String) {
     } else {
         ("nobody accepted".into(), format!("Nobody accepted in time. {}", asked(r)))
     }
+}
+
+/// "2 hours" or "90 minutes".
+fn span(secs: u64) -> String {
+    if secs.is_multiple_of(3600) { plural(&(secs / 3600).to_string(), "hour") } else { plural(&secs.div_ceil(60).to_string(), "minute") }
 }
 
 /// The program a reviewer runs in, after its name.
@@ -400,29 +434,22 @@ fn repliers(r: &Review) -> Vec<&String> {
         .collect()
 }
 
-/// A PR on the index: its newest review, the newest finished one shown while that runs, when
-/// anything last happened to it and how many reviews it has had.
+/// A PR on the index: its newest review, the newest finished one shown while that runs, and how
+/// many reviews it has had.
 struct Pr<'a> {
     r: &'a Review,
     last: Option<(&'a Review, bool)>,
     locked: bool,
-    at: Ms,
     n: usize,
 }
 
-/// A request, an end or a ruling, whichever came last.
-fn activity(r: &Review) -> Ms {
-    let ruled = r.findings.iter().filter_map(|f| f.ruling.as_ref()).map(|x| x.at);
-    ruled.chain(r.ended).fold(r.created, Ms::max)
-}
-
-/// One per PR, latest activity first.
+/// One per PR, newest request first, so a row keeps its place whatever happens to its review.
 fn prs(st: &State) -> Vec<Pr<'_>> {
     let mut latest: Vec<&Review> = st.reviews.iter().collect();
-    latest.sort_by_key(|r| std::cmp::Reverse(r.created));
+    latest.sort_by_key(|r| std::cmp::Reverse((r.created, r.seq())));
     let mut seen = HashSet::new();
     latest.retain(|r| seen.insert(&r.pr));
-    let mut out: Vec<Pr> = latest
+    latest
         .into_iter()
         .map(|r| {
             let all = st.reviews.iter().filter(|x| x.pr == r.pr);
@@ -430,22 +457,32 @@ fn prs(st: &State) -> Vec<Pr<'_>> {
                 r,
                 last: all.clone().filter(|x| x.phase == Phase::Done).max_by_key(|x| x.ended).map(|x| (x, rereview(&st.reviews, &x.id).is_some())),
                 locked: rereview(&st.reviews, &r.id).is_some(),
-                at: all.clone().map(activity).max().unwrap_or(r.created),
                 n: all.count(),
             }
         })
-        .collect();
-    out.sort_by_key(|p| std::cmp::Reverse(p.at));
-    out
+        .collect()
+}
+
+/// Whether an online reviewer running `m` is idle.
+fn idle(online: &[OnlineAgent], m: Model) -> bool {
+    online.iter().any(|a| a.role == Role::Reviewer && a.model == Some(m) && a.busy.is_none())
+}
+
+/// A program a queued review of two or more reviewers still needs while none of its reviewers is idle.
+fn none_idle(r: &Review, online: &[OnlineAgent]) -> Option<Model> {
+    let needs = |m: &Model| r.phase == Phase::Offering && r.params.reviewers >= 2 && !r.active_slots().any(|s| s.model == Some(*m));
+    Model::ALL.into_iter().find(|m| needs(m) && !idle(online, *m))
 }
 
 /// Status, title and time, then the PR, the gist and who asked; `mine` words a call as the
 /// viewer's, `may` adds that the viewer can rule on someone else's.
-fn review_row(out: &mut String, p: &Pr, mine: bool, may: bool, now: Ms) {
+fn review_row(out: &mut String, p: &Pr, mine: bool, may: bool, online: &[OnlineAgent], now: Ms) {
     let r = p.r;
     let (cls, label) = status(r, p.locked, mine);
     let mut meta = vec![esc(&r.pr.short()), esc(&gist(r, mine, p.locked))];
-    if let Some(m) = r.missing_model().filter(|_| r.phase == Phase::Offering && r.active_slots().count() > 0) {
+    if let Some(m) = none_idle(r, online) {
+        meta.push(format!("no {} reviewer idle", m.as_str()));
+    } else if let Some(m) = r.missing_model().filter(|_| r.phase == Phase::Offering && r.active_slots().count() > 0) {
         meta.push(format!("needs a {} reviewer", m.as_str()));
     }
     if let Some((l, locked)) = p.last.filter(|_| r.phase != Phase::Done) {
@@ -460,9 +497,10 @@ fn review_row(out: &mut String, p: &Pr, mine: bool, may: bool, now: Ms) {
     }
     let _ = write!(
         out,
-        "<li class=\"rv\"><span class=\"st s-{cls}\">{label}</span><a class=\"rv-pr\" href=\"/r/{id}\" dir=\"auto\" title=\"{pr}\">{pr}<span class=\"sr\">, {label}</span></a>\
+        "<li class=\"rv{call}\"><span class=\"st s-{cls}\">{label}</span><a class=\"rv-pr\" href=\"/r/{id}\" dir=\"auto\" title=\"{pr}\">{pr}<span class=\"sr\">, {label}</span></a>\
          <span class=\"rv-when\">{}</span><span class=\"rv-meta\">{meta}</span></li>",
         when(r, now),
+        call = if cls == "judge" && mine { " call" } else { "" },
         id = esc(&r.id),
         pr = esc(&pr_name(r)),
         meta = dotted(&meta),
@@ -485,15 +523,22 @@ fn tab_name(r: &Review) -> String {
     }
 }
 
-/// The parts of "10 reviewers idle · 6 reviewing · 2 authors" that aren't zero.
-fn availability(online: &[OnlineAgent]) -> Vec<String> {
+/// Whether online agent `a` waits in a queued review's forming team.
+fn in_team(st: &State, a: &OnlineAgent) -> bool {
+    a.busy.as_deref().and_then(|id| st.review(id)).is_some_and(|r| r.phase == Phase::Offering)
+}
+
+/// The parts of "10 reviewers idle · 1 in a team · 6 reviewing · 2 authors" that aren't zero.
+fn availability(st: &State, online: &[OnlineAgent]) -> Vec<String> {
     let reviewers = online.iter().filter(|a| a.role == Role::Reviewer);
     let idle = reviewers.clone().filter(|a| a.busy.is_none()).count();
-    let reviewing = reviewers.filter(|a| a.busy.is_some()).count();
-    let authors = online.len() - idle - reviewing;
+    let team = reviewers.clone().filter(|a| in_team(st, a)).count();
+    let reviewing = reviewers.filter(|a| a.busy.is_some()).count() - team;
+    let authors = online.len() - idle - team - reviewing;
     let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
     let parts = [
         (idle, plural(idle, "reviewer") + " idle"),
+        (team, format!("{team} in a team")),
         (reviewing, format!("{reviewing} reviewing")),
         (authors, plural(authors, "author")),
     ];
@@ -505,7 +550,7 @@ fn availability(online: &[OnlineAgent]) -> Vec<String> {
 fn short_of<'a>(st: &'a State, online: &[OnlineAgent]) -> Vec<(Model, Vec<&'a Review>)> {
     Model::ALL
         .into_iter()
-        .filter(|m| !online.iter().any(|a| a.role == Role::Reviewer && a.model == Some(*m) && a.busy.is_none()))
+        .filter(|m| !idle(online, *m))
         .map(|m| {
             let waiting = st.reviews.iter().filter(|r| r.phase == Phase::Offering && r.params.reviewers >= 2 && !r.active_slots().any(|s| s.model == Some(m)));
             (m, waiting.collect::<Vec<_>>())
@@ -531,6 +576,7 @@ fn agents_panel(out: &mut String, st: &State, online: &[OnlineAgent], short: &[(
     for a in online {
         let what = match (&a.busy, a.role) {
             (Some(id), _) => match st.review(id) {
+                Some(r) if r.phase == Phase::Offering => format!("in a team for <a href=\"/r/{}\">{}#{}</a>", esc(&r.id), esc(&r.pr.repo), r.pr.number),
                 Some(r) => format!("on <a href=\"/r/{}\">{}#{}</a>", esc(&r.id), esc(&r.pr.repo), r.pr.number),
                 None => format!("on {}", esc(id)),
             },
@@ -549,62 +595,95 @@ fn agents_panel(out: &mut String, st: &State, online: &[OnlineAgent], short: &[(
     out.push_str("</section>");
 }
 
-const QUIET_MS: Ms = 7 * 24 * 3600 * 1000;
-/// How many approved PRs their group lists; `/?show=approved` lists them all.
-const APPROVED_SHOWN: usize = 10;
+/// Rows on a page of the index.
+const PER_PAGE: usize = 20;
 
-/// Who the index is shown to, and what: `show` is `approved` or `all` for that list in full, else
-/// the groups. `may`: whether the viewer may act on a review; `mine`: whether its PR is theirs.
+/// Who the index is shown to, and what: `filter` is a `?f=` key, `page` a `?page=` value.
+/// `may`: whether the viewer may act on a review; `mine`: whether its PR is theirs.
 pub struct View<'a> {
-    pub show: Option<&'a str>,
+    pub filter: Option<&'a str>,
+    pub page: Option<&'a str>,
     pub connect: Option<String>,
     pub may: &'a dyn Fn(&Review) -> bool,
     pub mine: &'a dyn Fn(&Review) -> bool,
 }
 
 impl View<'_> {
-    /// The groups, for a viewer who may act on nothing.
+    /// Every PR, for a viewer who may act on nothing.
     pub fn anyone() -> View<'static> {
-        View { show: None, connect: None, may: &|_| false, mine: &|_| false }
+        View { filter: None, page: None, connect: None, may: &|_| false, mine: &|_| false }
     }
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Group {
+enum Filter {
+    All,
     Call,
     Running,
-    Open,
-    Quiet,
-    Approved,
+    Queued,
+    Finished,
 }
 
-impl Group {
-    const ALL: [Group; 5] = [Group::Call, Group::Running, Group::Open, Group::Quiet, Group::Approved];
+impl Filter {
+    const ALL: [Filter; 5] = [Filter::All, Filter::Call, Filter::Running, Filter::Queued, Filter::Finished];
 
-    /// Its id, heading and note, and whether it starts collapsed.
-    fn parts(self) -> (&'static str, &'static str, &'static str, bool) {
+    fn parse(key: Option<&str>) -> Filter {
+        Filter::ALL.into_iter().find(|f| Some(f.parts().0) == key).unwrap_or(Filter::All)
+    }
+
+    /// Its `?f=` key and label.
+    fn parts(self) -> (&'static str, &'static str) {
         match self {
-            Group::Call => ("g-call", "Needs your call", "", false),
-            Group::Running => ("g-running", "Running", "", false),
-            Group::Open => ("g-open", "Open", "with an agent or another author", false),
-            Group::Quiet => ("g-quiet", "Quiet", "unresolved, nothing for 7+ days", true),
-            Group::Approved => ("g-approved", "Approved", "", true),
+            Filter::All => ("", "All"),
+            Filter::Call => ("call", "Needs your call"),
+            Filter::Running => ("running", "Running"),
+            Filter::Queued => ("queued", "Queued"),
+            Filter::Finished => ("finished", "Finished"),
         }
     }
+
+    /// Whether PR `p` is in it; `mine`: whether the PR is the viewer's.
+    fn has(self, p: &Pr, mine: bool) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Call => mine && status(p.r, p.locked, true).0 == "judge",
+            Filter::Running => matches!(p.r.phase, Phase::Reviewing | Phase::Voting(_)),
+            Filter::Queued => p.r.phase == Phase::Offering,
+            Filter::Finished => !p.r.phase.active(),
+        }
+    }
+
+    /// Page `page` of the index with this filter.
+    fn href(self, page: usize) -> String {
+        let mut q: Vec<String> = Vec::new();
+        if self != Filter::All {
+            q.push(format!("f={}", self.parts().0));
+        }
+        if page > 1 {
+            q.push(format!("page={page}"));
+        }
+        if q.is_empty() { "/".into() } else { format!("/?{}", q.join("&amp;")) }
+    }
 }
 
-/// The viewer's own calls come first whatever their age; anything else unresolved is Open until
-/// nothing has happened to it for a week.
-fn group(p: &Pr, mine: bool, now: Ms) -> Group {
-    if p.r.phase.active() {
-        return Group::Running;
+/// The page `asked` names, or the nearest of `pages`: the last for a number past it, the first
+/// for anything that isn't a page number.
+fn page_number(asked: Option<&str>, pages: usize) -> usize {
+    let digits = asked.map(str::trim).filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    digits.map_or(1, |p| p.parse().unwrap_or(usize::MAX)).clamp(1, pages)
+}
+
+/// "‹ Newer · Page 2 of 5 · Older ›", with only the links that lead somewhere.
+fn pager(filter: Filter, page: usize, pages: usize) -> String {
+    let mut parts = Vec::new();
+    if page > 1 {
+        parts.push(format!("<a href=\"{}\" rel=\"prev\"><span aria-hidden=\"true\">‹ </span>Newer</a>", filter.href(page - 1)));
     }
-    match status(p.r, p.locked, mine).0 {
-        "approved" => Group::Approved,
-        "judge" if mine => Group::Call,
-        _ if now.saturating_sub(p.at) >= QUIET_MS => Group::Quiet,
-        _ => Group::Open,
+    parts.push(format!("<span aria-current=\"page\">Page {page} of {pages}</span>"));
+    if page < pages {
+        parts.push(format!("<a href=\"{}\" rel=\"next\">Older<span aria-hidden=\"true\"> ›</span></a>", filter.href(page + 1)));
     }
+    format!("<nav class=\"foot pager\" aria-label=\"Pages\">{}</nav>", parts.join("<span aria-hidden=\"true\">·</span>"))
 }
 
 fn status_key() -> String {
@@ -613,85 +692,87 @@ fn status_key() -> String {
          <dt><span class=\"st s-judge\">Needs your call</span></dt><dd>Reviewers split or one couldn't be checked: rule Must fix or Dismiss on the review page.</dd>\
          <dt><span class=\"st s-changes\">Changes requested</span></dt><dd>The author's agent fixes and asks for a re-review.</dd>\
          <dt><span class=\"st s-failed\">Failed</span></dt><dd>No result; request it again.</dd>\
-         <dt><span class=\"st s-voting\">Running</span></dt><dd>Offer, review, vote; times are deadlines.</dd>\
-         <dt><b>Quiet</b></dt><dd>Nothing for 7 days, such as a PR merged or dropped since.</dd></dl></details>"
+         <dt><span class=\"st s-queued\">Queued</span></dt><dd>Waiting for a full team of reviewers; it starts by itself.</dd>\
+         <dt><span class=\"st s-voting\">Running</span></dt><dd>Review, then votes; times are deadlines.</dd></dl></details>"
     )
 }
 
-/// One row per PR, grouped by what it needs, or one group or all in full (`view.show`), beside
-/// the agents online.
+/// One row per PR, newest request first, under filters with their counts, beside the agents online.
 pub fn render_index(st: &State, now: Ms, view: &View) -> String {
+    index_page(st, now, view).0
+}
+
+/// The index and its tab title.
+fn index_page(st: &State, now: Ms, view: &View) -> (String, String) {
     let prs = prs(st);
     let mut online = st.online(now);
     online.sort_by_key(|a| (a.role != Role::Reviewer, a.busy.is_none(), a.name.clone()));
     let short = short_of(st, &online);
-    let group = |p: &Pr| group(p, (view.mine)(p.r), now);
-    let row = |out: &mut String, p: &Pr| review_row(out, p, (view.mine)(p.r), (view.may)(p.r), now);
+    let filter = Filter::parse(view.filter);
+    let has = |f: Filter, p: &Pr| f.has(p, (view.mine)(p.r));
 
     let mut out = String::from("<div class=\"cols\"><div class=\"list\">");
     let summary = if online.is_empty() {
         "No agents online".to_string()
     } else {
-        let mut parts = availability(&online);
+        let mut parts = availability(st, &online);
         parts.extend(short.iter().map(|(m, _)| format!("no {} idle", m.as_str())));
         format!("Agents: {}", dotted(&parts))
     };
-    let _ = write!(out, "<a class=\"ag-sum\" href=\"#agents\">{summary}</a>");
-    let full = match view.show {
-        Some("approved") => Some(("Approved", prs.iter().filter(|p| group(p) == Group::Approved).collect::<Vec<_>>())),
-        Some("all") => Some(("All pull requests", prs.iter().collect())),
-        _ => None,
-    };
-    if let Some((name, list)) = full {
-        let _ = write!(out, "<h1 class=\"sec\">{name} <span class=\"count\">{}</span> <span class=\"note\"><a href=\"/\">back to the groups</a></span></h1>", list.len());
-        if !list.is_empty() {
-            out.push_str("<ul class=\"reviews\">");
-            list.into_iter().for_each(|p| row(&mut out, p));
-            out.push_str("</ul>");
-        }
-    } else if prs.is_empty() {
-        out.push_str("<h1 class=\"sr\">Pull requests</h1><p class=\"empty\">No reviews yet.</p>");
+    let _ = write!(out, "<a class=\"ag-sum\" href=\"#agents\">{summary}</a><h1 class=\"sr\">Pull requests</h1>");
+    if prs.is_empty() {
+        out.push_str("<p class=\"empty\">No reviews yet.</p>");
     } else {
-        out.push_str("<h1 class=\"sr\">Pull requests</h1>");
-        for g in Group::ALL {
-            let list: Vec<&Pr> = prs.iter().filter(|p| group(p) == g).collect();
-            if list.is_empty() {
+        out.push_str("<nav class=\"filters\" aria-label=\"Filter\">");
+        for f in Filter::ALL {
+            let n = prs.iter().filter(|p| has(f, p)).count();
+            if n == 0 && f != Filter::All && f != filter {
                 continue;
             }
-            let (id, name, note, folded) = g.parts();
-            let shown = if g == Group::Approved { APPROVED_SHOWN } else { list.len() };
-            let note = match note {
-                _ if list.len() > shown => format!(" <span class=\"note\">newest {shown} · <a href=\"/?show=approved\">list all</a></span>"),
-                "" => String::new(),
-                n => format!(" <span class=\"note\">{n}</span>"),
-            };
-            let head = format!("<h2 class=\"sec\">{name} <span class=\"count\">{}</span>{note}</h2>", list.len());
-            let _ = if folded {
-                write!(out, "<details id=\"{id}\" class=\"grp\"><summary>{CHEVRON}{head}</summary><ul class=\"reviews\">")
-            } else {
-                write!(out, "<section id=\"{id}\" class=\"grp\">{head}<ul class=\"reviews\">")
-            };
-            list.into_iter().take(shown).for_each(|p| row(&mut out, p));
-            out.push_str(if folded { "</ul></details>" } else { "</ul></section>" });
+            let _ = write!(
+                out,
+                "<a{call} href=\"{}\"{current}>{} <span class=\"count\">{n}</span></a>",
+                f.href(1),
+                f.parts().1,
+                call = if f == Filter::Call && n > 0 { " class=\"f-call\"" } else { "" },
+                current = if f == filter { " aria-current=\"page\"" } else { "" },
+            );
         }
-        let _ = write!(
-            out,
-            "<p class=\"foot\">{} · {} · <a href=\"/?show=all\">list all</a></p>",
-            plural(&prs.len().to_string(), "PR"),
-            plural(&st.reviews.len().to_string(), "review"),
-        );
+        out.push_str("</nav>");
+        let list: Vec<&Pr> = prs.iter().filter(|p| has(filter, p)).collect();
+        let pages = list.len().div_ceil(PER_PAGE).max(1);
+        let page = page_number(view.page, pages);
+        if list.is_empty() {
+            out.push_str("<p class=\"empty\">None right now.</p>");
+        } else {
+            out.push_str("<ul class=\"reviews\">");
+            for p in list.iter().skip((page - 1) * PER_PAGE).take(PER_PAGE) {
+                review_row(&mut out, p, (view.mine)(p.r), (view.may)(p.r), &online, now);
+            }
+            out.push_str("</ul>");
+        }
+        if pages > 1 {
+            out.push_str(&pager(filter, page, pages));
+        }
     }
     out.push_str("</div><aside class=\"side\">");
     agents_panel(&mut out, st, &online, &short);
     out.push_str(view.connect.as_deref().unwrap_or(""));
     out.push_str(&status_key());
     out.push_str("</aside></div>");
-    out
+    (out, index_title(&prs))
 }
 
-/// How many PRs have a review running, for the index's tab title.
-fn running(st: &State) -> usize {
-    st.reviews.iter().filter(|r| r.phase.active()).map(|r| &r.pr).collect::<HashSet<_>>().len()
+/// The index's tab title: how many PRs have a review running and how many queued.
+fn index_title(prs: &[Pr]) -> String {
+    let mut parts = vec!["amx".to_string()];
+    for f in [Filter::Running, Filter::Queued] {
+        let n = prs.iter().filter(|p| f.has(p, false)).count();
+        if n > 0 {
+            parts.push(format!("{n} {}", f.parts().0));
+        }
+    }
+    parts.join(" · ")
 }
 
 /// The connect commands for both clients; `/setup` has the rest.
@@ -816,8 +897,10 @@ fn render_finding(out: &mut String, r: &Review, f: &Finding, rule: bool) {
         Some((_, label)) if label == "confirmed" => String::new(),
         Some((_, label)) if label == "resolved" => "<span class=\"badge s-approved\">fixed</span>".into(),
         Some((cls, label)) => format!("<span class=\"badge s-{cls}\">{}</span>", esc(&label)),
+        None if r.phase == Phase::Offering && f.by.is_none() => "<span class=\"badge s-queued\">to re-check</span>".into(),
         None if r.phase.active() && f.by.is_none() => "<span class=\"badge s-waiting\">re-checking</span>".into(),
         None if r.phase.active() => String::new(),
+        None if r.phase == Phase::Failed => "<span class=\"badge s-closed\">not voted on</span>".into(),
         None => "<span class=\"badge s-undecided\">undecided</span>".into(),
     };
     let new = if r.parent.is_some() && f.by.is_some() { "<span class=\"badge s-new\">new</span>" } else { "" };
@@ -946,7 +1029,8 @@ fn waiting_for(who: Vec<&String>, to: &str) -> String {
 
 /// `can`: the viewer may cancel it while it runs.
 /// `locked`: a re-review has taken over this review's open findings.
-fn render_verdict(out: &mut String, r: &Review, old: bool, can: bool, locked: bool, now: Ms) {
+/// `q`: the relay's queue, to say whether a queued review's missing program has a reviewer idle.
+fn render_verdict(out: &mut String, r: &Review, q: Option<&Queue>, old: bool, can: bool, locked: bool, now: Ms) {
     let (cls, label) = status(r, locked, can);
     let detail = match r.phase {
         Phase::Done => {
@@ -971,10 +1055,18 @@ fn render_verdict(out: &mut String, r: &Review, old: bool, can: bool, locked: bo
             }
             dotted(&parts)
         }
+        Phase::Failed if r.broke_off() => esc(&format!("{} The author can request a re-review.", failure(r).1)),
         Phase::Failed => esc(&format!("{} The author can request it again.", failure(r).1)),
         Phase::Offering => {
-            let left = r.params.reviewers.saturating_sub(r.active_slots().count());
-            esc(&format!("Waiting for {} to accept. {}", plural(&left.to_string(), "reviewer"), asked(r)))
+            let joined = r.active_slots().count();
+            let left = plural(&r.params.reviewers.saturating_sub(joined).to_string(), "reviewer");
+            let why = match (q.and_then(|q| none_idle(r, &q.online)), r.missing_model()) {
+                (Some(m), _) => format!("Waiting for a {} reviewer: none is idle.", m.as_str()),
+                (None, Some(m)) if joined + 1 == r.params.reviewers => format!("Waiting for a {} reviewer to join.", m.as_str()),
+                _ if joined == 0 => format!("Waiting for {left} to join."),
+                _ => format!("Waiting for {left} more to join."),
+            };
+            esc(&format!("{why} Nothing to do: it starts by itself."))
         }
         Phase::Reviewing => esc(&waiting_for(r.active_slots().filter(|s| s.submission.is_none()).map(|s| &s.agent).collect(), "submit")),
         Phase::Voting(_) if r.replying => esc(&waiting_for(repliers(r), "reply")),
@@ -996,12 +1088,69 @@ fn render_verdict(out: &mut String, r: &Review, old: bool, can: bool, locked: bo
     } else {
         String::new()
     };
+    let time = if r.phase == Phase::Offering {
+        let fails = format!("fails at {}", clock_tag(r.deadline));
+        let fails = if r.deadline_left(now) <= SOON_MS { format!("<span class=\"needs\">{fails}</span>") } else { fails };
+        format!("{} · {fails}", queued(r, now))
+    } else {
+        when(r, now)
+    };
     let _ = write!(
         out,
-        "<section class=\"verdict v-{cls}{old}\" aria-label=\"Status\"><p class=\"vt\">{label}</p><p class=\"vd\">{detail}</p><p class=\"vw\">{}</p>{cancel}</section>",
-        when(r, now),
+        "<section class=\"verdict v-{cls}{old}\" aria-label=\"Status\"><p class=\"vt\">{label}</p><p class=\"vd\">{detail}</p><p class=\"vw\">{time}</p>{cancel}</section>",
         old = if old { " v-old" } else { "" },
     );
+}
+
+/// A queued review's team: who has joined, then each open seat with who is asked to take it,
+/// or why nobody is. Without the relay's queue `q` the seats are only "open".
+fn render_team(out: &mut String, r: &Review, q: Option<&Queue>) {
+    let team: Vec<&String> = r.active_slots().map(|s| &s.agent).collect();
+    let _ = write!(out, "<h2>Team <span class=\"count\">{} of {}</span></h2><ul class=\"reviewers\">", team.len(), r.params.reviewers);
+    for s in r.active_slots() {
+        let _ = write!(out, "<li><div class=\"who\"><b>{}</b>{} <span class=\"badge s-queued\"><span>joined {}</span></span></div></li>", esc(&s.agent), program(s.model), clock_tag(s.joined));
+    }
+    let mut seats: Vec<Option<Model>> = Model::ALL.into_iter().filter(|_| r.params.reviewers >= 2).filter(|m| !r.active_slots().any(|s| s.model == Some(*m))).map(Some).collect();
+    seats.resize(r.params.reviewers.saturating_sub(team.len()), None);
+    let online: &[OnlineAgent] = q.map_or(&[], |q| &q.online);
+    let free: Vec<&OnlineAgent> = online.iter().filter(|a| a.role == Role::Reviewer && a.busy.is_none()).collect();
+    let offered = |a: &OnlineAgent| q.and_then(|q| q.offers.get(&a.name)).map(String::as_str);
+    let mut asked: Vec<&OnlineAgent> = free.iter().copied().filter(|a| offered(a) == Some(r.id.as_str())).collect();
+    let mut named: Vec<&str> = Vec::new();
+    let n = seats.len();
+    for (i, m) in seats.into_iter().enumerate() {
+        let fits = |a: &OnlineAgent| m.is_none() || a.model == m;
+        let label = m.map_or("claude or codex", Model::as_str);
+        let take = if m.is_some() || i + 1 == n { usize::MAX } else { 1 };
+        let mut asking = Vec::new();
+        while asking.len() < take && let Some(at) = asked.iter().position(|a| fits(a)) {
+            asking.push(format!("<b>{}</b>", esc(&asked.remove(at).name)));
+        }
+        let line = if !asking.is_empty() {
+            let until = match r.team_due().filter(|_| i == 0) {
+                Some(t) => format!(" <span class=\"why\">until {}, else {} {} released and it waits on</span>", clock_tag(t), esc(&names(&team)), if team.len() == 1 { "is" } else { "are" }),
+                None => String::new(),
+            };
+            format!("asking {}{until}", names(&asking))
+        } else if q.is_none() {
+            "open".into()
+        } else {
+            let idle: Vec<&&OnlineAgent> = free.iter().filter(|a| fits(a) && offered(a) != Some(r.id.as_str()) && !named.contains(&a.name.as_str())).collect();
+            let may_join = |a: &&&OnlineAgent| a.name != r.author && !r.declined.contains(&a.name) && !r.lapsed.contains(&a.name) && (r.picked.is_empty() || r.picked.contains(&a.name));
+            let pick = idle.iter().copied().find(may_join).or(idle.first().copied());
+            named.extend(pick.map(|a| a.name.as_str()));
+            match pick {
+                None => "none idle".into(),
+                Some(a) if r.lapsed.contains(&a.name) => format!("<b>{}</b> didn't answer its offer; it's asked again when it next waits", esc(&a.name)),
+                Some(a) if r.declined.contains(&a.name) => format!("<b>{}</b> declined; asked again from {}", esc(&a.name), clock_tag(r.declined_until(&a.name).unwrap_or_default())),
+                Some(a) if !may_join(&a) => format!("<b>{}</b> is idle but can't take it", esc(&a.name)),
+                Some(a) if offered(a).is_some_and(|o| o != r.id) => format!("<b>{}</b> is asked for {} first", esc(&a.name), esc(offered(a).unwrap_or_default())),
+                Some(a) => format!("<b>{}</b> is idle, asked once a full team can form", esc(&a.name)),
+            }
+        };
+        let _ = write!(out, "<li><div class=\"who\"><span class=\"muted\">{label}:</span> {line}</div></li>");
+    }
+    out.push_str("</ul>");
 }
 
 fn render_reviewers(out: &mut String, r: &Review) {
@@ -1025,7 +1174,6 @@ fn render_reviewers(out: &mut String, r: &Review) {
                 };
                 format!("<span class=\"badge s-{cls}\">{label}</span>{sha}")
             }
-            (None, None) if r.phase == Phase::Offering => "<span class=\"badge s-waiting\">accepted</span>".into(),
             (None, None) if r.phase == Phase::Failed => "<span class=\"badge s-closed\">stopped</span>".into(),
             (None, None) => "<span class=\"badge s-waiting\">reviewing</span>".into(),
         };
@@ -1054,7 +1202,7 @@ fn to_decide(can: bool, locked: bool, fix: usize) -> &'static str {
 /// A review in a few words, for its index row and the PR's history; `can` and `locked` as for `status`.
 fn gist(r: &Review, can: bool, locked: bool) -> String {
     match r.phase {
-        Phase::Offering => format!("{} of {} accepted", r.active_slots().count(), r.params.reviewers),
+        Phase::Offering => format!("{} of {} joined", r.active_slots().count(), r.params.reviewers),
         Phase::Reviewing => format!("{} of {} submitted", r.active_slots().filter(|s| s.submission.is_some()).count(), r.active_slots().count()),
         Phase::Voting(_) if r.replying => format!("{} to reply", repliers(r).len()),
         Phase::Voting(n) => {
@@ -1126,12 +1274,27 @@ fn render_history(out: &mut String, r: &Review, prs: &[Review], may: &dyn Fn(&Re
 
 /// The page as seen on the day the review was requested.
 pub fn render_review(r: &Review) -> String {
-    render_review_page(r, &[], r.created, &|_| false)
+    render_review_page(r, &[], None, r.created, &|_| false)
 }
 
-/// `prs` are all reviews of the same PR, this one included, oldest first. `may`: whether the
-/// viewer may cancel or rule on a review.
-pub fn render_review_page(r: &Review, prs: &[Review], now: Ms, may: &dyn Fn(&Review) -> bool) -> String {
+/// What a queued review's page shows of the relay: who is online and the review each free
+/// reviewer is offered, taken under the state's lock so the page renders outside it.
+pub struct Queue {
+    online: Vec<OnlineAgent>,
+    offers: BTreeMap<String, String>,
+}
+
+impl Queue {
+    pub fn of(st: &State, now: Ms) -> Queue {
+        let online = st.online(now);
+        let offers = online.iter().filter_map(|a| Some((a.name.clone(), st.offered(&a.name)?.to_string()))).collect();
+        Queue { online, offers }
+    }
+}
+
+/// `prs` are all reviews of the same PR, this one included, oldest first; `q` the relay's queue,
+/// for who could join a queued review. `may`: whether the viewer may cancel or rule on a review.
+pub fn render_review_page(r: &Review, prs: &[Review], q: Option<&Queue>, now: Ms, may: &dyn Fn(&Review) -> bool) -> String {
     let can = may(r);
     let mut meta = vec![format!("{} by <b>{}</b>", esc(&r.id), esc(&r.author))];
     if let Some(h) = &r.head_sha {
@@ -1150,10 +1313,14 @@ pub fn render_review_page(r: &Review, prs: &[Review], now: Ms, may: &dyn Fn(&Rev
         meta = dotted(&meta),
     );
     let locked = rereview(prs, &r.id).is_some();
-    render_verdict(&mut out, r, prs.last().is_some_and(|l| l.id != r.id), can, locked, now);
+    render_verdict(&mut out, r, q, prs.last().is_some_and(|l| l.id != r.id), can, locked, now);
     render_findings(&mut out, r, can && r.phase == Phase::Done && !locked);
     render_discussion(&mut out, r);
-    render_reviewers(&mut out, r);
+    if r.phase == Phase::Offering {
+        render_team(&mut out, r, q);
+    } else {
+        render_reviewers(&mut out, r);
+    }
     render_history(&mut out, r, prs, may, now);
     render_transcript(&mut out, r);
     out
@@ -1388,7 +1555,8 @@ fn no_store(mut r: Response) -> Response {
 
 #[derive(Deserialize)]
 pub struct IndexQuery {
-    show: Option<String>,
+    f: Option<String>,
+    page: Option<String>,
 }
 
 pub async fn index(
@@ -1402,13 +1570,12 @@ pub async fn index(
     let login = who.as_ref().map(|Extension(w)| w.login.as_str());
     let may = |r: &Review| login.is_some_and(|l| r.may_act(l, owner.is_some()));
     let mine = |r: &Review| login.is_some_and(|l| r.author_login.eq_ignore_ascii_case(l));
-    let (main, running) = hub.read(|s, now| {
+    let (main, title) = hub.read(|s, now| {
         let quiet = s.reviews.is_empty() || s.online(now).is_empty();
         let connect = login.map(|l| connect(&s.web_url, l, quiet));
-        let view = View { show: q.show.as_deref(), connect, may: &may, mine: &mine };
-        (render_index(s, now, &view), running(s))
+        let view = View { filter: q.f.as_deref(), page: q.page.as_deref(), connect, may: &may, mine: &mine };
+        index_page(s, now, &view)
     });
-    let title = if running == 0 { "amx".to_string() } else { format!("amx · {running} running") };
     let main = titled(&title, &main);
     if partial(&headers) {
         return fragment(&headers, main);
@@ -1424,7 +1591,8 @@ pub async fn review_page(
     Extension(viewer): Extension<Viewer>,
     headers: HeaderMap,
 ) -> Response {
-    let Some((r, prs, now)) = hub.read(|s, now| s.review(&id).map(|r| (r.clone(), siblings(s, r), now))) else {
+    let taken = hub.read(|s, now| s.review(&id).map(|r| (r.clone(), siblings(s, r), (r.phase == Phase::Offering).then(|| Queue::of(s, now)), now)));
+    let Some((r, prs, q, now)) = taken else {
         let main = format!(
             "<h1>No review {}</h1><p class=\"empty\">The relay may have restarted. <a href=\"/\">All reviews</a></p>",
             esc(&id)
@@ -1434,7 +1602,7 @@ pub async fn review_page(
     };
     let may = |r: &Review| who.as_ref().is_some_and(|Extension(w)| r.may_act(&w.login, owner.is_some()));
     let title = format!("{} · {}", status(&r, rereview(&prs, &r.id).is_some(), may(&r)).1, tab_name(&r));
-    let main = titled(&title, &render_review_page(&r, &prs, now, &may));
+    let main = titled(&title, &render_review_page(&r, &prs, q.as_ref(), now, &may));
     if partial(&headers) {
         return fragment(&headers, main);
     }

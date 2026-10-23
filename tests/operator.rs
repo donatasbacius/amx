@@ -196,6 +196,12 @@ async fn requests_take_the_hubs_rules_and_old_reviews_keep_theirs() {
     let toml = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/contrib/config.toml")).unwrap();
     assert!(!toml.contains("override per request"), "{toml}");
     assert!(!plain.contains("Ignored"), "{plain}");
+    let again = hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(2), "count": 3})).await;
+    assert!(again.contains("You already requested this review as r2; it is not queued twice, and the count and reviewers you gave now are ignored: it keeps 2 reviewer(s)."), "{again}");
+    let same = hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(2), "count": 2})).await;
+    assert!(same.contains("it is not queued twice.") && !same.contains("ignored"), "{same}");
+    let index = browser("owner").get(format!("{}/?f=queued&page=9&n=1&show=all", hub.base("owner"))).send().await.unwrap().text().await.unwrap();
+    assert!(index.contains("aria-current=\"page\">Queued") && index.matches("<li class=\"rv").count() == 2 && !index.contains("pager"), "a page past the last, and old parameters, still list them: {index}");
     let params = &hub.api("r1").await["params"];
     assert_eq!((params["consensus"]["confirm_fraction"].as_f64(), params["consensus"]["vote_rounds"].as_u64(), params["review_secs"].as_u64()), (Some(0.5), Some(2), Some(1200)));
 
@@ -222,11 +228,13 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 2).await;
     hub.owner("rv", "hello", json!({"role": "reviewer", "model": "claude"})).await;
-    hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 1, "title": "Drop the <v1> export"})).await;
+    hub.reviewer("rv2", "hello", json!({"role": "reviewer", "model": "codex"})).await;
+    hub.friend("fa", "request_review", json!({"pr_url": pr(1), "count": 2, "title": "Drop the <v1> export"})).await;
     for n in 2..=5 {
-        hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(n), "count": 1})).await;
+        hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(n), "count": 2})).await;
     }
     hub.owner("rv", "accept_review", json!({"review_id": "r1"})).await;
+    hub.reviewer("rv2", "accept_review", json!({"review_id": "r1"})).await;
     assert_eq!(hub.api("r1").await["phase"], "reviewing");
     let full = Client::new()
         .post(format!("{}/mcp?agent=fa", hub.tailnet))
@@ -243,7 +251,7 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     // opened, what happens and the red button follow it, in the order they are read and tabbed.
     let friend_page = hub.page("friend", "r1").await;
     let control = "<details class=\"act\" id=\"cancel\"><summary class=\"btn\"><span class=\"c0\">Cancel review</span><span class=\"c1\">Keep running</span></summary>\
-                   <form method=\"post\" action=\"/r/r1/cancel\"><p id=\"cancel-what\">rv stops, and the PR is free for a new review. You can't undo this.</p>\
+                   <form method=\"post\" action=\"/r/r1/cancel\"><p id=\"cancel-what\">rv and rv2 stop, and the PR is free for a new review. You can't undo this.</p>\
                    <button class=\"btn btn-fix\" aria-describedby=\"cancel-what\">Cancel review</button></form></details></section>";
     assert!(friend_page.contains(control), "{friend_page}");
     let waiting = hub.page("friend", "r2").await;
@@ -284,7 +292,7 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     assert_eq!(hub.api("r1").await["phase"], "reviewing", "nothing refused changed anything");
 
     // A tailnet login named local is not the hub owner.
-    let evil = call_as(browser("evil"), &hub.tailnet, "ea", "request_review", json!({"title": "Add a cache", "pr_url": pr(7), "count": 1})).await;
+    let evil = call_as(browser("evil"), &hub.tailnet, "ea", "request_review", json!({"title": "Add a cache", "pr_url": pr(7), "count": 2})).await;
     let ev_id = evil.split_whitespace().nth(1).unwrap().to_string();
     let (code, _) = hub.post("evil", "/r/r3/cancel", &[]).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
@@ -350,7 +358,7 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
     assert!(hub.page("owner", "r2").await.contains("The hub owner cancelled it."));
     let r1 = hub.api("r1").await;
     assert_eq!((r1["phase"].as_str(), r1["cancelled_by"].as_str()), (Some("failed"), Some("friend")));
-    hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(1), "count": 1})).await;
+    hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(1), "count": 2})).await;
     let r = Client::new().get(format!("{}/r/r1", hub.local)).send().await.unwrap();
     assert_eq!(r.headers()["x-frame-options"], "DENY");
     assert_eq!(r.headers()["content-security-policy"], "frame-ancestors 'none'");
@@ -392,11 +400,11 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
             req.send().await.unwrap().text().await.unwrap()
         }
     };
-    let yours = "<section id=\"g-call\" class=\"grp\"><h2 class=\"sec\">Needs your call <span class=\"count\">1</span></h2><ul class=\"reviews\"><li class=\"rv\"><span class=\"st s-judge\">Needs your call</span>";
+    let yours = "<li class=\"rv call\"><span class=\"st s-judge\">Needs your call</span>";
     let authors = "<span class=\"st s-judge\">Needs the author's call</span>";
     assert!(index("friend", None).await.contains(yours));
     let owner = index("owner", None).await;
-    assert!(owner.contains(authors) && owner.contains("<span>fa ·</span> <span>you can rule</span>") && !owner.contains("g-call"), "the owner's own PRs only: {owner}");
+    assert!(owner.contains(authors) && owner.contains("<span>fa ·</span> <span>you can rule</span>") && !owner.contains("f-call") && !owner.contains("rv call"), "the owner's own PRs only: {owner}");
     let page = hub.page("stranger", "r1").await;
     assert!(page.contains("<p class=\"vt\">Needs the author's call</p>") && page.contains("<title>Needs the author&#39;s call · "), "{page}");
     assert!(index("stranger", None).await.contains(authors));
@@ -499,7 +507,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     let page = hub.page("friend", "r2").await;
     assert!(page.contains("<h2>Discussion <span class=\"count\">1</span></h2><ol class=\"talk\"><li><div class=\"th\"><b>fa</b> <time class=\"clock\"") && page.contains("<p>Added backoff.</p>"), "the note opens the discussion: {page}");
     let all = wait_for(&hub.local, "rv1", "carried from r1/F1").await;
-    let task = &all[all.find("[r2] You are assigned again").unwrap()..];
+    let task = &all[all.find("[r2] Your team is complete").unwrap()..];
     assert!(task.contains("C1 [major] carried from r1/F1, ruled must fix by friend:"), "{task}");
     assert!(task.contains("Findings ruled must fix are real (a human decided); vote only on whether they are still present."), "{task}");
     assert!(!task.contains("idempotency"), "a dismissed finding is not carried: {task}");
@@ -527,7 +535,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
 async fn every_page_names_its_viewer_as_tailscale_reports_them_and_is_not_cached() {
     let tmp = tempfile::tempdir().unwrap();
     let hub = start(tmp.path(), 2).await;
-    hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(1), "count": 1})).await;
+    hub.friend("fa", "request_review", json!({"title": "Add a cache", "pr_url": pr(1), "count": 2})).await;
     hub.running.hub.owner.lock().unwrap().as_mut().unwrap().login = "boss@example.com".into();
     let get = |who: &'static str, path: &'static str, proxy: Option<&'static str>| {
         let url = format!("{}{path}", hub.base(who));

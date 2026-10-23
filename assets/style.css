@@ -78,11 +78,11 @@ summary > .i:first-child { margin: 0 .3em 0 -.3em; }
 details[open] > summary > .i { transform: rotate(90deg); }
 
 /* Relay chrome: small and grey. */
-.live, .meta, .newer, .ref, .rv-meta, .rv-when, .note, .foot, .prog, .key, .warn, .ag-sum, .vw, .fid, .facts, .h-gist, .h-when, .log li, .rule .q {
+.live, .meta, .newer, .ref, .rv-meta, .rv-when, .foot, .reviewers .why, .prog, .key, .warn, .ag-sum, .vw, .fid, .facts, .h-gist, .h-when, .log li, .rule .q {
   color: var(--muted); font-size: var(--fs-1); line-height: var(--lh-1);
 }
-.th time, .side-d > summary, .more > summary, .key dd, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role, .pg { color: var(--muted); }
-.th, .me, .agents, .side-d, .vbox > summary, .aside, .badge, .st { font-size: var(--fs-1); line-height: var(--lh-1); }
+.th time, .filters a, .side-d > summary, .more > summary, .key dd, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role, .pg { color: var(--muted); }
+.th, .me, .agents, .side-d, .filters, .vbox > summary, .aside, .badge, .st { font-size: var(--fs-1); line-height: var(--lh-1); }
 .rv-when, .vw, .h-when, .badge, .st, .log time, .me { white-space: nowrap; }
 .meta b, .facts b, .et b { color: var(--text); }
 
@@ -119,9 +119,10 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .s-stale { --dot: var(--judge); color: var(--judge-text); }
 .s-submitted { --dot: var(--text); }
 .s-failed::before { box-shadow: inset 0 0 0 2px var(--fail); }
+.s-queued::before { box-shadow: inset 0 0 0 2px var(--run); }
 .s-closed, .s-undecided, .s-new { color: var(--muted); font-weight: 500; }
 .s-undecided { box-shadow: inset 0 0 0 1px var(--line-strong); background: transparent; }
-.s-failed, .s-undecided, .s-new { --dot: transparent; }
+.s-failed, .s-undecided, .s-new, .s-queued { --dot: transparent; }
 .s-undecided::before, .s-new::before { box-shadow: inset 0 0 0 1.5px var(--line-strong); }
 
 .reviews, .agents, .reviewers, .log, .votes, .history, .talk, .vl, .key { list-style: none; margin: 0; padding: 0; }
@@ -132,12 +133,13 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .reviewers li { padding: var(--row-y) var(--row-x); overflow-wrap: anywhere; }
 .reviewers .pg { margin-right: 4px; }
 .cols { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--sp-6); align-items: start; }
-.sec { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; font-size: var(--fs-2); line-height: var(--lh-2); font-weight: 650; margin: var(--sp-5) 0 var(--sp-2); }
-.note { font-weight: 400; }
-.grp > summary { padding: var(--sp-1) 0; margin-top: var(--sp-3); }
-.grp > summary > .sec { display: inline-flex; margin: 0; }
-.grp[open] > summary { margin-bottom: var(--sp-2); }
-.foot { margin: var(--sp-5) 0 0; }
+.filters { display: flex; flex-wrap: wrap; gap: 0 var(--sp-4); margin: var(--sp-4) 0 var(--sp-3); }
+.filters a { padding: 4px 0; }
+.filters a[aria-current] { color: var(--text); box-shadow: inset 0 -2px var(--text); }
+.filters .f-call, .f-call .count { color: var(--judge-text); font-weight: 600; }
+.foot { margin: var(--sp-3) 0 0; }
+.pager { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-2); }
+.pager a { padding: 4px 0; }
 .rv {
   position: relative; display: grid; grid-template: "st t w" "st m m" / 12em minmax(0, 1fr) auto;
   column-gap: var(--sp-3); align-items: baseline; padding: var(--sp-2) var(--row-x);
@@ -148,7 +150,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .rv-when { grid-area: w; text-align: right; }
 .rv-when [data-deadline] { color: var(--run); }
 .rv-meta { grid-area: m; }
-#g-call .rv { box-shadow: inset 3px 0 0 var(--judge); }
+.rv.call { box-shadow: inset 3px 0 0 var(--judge); }
 .rv:hover, .f > summary:hover, .f[open] > summary { background: var(--bg); }
 .rv:hover .rv-pr { text-decoration: underline; }
 .rv:has(.rv-pr:focus-visible) { outline: 2px solid var(--link); outline-offset: -2px; }
@@ -185,7 +187,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .v-approved { --bar: var(--ok); }
 .v-changes { --bar: var(--fix); }
 .v-failed { --bar: var(--fail); }
-.v-waiting, .v-inreview, .v-voting { --bar: var(--run); }
+.v-queued, .v-inreview, .v-voting { --bar: var(--run); }
 .v-judge, .s-judge { --bar: var(--judge); --dot: var(--judge); }
 .v-old { --bar: var(--line-strong); }
 .needs { color: var(--judge-text); font-weight: 600; }
@@ -259,7 +261,8 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
   .rv-pr { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
   .meta > span, .rv-meta > span, .vd > span, .ag-sum > span { display: inline-block; }
   p a, .aside a, .md a, .agents a { padding-block: 3px; }
-  .grp > summary, .side-d > summary, .more > summary { padding-block: var(--sp-3); }
+  .pager a { padding-block: 13px; }
+  .side-d > summary, .more > summary { padding-block: var(--sp-3); }
   .vbox { margin-top: 0; }
   .vbox > summary { min-height: 44px; padding: var(--sp-2) 0 var(--sp-3); margin-bottom: calc(-1 * var(--sp-3)); }
   .history li { position: relative; min-height: 44px; align-items: center; }

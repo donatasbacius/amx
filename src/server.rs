@@ -463,7 +463,7 @@ fn held(hub: &Hub, who: &Identity, name: &str) -> Result<bool, String> {
     Ok(holders().any(|(_, s)| s.live(online)))
 }
 
-/// The role a call gives its session: `hello`'s (a reviewer's only with its model), or author for a review request.
+/// The role a call gives its session: `hello`'s (a reviewer's only with its model).
 fn role_given(msg: &Value) -> Option<Role> {
     match msg["params"]["name"].as_str().filter(|_| msg["method"] == "tools/call")? {
         "hello" => {
@@ -471,17 +471,37 @@ fn role_given(msg: &Value) -> Option<Role> {
             let role = Role::parse(a["role"].as_str()?)?;
             (role == Role::Author || a["model"].as_str().and_then(Model::parse).is_some()).then_some(role)
         }
-        "request_review" | "request_rereview" => Some(Role::Author),
         _ => None,
+    }
+}
+
+/// A review request, which makes a session that hasn't said its role an author once it succeeds.
+fn requests(msg: &Value) -> bool {
+    msg["method"] == "tools/call" && matches!(msg["params"]["name"].as_str(), Some("request_review" | "request_rereview"))
+}
+
+/// After a review request succeeded: a session that hadn't said its role becomes an author, and
+/// so does its agent, unless a live reviewer session shares the name.
+fn became_author(hub: &Hub, who: &Identity, key: &str, agent: &str) {
+    let online = Duration::from_secs(hub.cfg.timing.online_secs);
+    let mut all = hub.sessions.lock().unwrap();
+    match all.get_mut(key) {
+        Some(s) if s.role.is_none() => s.role = Some(Role::Author),
+        _ => return,
+    }
+    let shared = all.iter().any(|(k, o)| k != key && o.agent.as_deref() == Some(agent) && o.role == Some(Role::Reviewer) && o.live(online));
+    drop(all);
+    if !shared {
+        let _ = hub.touch(agent, who, Some(Role::Author));
     }
 }
 
 /// The session's agent and the role to record for it. A session without a chosen name gets one
 /// on its first call that acts (`active`), once its role is known: a free default name whose last
 /// holder had that role, else one never used. A session that hasn't said its role takes the one
-/// its free names had, unless they differ. A name shared with a live reviewer session stays a
-/// reviewer.
-fn named(hub: &Hub, who: &Identity, key: &str, default: &str, given: Option<Role>, active: bool) -> Result<(String, Option<Role>, String), String> {
+/// its free names had, unless they differ, or for a review request (`asks`) an author's name
+/// without taking the role yet. A name shared with a live reviewer session stays a reviewer.
+fn named(hub: &Hub, who: &Identity, key: &str, default: &str, given: Option<Role>, asks: bool, active: bool) -> Result<(String, Option<Role>, String), String> {
     let online = Duration::from_secs(hub.cfg.timing.online_secs);
     let mine = session_key(who, "");
     let mut all = hub.sessions.lock().unwrap();
@@ -510,7 +530,7 @@ fn named(hub: &Hub, who: &Identity, key: &str, default: &str, given: Option<Role
                     })
                     .collect();
                 let mut had = free.iter().filter_map(|(_, r)| *r);
-                let role = match (role, had.next()) {
+                let role = match (role.or(asks.then_some(Role::Author)), had.next()) {
                     (Some(r), _) => r,
                     (None, None) => Role::Author,
                     (None, Some(r)) if had.all(|o| o == r) => r,
@@ -522,7 +542,7 @@ fn named(hub: &Hub, who: &Identity, key: &str, default: &str, given: Option<Role
             if name != default {
                 note = format!("You are `{name}`.");
             }
-            role = Some(r);
+            role = role.or((!asks).then_some(r));
             hub.write(|st, _| st.new_session(&name));
             name
         }
@@ -637,7 +657,7 @@ async fn mcp(
             .map(|note| (chosen.clone().unwrap_or_default(), role, note, Some(session(&hub, &who, &id, chosen.as_deref(), role)), Some(id)))
     } else if let Some(id) = session_id(&headers) {
         let key = session(&hub, &who, id, chosen.as_deref(), role);
-        named(&hub, &who, &key, &default, role_given(&value), active).map(|(a, r, note)| (a, r, note, Some(key), None))
+        named(&hub, &who, &key, &default, role_given(&value), requests(&value), active).map(|(a, r, note)| (a, r, note, Some(key), None))
     } else {
         Ok((chosen.unwrap_or(default), role_given(&value).or(role), String::new(), None, None))
     };
@@ -692,10 +712,14 @@ async fn mcp(
         return sse(rx, done);
     }
     let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: key.is_some(), stream: false, note: &note };
+    let asks = requests(&value);
     match crate::mcp::handle(&hub, &c, value).await {
         Some(resp) => {
             if let (Some(key), Some(n)) = (&key, seq_of(&resp)) {
                 answered(&hub, key, &id, n);
+            }
+            if let Some(key) = key.as_deref().filter(|_| asks && resp["result"]["isError"] == false) {
+                became_author(&hub, &who, key, &agent);
             }
             let mut r = Json(resp).into_response();
             r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

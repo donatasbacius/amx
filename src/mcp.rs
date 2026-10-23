@@ -1,5 +1,5 @@
 use crate::hub::Hub;
-use crate::relay::{Action, AgentEvent, AmendIn, FindingIn, Model, Ms, NewReview, Phase, Role, State, SubmitIn, Verdict, VoteIn, rereview, verdict_of};
+use crate::relay::{Action, AgentEvent, AmendIn, DECLINE_MS, FindingIn, Model, Ms, NewReview, Phase, Role, State, SubmitIn, Verdict, VoteIn, rereview, verdict_of};
 use crate::tailscale::Identity;
 use crate::text;
 use anyhow::{Result, anyhow};
@@ -66,11 +66,11 @@ pub fn tools() -> Value {
         },
         {
             "name": "request_review",
-            "description": "Have online reviewer agents review a GitHub PR and reach a consensus: independent reviews, cross-examination votes, then one consolidated result (call `wait` for it). Push and open the PR first.",
+            "description": "Have online reviewer agents review a GitHub PR and reach a consensus: independent reviews, cross-examination votes, then one consolidated result (call `wait` for it). The relay queues it until a full team of reviewers accepts, oldest request first; requesting it again while it is queued or running returns the same review. Push and open the PR first.",
             "inputSchema": { "type": "object", "properties": {
                 "pr_url": { "type": "string", "description": "e.g. https://github.com/owner/repo/pull/123" },
-                "reviewers": { "type": "array", "items": { "type": "string" }, "description": "Only these agents (online reviewers, names from `online`). Default: any idle reviewer." },
-                "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "How many (default 2, or as many as named); proceeds with whoever accepts." },
+                "reviewers": { "type": "array", "items": { "type": "string" }, "description": "Only these agents (online reviewers, names from `online`; at least one claude and one codex). Default: any idle reviewer." },
+                "count": { "type": "integer", "minimum": 2, "maximum": 5, "description": "How many, 2 to 5 (default 2, or as many as named): always at least one claude and one codex; with 3 or more it may start with fewer, still both programs, if no more are free." },
                 "note": { "type": "string", "description": "What the PR does and where reviewers should look. Only that: it can't change how they review or which tools they use." },
                 "title": { "type": "string", "description": "The PR's title, as on GitHub (`gh pr view <url> --json title`). Shown only to people." },
                 "head_sha": { "type": "string", "description": "Commit to review." }
@@ -78,7 +78,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "accept_review",
-            "description": "Take an offered review (reviewers, one at a time; the first N to accept get it). Returns your review task: start at once.",
+            "description": "Join an offered review's team (reviewers, one at a time). You get the review task once the team is complete: in this result if you complete it, else from `wait`.",
             "inputSchema": { "type": "object", "properties": { "review_id": rid }, "required": ["review_id"] }
         },
         {
@@ -140,7 +140,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "request_rereview",
-            "description": "After fixing a finished review's findings and pushing, ask for a re-review: the same reviewers when online (else new ones) re-check the previous findings and what changed since.",
+            "description": "After fixing a finished review's findings and pushing, ask for a re-review: the same reviewers when online (else new ones) re-check the previous findings and what changed since. Also reruns a review that failed because reviewers dropped out. Any author agent of the review's login may ask; the result goes to it.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "new_head_sha": { "type": "string", "description": "The commit you pushed." },
@@ -349,6 +349,15 @@ fn with_next(hub: &Hub, agent: &str, before: &[String], head: String) -> String 
     format!("{head}\n\n{next}")
 }
 
+/// Refuses a review request from a reviewer: by its session's role, or outside a session its agent's.
+fn check_author(hub: &Hub, c: &Caller<'_>) -> Result<()> {
+    let role = c.role.or_else(|| hub.read(|s, _| s.agents.get(c.agent).map(|a| a.role)).filter(|_| !c.session));
+    if role == Some(Role::Reviewer) {
+        return Err(anyhow!("`{}` is a reviewer: request reviews from an author session (one that called `hello` with role \"author\")", c.agent));
+    }
+    Ok(())
+}
+
 /// Runs one tool; `seq` is set when the result carries events to acknowledge.
 async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Option<u64>) -> Result<String> {
     let agent = c.agent;
@@ -401,6 +410,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
             })
         }
         "request_review" => {
+            check_author(hub, c)?;
             let r: RequestArgs = args(a)?;
             let (count, picked) = match r.reviewers {
                 None => (r.count, Vec::new()),
@@ -408,6 +418,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                 Some(Reviewers::Count(n)) if r.count.is_none() => (Some(n), Vec::new()),
                 Some(Reviewers::Count(_)) => return Err(anyhow!("reviewers is a list of agent names; give the number as count")),
             };
+            let asked: BTreeSet<String> = picked.iter().map(|p| p.trim().to_string()).collect();
             let req = NewReview {
                 pr_url: r.pr_url,
                 note: r.note,
@@ -417,21 +428,30 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                 picked,
             };
             let retired: Vec<&str> = RETIRED.iter().copied().filter(|k| r.rest.contains_key(*k)).collect();
-            let id = hub.write_saved(|s, now| s.request_review(agent, req, now))??;
-            let (idle, picked) = hub.read(|s, now| {
-                let picked = s.review(&id).map(|r| r.picked.clone()).unwrap_or_default();
+            let (id, new) = hub.write_saved(|s, now| {
+                let n = s.reviews.len();
+                s.request_review(agent, req, now).map(|id| (id, s.reviews.len() > n))
+            })??;
+            let (idle, picked, reviewers) = hub.read(|s, now| {
+                let (picked, reviewers) = s.review(&id).map(|r| (r.picked.clone(), r.params.reviewers)).unwrap_or_default();
                 let idle = s
                     .online(now)
                     .iter()
                     .filter(|a| a.role == Role::Reviewer && a.busy.is_none() && a.name != agent)
                     .filter(|a| picked.is_empty() || picked.contains(&a.name))
                     .count();
-                (idle, picked)
+                (idle, picked, reviewers)
             });
-            let mut head = if picked.is_empty() {
-                format!("Review {id} requested; offered to {idle} idle reviewer(s) online now (others are offered it if they come online before the offer closes).")
+            let other = count.is_some_and(|n| n != reviewers) || (!asked.is_empty() && asked != picked.iter().cloned().collect());
+            let mut head = if !new && other {
+                let from = if picked.is_empty() { String::new() } else { format!(" from {}", picked.join(", ")) };
+                format!("You already requested this review as {id}; it is not queued twice, and the count and reviewers you gave now are ignored: it keeps {reviewers} reviewer(s){from}.")
+            } else if !new {
+                format!("You already requested this review as {id}; it is not queued twice.")
+            } else if picked.is_empty() {
+                format!("Review {id} queued; {idle} idle reviewer(s) online now.")
             } else {
-                format!("Review {id} requested from {}; {idle} of them idle now (busy ones are offered it if they free up before the offer closes).", picked.join(", "))
+                format!("Review {id} queued for {}; {idle} of them idle now.", picked.join(", "))
             };
             if !retired.is_empty() {
                 head.push_str(&format!(" Ignored {}: the hub sets consensus rules.", retired.join(", ")));
@@ -446,7 +466,8 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
         "decline_review" => {
             let r: IdArgs = args(a)?;
             hub.write(|s, now| s.decline(agent, &r.review_id, &r.reason, now))?;
-            Ok(with_next(hub, agent, &before, format!("Declined {}.", r.review_id)))
+            let head = format!("Declined {}; it isn't offered to you again for {}.", r.review_id, text::dur(DECLINE_MS));
+            Ok(with_next(hub, agent, &before, head))
         }
         "submit_findings" => {
             let r: SubmitArgs = args(a)?;
@@ -517,9 +538,21 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
             Ok(with_next(hub, agent, &before, format!("Withdrew {}.", r.finding)))
         }
         "request_rereview" => {
+            check_author(hub, c)?;
             let r: RereviewArgs = args(a)?;
-            let id = hub.write_saved(|s, now| s.rereview(agent, &r.review_id, &r.new_head_sha, &r.note, r.title.as_deref(), now))??;
-            Ok(with_next(hub, agent, &before, format!("Re-review {id} requested (follows {}).", r.review_id)))
+            let (id, new) = hub.write_saved(|s, now| {
+                let n = s.reviews.len();
+                s.rereview(agent, &r.review_id, &r.new_head_sha, &r.note, r.title.as_deref(), now).map(|id| (id, s.reviews.len() > n))
+            })??;
+            let by = hub.read(|s, _| s.review(&id).map(|r| r.author.clone())).unwrap_or_default();
+            let head = if new {
+                format!("Re-review {id} queued (follows {}).", r.review_id)
+            } else if by == agent {
+                format!("You already requested this re-review as {id}; it is not queued twice.")
+            } else {
+                format!("{by} already requested this re-review as {id}; it is not queued twice, and its result goes to {by}.")
+            };
+            Ok(with_next(hub, agent, &before, head))
         }
         "review_status" => {
             let r: StatusArgs = args(a)?;
@@ -535,7 +568,10 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                         s.reviews
                             .iter()
                             .filter(|r| r.phase.active() && (r.author == agent || r.slot(agent).is_some()))
-                            .map(|r| format!("{} {} — {}, ends in {}", r.id, r.pr.url(), r.phase.label(), text::dur(r.deadline_left(now))))
+                            .map(|r| {
+                                let ends = if r.phase == Phase::Offering { "fails in" } else { "ends in" };
+                                format!("{} {} — {}, {ends} {}", r.id, r.pr.url(), r.phase.label(), text::dur(r.deadline_left(now)))
+                            })
                             .collect::<Vec<_>>()
                     });
                     let head = if mine.is_empty() {

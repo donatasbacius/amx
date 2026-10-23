@@ -1,0 +1,428 @@
+{
+  "version": 1,
+  "saved_at": 1792746827472,
+  "next_review": 3,
+  "agents": [
+    {
+      "name": "al-author",
+      "login": "local",
+      "user_id": 0,
+      "node": "relay",
+      "role": "author",
+      "first_seen": 1792746825967,
+      "last_seen": 1792746825971,
+      "events": [
+        {
+          "seq": 1,
+          "at": 1792746825969,
+          "review": "r1",
+          "text": "[r1] Reviewers assigned: cl-a, cx-a (of 2 requested). Independent review phase, up to \ue000left\ue000. Call `wait` for the result.",
+          "progress": true,
+          "due": 1792748025969
+        },
+        {
+          "seq": 2,
+          "at": 1792746825970,
+          "review": "r1",
+          "text": "[r1] Review result for https://github.com/example-org/widgets/pull/1: APPROVE\nReviewers:\n- cl-a suggested approve at aaaaaaa:\n> Looks fine.\n- cx-a suggested approve at aaaaaaa:\n> Looks fine.\n\nNo confirmed findings.\n\nTranscript: http://127.0.0.1:7392/r/r1 (or `review_status` with review_id \"r1\").\nNEXT: nothing required. Address minor findings or nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on r1 (recorded in the transcript; it does not change the result).",
+          "result": true
+        }
+      ],
+      "next_seq": 2,
+      "delivered": 0
+    },
+    {
+      "name": "cl-a",
+      "login": "local",
+      "user_id": 0,
+      "node": "relay",
+      "role": "reviewer",
+      "model": "claude",
+      "first_seen": 1792746825967,
+      "last_seen": 1792746825969,
+      "events": [
+        {
+          "seq": 1,
+          "at": 1792746825968,
+          "review": "r1",
+          "text": "[r1] Review offer: https://github.com/example-org/widgets/pull/1 from al-author (2 reviewer(s) wanted).\nNote from the author:\n> cache\n\nNEXT: call `accept_review` with review_id \"r1\" if you can review it now, else `decline_review`. The first 2 to accept get it; the offer closes in \ue000left\ue000.",
+          "task": "r1:offer",
+          "due": 1792746865968
+        },
+        {
+          "seq": 2,
+          "at": 1792746825970,
+          "review": "r1",
+          "text": "[r1] Review finished: approve. Thanks; you are free for other reviews. Call `wait`.",
+          "progress": true
+        },
+        {
+          "seq": 3,
+          "at": 1792746825971,
+          "review": "r3",
+          "text": "[r3] Review offer: https://github.com/example-org/widgets/pull/3 from al-author (2 reviewer(s) wanted).\nNote from the author:\n> rename\n\nNEXT: call `accept_review` with review_id \"r3\" if you can review it now, else `decline_review`. The first 2 to accept get it; the offer closes in \ue000left\ue000.",
+          "task": "r3:offer",
+          "due": 1792746865971
+        }
+      ],
+      "next_seq": 3,
+      "delivered": 1
+    },
+    {
+      "name": "cl-b",
+      "login": "local",
+      "user_id": 0,
+      "node": "relay",
+      "role": "reviewer",
+      "model": "claude",
+      "first_seen": 1792746825968,
+      "last_seen": 1792746825971,
+      "events": [
+        {
+          "seq": 1,
+          "at": 1792746825968,
+          "review": "r1",
+          "text": "[r1] Review offer: https://github.com/example-org/widgets/pull/1 from al-author (2 reviewer(s) wanted).\nNote from the author:\n> cache\n\nNEXT: call `accept_review` with review_id \"r1\" if you can review it now, else `decline_review`. The first 2 to accept get it; the offer closes in \ue000left\ue000.",
+          "task": "r1:offer",
+          "due": 1792746865968
+        },
+        {
+          "seq": 2,
+          "at": 1792746825969,
+          "review": "r1",
+          "text": "[r1] Offer closed: the review has its reviewers. Call `wait`.",
+          "progress": true
+        },
+        {
+          "seq": 3,
+          "at": 1792746825970,
+          "review": "r2",
+          "text": "[r2] Review offer: https://github.com/example-org/widgets/pull/2 from al-author (2 reviewer(s) wanted).\nNote from the author:\n> leak\n\nNEXT: call `accept_review` with review_id \"r2\" if you can review it now, else `decline_review`. The first 2 to accept get it; the offer closes in \ue000left\ue000.",
+          "task": "r2:offer",
+          "due": 1792746865970
+        }
+      ],
+      "next_seq": 3,
+      "delivered": 3
+    },
+    {
+      "name": "cx-a",
+      "login": "local",
+      "user_id": 0,
+      "node": "relay",
+      "role": "reviewer",
+      "model": "codex",
+      "first_seen": 1792746825968,
+      "last_seen": 1792746825970,
+      "events": [
+        {
+          "seq": 1,
+          "at": 1792746825968,
+          "review": "r1",
+          "text": "[r1] Review offer: https://github.com/example-org/widgets/pull/1 from al-author (2 reviewer(s) wanted).\nNote from the author:\n> cache\n\nNEXT: call `accept_review` with review_id \"r1\" if you can review it now, else `decline_review`. The first 2 to accept get it; the offer closes in \ue000left\ue000.",
+          "task": "r1:offer",
+          "due": 1792746865968
+        },
+        {
+          "seq": 2,
+          "at": 1792746825970,
+          "review": "r1",
+          "text": "[r1] Review finished: approve. Thanks; you are free for other reviews. Call `wait`.",
+          "progress": true
+        },
+        {
+          "seq": 3,
+          "at": 1792746825970,
+          "review": "r2",
+          "text": "[r2] Review offer: https://github.com/example-org/widgets/pull/2 from al-author (2 reviewer(s) wanted).\nNote from the author:\n> leak\n\nNEXT: call `accept_review` with review_id \"r2\" if you can review it now, else `decline_review`. The first 2 to accept get it; the offer closes in \ue000left\ue000.",
+          "task": "r2:offer",
+          "due": 1792746865970
+        },
+        {
+          "seq": 4,
+          "at": 1792746825971,
+          "review": "r3",
+          "text": "[r3] Review offer: https://github.com/example-org/widgets/pull/3 from al-author (2 reviewer(s) wanted).\nNote from the author:\n> rename\n\nNEXT: call `accept_review` with review_id \"r3\" if you can review it now, else `decline_review`. The first 2 to accept get it; the offer closes in \ue000left\ue000.",
+          "task": "r3:offer",
+          "due": 1792746865971
+        }
+      ],
+      "next_seq": 4,
+      "delivered": 1
+    }
+  ],
+  "reviews": [
+    {
+      "id": "r1",
+      "pr": {
+        "owner": "example-org",
+        "repo": "widgets",
+        "number": 1
+      },
+      "author": "al-author",
+      "author_login": "local",
+      "note": "cache",
+      "title": "Add a widget cache",
+      "params": {
+        "reviewers": 2,
+        "consensus": {
+          "reviewers": 2,
+          "confirm_fraction": 0.5,
+          "blocking_unanimous": true,
+          "vote_rounds": 2
+        },
+        "offer_secs": 40,
+        "review_secs": 1200,
+        "vote_secs": 600,
+        "reply_secs": 90
+      },
+      "created": 1792746825968,
+      "ended": 1792746825970,
+      "phase": {
+        "phase": "done"
+      },
+      "deadline": 1792748025969,
+      "offered": [
+        "cl-a",
+        "cl-b",
+        "cx-a"
+      ],
+      "declined": [],
+      "slots": [
+        {
+          "agent": "cl-a",
+          "login": "local",
+          "model": "claude",
+          "joined": 1792746825969,
+          "dropped": null,
+          "submission": {
+            "at": 1792746825969,
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "verdict": "approve",
+            "summary": "Looks fine."
+          }
+        },
+        {
+          "agent": "cx-a",
+          "login": "local",
+          "model": "codex",
+          "joined": 1792746825969,
+          "dropped": null,
+          "submission": {
+            "at": 1792746825970,
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "verdict": "approve",
+            "summary": "Looks fine."
+          }
+        }
+      ],
+      "findings": [],
+      "log": [
+        {
+          "at": 1792746825968,
+          "who": "al-author",
+          "kind": "request",
+          "text": "requested 2 reviewer(s). cache"
+        },
+        {
+          "at": 1792746825969,
+          "who": "cl-a",
+          "kind": "accept",
+          "text": "accepted the review"
+        },
+        {
+          "at": 1792746825969,
+          "who": "cx-a",
+          "kind": "accept",
+          "text": "accepted the review"
+        },
+        {
+          "at": 1792746825969,
+          "who": "relay",
+          "kind": "phase",
+          "text": "independent review started with cl-a, cx-a"
+        },
+        {
+          "at": 1792746825969,
+          "who": "cl-a",
+          "kind": "submit",
+          "text": "submitted 0 finding(s) at aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "at": 1792746825970,
+          "who": "cx-a",
+          "kind": "submit",
+          "text": "submitted 0 finding(s) at aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "at": 1792746825970,
+          "who": "relay",
+          "kind": "result",
+          "text": "consensus: approve"
+        }
+      ],
+      "result": {
+        "verdict": "approve",
+        "at": 1792746825970,
+        "text": "[r1] Review result for https://github.com/example-org/widgets/pull/1: APPROVE\nReviewers:\n- cl-a suggested approve at aaaaaaa:\n> Looks fine.\n- cx-a suggested approve at aaaaaaa:\n> Looks fine.\n\nNo confirmed findings.\n\nTranscript: http://127.0.0.1:7392/r/r1 (or `review_status` with review_id \"r1\").\nNEXT: nothing required. Address minor findings or nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on r1 (recorded in the transcript; it does not change the result)."
+      },
+      "failure": null,
+      "parent": null,
+      "iteration": 1,
+      "since_sha": null,
+      "head_sha": null,
+      "next_finding": 0
+    },
+    {
+      "id": "r2",
+      "pr": {
+        "owner": "example-org",
+        "repo": "widgets",
+        "number": 2
+      },
+      "author": "al-author",
+      "author_login": "local",
+      "note": "leak",
+      "title": "Fix a widget leak",
+      "params": {
+        "reviewers": 2,
+        "consensus": {
+          "reviewers": 2,
+          "confirm_fraction": 0.5,
+          "blocking_unanimous": true,
+          "vote_rounds": 2
+        },
+        "offer_secs": 40,
+        "review_secs": 1200,
+        "vote_secs": 600,
+        "reply_secs": 90
+      },
+      "created": 1792746825970,
+      "ended": null,
+      "phase": {
+        "phase": "offering"
+      },
+      "deadline": 1792746865970,
+      "offered": [
+        "cl-b",
+        "cx-a"
+      ],
+      "declined": [],
+      "picked": [
+        "cl-b",
+        "cx-a"
+      ],
+      "slots": [
+        {
+          "agent": "cl-b",
+          "login": "local",
+          "model": "claude",
+          "joined": 1792746825971,
+          "dropped": null,
+          "submission": {
+            "at": 1792746825971,
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "verdict": "approve",
+            "summary": "Looks fine."
+          }
+        }
+      ],
+      "findings": [
+        {
+          "id": "F1",
+          "by": "cl-b",
+          "severity": "major",
+          "url": "https://github.com/example-org/widgets/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/src/lib.rs#L3",
+          "title": "Leak remains",
+          "text": "The handle is never closed.",
+          "origin": null,
+          "withdrawn": null,
+          "revision": 0,
+          "open_round": 1,
+          "votes": {},
+          "outcome": null
+        }
+      ],
+      "log": [
+        {
+          "at": 1792746825970,
+          "who": "al-author",
+          "kind": "request",
+          "text": "requested 2 reviewer(s) from cl-b, cx-a. leak"
+        },
+        {
+          "at": 1792746825971,
+          "who": "cl-b",
+          "kind": "accept",
+          "text": "accepted the review"
+        },
+        {
+          "at": 1792746825971,
+          "who": "cl-b",
+          "kind": "submit",
+          "text": "submitted 1 finding(s) at aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "result": null,
+      "failure": null,
+      "parent": null,
+      "iteration": 1,
+      "since_sha": null,
+      "head_sha": null,
+      "next_finding": 1
+    },
+    {
+      "id": "r3",
+      "pr": {
+        "owner": "example-org",
+        "repo": "widgets",
+        "number": 3
+      },
+      "author": "al-author",
+      "author_login": "local",
+      "note": "rename",
+      "title": "Rename widgets",
+      "params": {
+        "reviewers": 2,
+        "consensus": {
+          "reviewers": 2,
+          "confirm_fraction": 0.5,
+          "blocking_unanimous": true,
+          "vote_rounds": 2
+        },
+        "offer_secs": 40,
+        "review_secs": 1200,
+        "vote_secs": 600,
+        "reply_secs": 90
+      },
+      "created": 1792746825971,
+      "ended": null,
+      "phase": {
+        "phase": "offering"
+      },
+      "deadline": 1792746865971,
+      "offered": [
+        "cl-a",
+        "cx-a"
+      ],
+      "declined": [],
+      "slots": [],
+      "findings": [],
+      "log": [
+        {
+          "at": 1792746825971,
+          "who": "al-author",
+          "kind": "request",
+          "text": "requested 2 reviewer(s). rename"
+        }
+      ],
+      "result": null,
+      "failure": null,
+      "parent": null,
+      "iteration": 1,
+      "since_sha": null,
+      "head_sha": null,
+      "next_finding": 0
+    }
+  ]
+}

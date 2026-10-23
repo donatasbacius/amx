@@ -153,7 +153,9 @@ impl Hub {
     pub async fn wait(&self, name: &str, timeout: Duration, progress: bool, held: bool) -> (Vec<AgentEvent>, u64) {
         let mut rx = self.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
-        self.state.lock().unwrap().set_waiting(name, 1, now_ms());
+        if self.state.lock().unwrap().set_waiting(name, 1, now_ms()) {
+            self.bump();
+        }
         let _guard = Waiting { hub: self, name: name.to_string() };
         loop {
             rx.borrow_and_update();
