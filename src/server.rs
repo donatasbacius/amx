@@ -424,6 +424,14 @@ fn streams(hub: &Hub, agent: Option<&str>, delta: i32) {
     }
 }
 
+/// A session is gone, and with it its streams and its hold on its agent.
+fn ended(hub: &Hub, s: &Session) {
+    streams(hub, s.agent.as_deref(), -(s.streams as i32));
+    if let Some(a) = &s.agent {
+        hub.write(|st, _| st.agents.leave(a));
+    }
+}
+
 /// The caller's session `id`, recreated if the relay doesn't know it. Over the cap, the login's
 /// least recently used session ends.
 fn session(hub: &Hub, who: &Identity, id: &str, chosen: Option<&str>, role: Option<Role>) -> String {
@@ -436,7 +444,7 @@ fn session(hub: &Hub, who: &Identity, id: &str, chosen: Option<&str>, role: Opti
             && let Some(old) = own().min_by_key(|(_, s)| s.used).map(|(k, _)| k.clone())
             && let Some(s) = all.remove(&old)
         {
-            streams(hub, s.agent.as_deref(), -(s.streams as i32));
+            ended(hub, &s);
         }
     }
     let s = all.entry(key.clone()).or_insert_with(|| Session {
@@ -774,7 +782,7 @@ async fn mcp_delete(State(hub): St, Extension(who): Extension<Identity>, headers
     if let Some(id) = session_id(&headers) {
         let s = hub.sessions.lock().unwrap().remove(&session_key(&who, id));
         if let Some(s) = s {
-            streams(&hub, s.agent.as_deref(), -(s.streams as i32));
+            ended(&hub, &s);
         }
     }
     StatusCode::OK

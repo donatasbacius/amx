@@ -143,9 +143,9 @@ pub fn review_task(r: &Review, left: &str) -> String {
     let _ = write!(
         s,
         "Never write to GitHub (no comments, reviews, pushes). Then call `submit_findings` with review_id \"{}\", head_sha (the headRefOid you reviewed), verdict (approve | changes_requested), a one-sentence summary, and findings: \
-         [{{severity: blocking|major|minor|nit, url: \"https://github.com/{}/{}/blob/<head_sha>/<path>#L<line>\", title, text}}] (an empty list if you found nothing). \
-         Severity: blocking = must not merge (bug, data loss, security hole); major = should be fixed before merge; minor = worth fixing; nit = style or taste. \
-         Be terse: title = what's wrong in a few words (at most 80 characters); text = one to three sentences: where, why it matters, the fix; no preamble, don't restate the code or the title. {MARKDOWN} \
+         [{{severity: blocking|major|minor|nit, url: \"https://github.com/{}/{}/blob/<head_sha>/<path>#L<line>\", title, text}}] (an empty list if you found nothing, with `checked`: one line on the files or areas you read). \
+         Severity: blocking = must not merge (bug, data loss, security hole); major = should be fixed before merge; minor = small but real, must be fixed before merge; nit = style or taste, never blocks. Blocking, major and minor all hold back approval. \
+         Be terse, but read the diff and the code it touches before you submit; title = what's wrong in a few words (at most 80 characters); text = one to three sentences: where, why it matters, the fix; no preamble, don't restate the code or the title. {MARKDOWN} \
          Other reviewers' findings stay hidden until everyone has submitted. Deadline: {left}.",
         r.id, r.pr.owner, r.pr.repo
     );
@@ -379,7 +379,7 @@ pub fn result(r: &Review, web: &str) -> String {
         r.id,
         r.pr.url(),
         match verdict {
-            Verdict::Approve if open => "NEEDS YOUR CALL (nothing confirmed to fix; findings below to check)",
+            Verdict::Approve if open => "DECIDE (nothing confirmed to fix; findings below to check)",
             Verdict::Approve => "APPROVE",
             Verdict::ChangesRequested => "CHANGES REQUESTED",
         }
@@ -389,6 +389,10 @@ pub fn result(r: &Review, web: &str) -> String {
         let mut head = format!("- {}", sl.agent);
         if let Some(x) = &sl.submission {
             let _ = write!(head, " suggested {} at {}", x.verdict.as_str(), short_sha(&x.head_sha));
+        }
+        if let Some(t) = sl.took() {
+            let fast = if t < crate::relay::FAST_MS { ", very fast" } else { "" };
+            let _ = write!(head, " ({} after the task{fast})", dur(t));
         }
         if let Some(d) = &sl.dropped {
             let _ = write!(head, " (dropped: {d})");
@@ -483,7 +487,7 @@ pub fn result(r: &Review, web: &str) -> String {
         Verdict::ChangesRequested => {
             let _ = write!(
                 s,
-                "NEXT: fix the confirmed findings{} (and any disputed ones you agree with){}, push, then call `request_rereview` with review_id \"{}\", new_head_sha and a note on what you changed. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                "NEXT: fix the confirmed blocking, major and minor findings{} (and any disputed ones you agree with){}, push, then call `request_rereview` with review_id \"{}\", new_head_sha and a note on what you changed. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
                 if r.findings.iter().any(|f| f.ruled().is_some_and(|x| x.must_fix)) { " and those ruled must fix" } else { "" },
                 if unverified_ids.is_empty() { String::new() } else { format!("; check {} against the code yourself and fix the real ones", unverified_ids.join(", ")) },
                 r.id,
@@ -500,7 +504,7 @@ pub fn result(r: &Review, web: &str) -> String {
             }
             let _ = write!(
                 s,
-                "NEXT: nothing is confirmed to fix, but {}: check them against the code yourself and fix the real ones (ask your human if unsure). Address minor findings or nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                "NEXT: nothing is confirmed to fix, but {}: check them against the code yourself and fix the real ones (ask your human if unsure). Address nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
                 open.join(", and "),
                 r.id
             );
@@ -508,7 +512,7 @@ pub fn result(r: &Review, web: &str) -> String {
         Verdict::Approve => {
             let _ = write!(
                 s,
-                "NEXT: nothing required. Address minor findings or nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                "NEXT: nothing required. Address nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
                 r.id
             );
         }
@@ -523,7 +527,7 @@ pub fn next_step(r: &Review) -> String {
         v.join(", ")
     };
     if crate::relay::verdict_of(&r.findings) == Verdict::ChangesRequested {
-        let fix = ids(&|f, s| *s == Status::Confirmed || f.ruled().is_some_and(|x| x.must_fix));
+        let fix = ids(&|f, s| (*s == Status::Confirmed && f.outcome.as_ref().is_some_and(|o| o.severity.blocks())) || f.ruled().is_some_and(|x| x.must_fix));
         return format!("NEXT: fix {fix}, push, then call `request_rereview` with review_id \"{}\".", r.id);
     }
     match ids(&|f, s| matches!(s, Status::Disputed | Status::Unverified) && f.ruled().is_none()) {
@@ -565,13 +569,14 @@ pub fn status(r: &Review, viewer: &str, now: Ms, web: &str) -> String {
     if r.revealed() {
         s.push_str(&findings_for(r, 2));
     } else {
-        let mine: Vec<&Finding> = r.findings.iter().filter(|f| f.by.as_deref() == Some(viewer) || f.by.is_none()).collect();
-        let hidden = r.findings.len() - mine.len();
-        for f in mine {
+        for f in r.findings.iter().filter(|f| f.by.is_none()) {
             let _ = writeln!(s, "{}", finding_line(f));
         }
-        if hidden > 0 {
-            let _ = writeln!(s, "({hidden} finding(s) from other reviewers hidden until everyone has submitted)");
+        for f in r.findings.iter().filter(|f| f.by.as_deref() == Some(viewer)) {
+            let _ = writeln!(s, "{}", labelled(&format!("- [{}] yours:", f.severity.as_str()), &linked(f)));
+        }
+        if r.phase == Phase::Reviewing {
+            s.push_str("(other reviewers' findings stay hidden until everyone has submitted)\n");
         }
     }
     if let Some(res) = r.result_now(web) {

@@ -29,6 +29,10 @@ const MAX_SAY: usize = 4000;
 const MAX_FINDING: usize = 2000;
 const MAX_REASON: usize = 1000;
 const MAX_URL: usize = 400;
+/// What a reviewer says it checked; longer is cut, as finding titles are.
+const MAX_CHECKED: usize = 200;
+/// A submission this soon after the review task arrived is flagged as very fast.
+pub const FAST_MS: Ms = 30_000;
 /// Characters in one reviewer's findings, their links and its summary together, or in its vote reasons in a round.
 const MAX_REVIEWER_TEXT: usize = 16_000;
 /// Says, amendments and changed votes, per agent and review.
@@ -76,6 +80,11 @@ impl Severity {
             Severity::Minor => "minor",
             Severity::Nit => "nit",
         }
+    }
+
+    /// Whether a confirmed finding of this severity holds back approval: all but nits.
+    pub fn blocks(self) -> bool {
+        self != Severity::Nit
     }
 }
 
@@ -222,6 +231,9 @@ pub struct Agents {
     map: BTreeMap<String, Agent>,
     /// Open session event streams per name, which count as activity like a `wait`.
     streams: BTreeMap<String, u32>,
+    /// Names whose session or last event stream ended, or that the relay lost in a restart,
+    /// and that haven't been heard from since.
+    gone: BTreeSet<String>,
     timing: Timing,
 }
 
@@ -251,10 +263,25 @@ impl Agents {
         *n = n.saturating_add_signed(delta);
         if *n == 0 {
             self.streams.remove(name);
+            if delta < 0 {
+                self.leave(name);
+            }
+        } else {
+            self.gone.remove(name);
         }
         if let Some(a) = self.map.get_mut(name) {
             a.last_seen = now;
         }
+    }
+
+    /// `name`'s session has ended.
+    pub fn leave(&mut self, name: &str) {
+        self.gone.insert(name.to_string());
+    }
+
+    /// Whether `name` has left (see `gone`), so its silence counts even while it owes a task.
+    pub fn gone(&self, name: &str) -> bool {
+        self.gone.contains(name)
     }
 
     fn notify(&mut self, name: &str, review: &str, text: String, now: Ms) {
@@ -351,6 +378,9 @@ pub struct Submission {
     pub head_sha: String,
     pub verdict: Verdict,
     pub summary: String,
+    /// What the reviewer read, in one line; required with no findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,6 +392,9 @@ pub struct Slot {
     pub joined: Ms,
     pub dropped: Option<String>,
     pub submission: Option<Submission>,
+    /// When the review task reached it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasked: Option<Ms>,
 }
 
 impl Slot {
@@ -372,6 +405,11 @@ impl Slot {
     /// In a forming team: holds findings it brought from 0.14.1, so it is never released.
     fn kept(&self) -> bool {
         self.submission.is_some()
+    }
+
+    /// How long it took from getting the review task to submitting.
+    pub fn took(&self) -> Option<Ms> {
+        Some(self.submission.as_ref()?.at.saturating_sub(self.tasked?))
     }
 }
 
@@ -849,13 +887,11 @@ pub fn rereview<'a>(reviews: &'a [Review], id: &str) -> Option<&'a Review> {
     None
 }
 
-/// Changes are requested by a confirmed blocking or major finding, or one a human ruled must fix.
+/// Changes are requested by a confirmed blocking, major or minor finding, or one a human ruled must fix.
 pub fn verdict_of(findings: &[Finding]) -> Verdict {
     let blocks = findings.iter().any(|f| {
         f.ruled().is_some_and(|r| r.must_fix)
-            || f.outcome.as_ref().is_some_and(|o| {
-                o.status == Status::Confirmed && matches!(o.severity, Severity::Blocking | Severity::Major)
-            })
+            || f.outcome.as_ref().is_some_and(|o| o.status == Status::Confirmed && o.severity.blocks())
     });
     if blocks { Verdict::ChangesRequested } else { Verdict::Approve }
 }
@@ -887,6 +923,8 @@ pub struct SubmitIn {
     pub head_sha: String,
     pub verdict: String,
     pub summary: String,
+    /// Required when `findings` is empty.
+    pub checked: String,
     pub findings: Vec<FindingIn>,
 }
 
@@ -1119,6 +1157,7 @@ impl State {
             agents: Agents {
                 map: BTreeMap::new(),
                 streams: BTreeMap::new(),
+                gone: BTreeSet::new(),
                 timing,
             },
             reviews: Vec::new(),
@@ -1167,6 +1206,7 @@ impl State {
                 (a.name.clone(), a)
             })
             .collect();
+        self.agents.gone = self.agents.map.keys().cloned().collect();
         self.reviews = snap.reviews;
         let queue_secs = self.consensus.queue_secs.clamp(60, 24 * 3600);
         for r in &mut self.reviews {
@@ -1190,6 +1230,11 @@ impl State {
             }
             if r.phase.active() {
                 r.deadline += down;
+            }
+            if r.phase == Phase::Reviewing {
+                for s in r.slots.iter_mut().filter(|s| s.submission.is_none()) {
+                    s.tasked = s.tasked.map(|t| t + down);
+                }
             }
         }
         let queued: HashSet<String> = self.reviews.iter().filter(|r| r.phase == Phase::Offering).map(|r| offer_task(&r.id)).collect();
@@ -1252,6 +1297,7 @@ impl State {
         }
         a.last_seen = now;
         a.node = who.node.clone();
+        self.agents.gone.remove(name);
         if who.user_id != 0 {
             a.user_id = who.user_id;
         }
@@ -1329,6 +1375,9 @@ impl State {
             a.waiting = a.waiting.saturating_add_signed(delta);
             a.last_seen = now;
         }
+        if delta > 0 {
+            self.agents.gone.remove(name);
+        }
         let mut back = false;
         for r in self.reviews.iter_mut().filter(|_| delta > 0) {
             back |= r.lapsed.remove(name);
@@ -1401,7 +1450,19 @@ impl State {
         if !held {
             a.delivered = reached;
         }
+        let tasks: Vec<String> = fresh.iter().filter_map(|e| e.task.clone()).collect();
+        self.handed(name, &tasks, now);
         (fresh, reached)
+    }
+
+    /// Notes when `name` got the review tasks among `tasks`, which its time to submit counts from.
+    fn handed(&mut self, name: &str, tasks: &[String], now: Ms) {
+        for r in self.reviews.iter_mut().filter(|r| r.phase == Phase::Reviewing && tasks.contains(&review_task(&r.id))) {
+            if let Some(s) = r.slot_mut(name).filter(|s| s.tasked.is_none()) {
+                s.tasked = Some(now);
+                r.log(now, name, "task", "got the review task");
+            }
+        }
     }
 
     /// The agent's client has received its events up to `seq`.
@@ -1450,12 +1511,13 @@ impl State {
     }
 
     /// Drops queued events for tasks whose full text `name` has just been given in a tool result.
-    pub fn forget_tasks(&mut self, name: &str, tasks: &[String]) {
+    pub fn forget_tasks(&mut self, name: &str, tasks: &[String], now: Ms) {
         if let Some(a) = self.agents.map.get_mut(name) {
             let delivered = a.delivered;
             a.events
                 .retain(|e| e.seq <= delivered || e.task.as_ref().is_none_or(|t| !tasks.contains(t)));
         }
+        self.handed(name, tasks, now);
     }
 
     /// Events after `after` without marking them delivered.
@@ -1786,6 +1848,7 @@ impl State {
             joined: now,
             dropped: None,
             submission: None,
+            tasked: None,
         });
         r.log(now, agent, "accept", "accepted the review");
         self.advance(now);
@@ -1814,6 +1877,7 @@ impl State {
             head_sha,
             verdict,
             summary,
+            checked,
             findings,
         } = sub;
         let login = self.login_of(agent);
@@ -1850,6 +1914,10 @@ impl State {
             parsed.push((severity, url, title, text));
         }
         let summary = bounded(&summary, "summary", MAX_FINDING)?;
+        let checked = one_line(&checked, MAX_CHECKED);
+        if parsed.is_empty() && checked.is_none() {
+            bail!("with no findings, `checked` is required: say in one line what you read (files or areas)");
+        }
         check_reviewer_text(parsed.iter().map(|(_, u, h, t)| finding_size(Some(h), t, u.as_deref())).sum::<usize>() + summary.chars().count())?;
         for (severity, url, title, text) in parsed {
             r.next_finding += 1;
@@ -1876,9 +1944,11 @@ impl State {
                 head_sha: head_sha.to_string(),
                 verdict,
                 summary,
+                checked: checked.clone(),
             });
         }
-        r.log(now, agent, "submit", format!("submitted {n} finding(s) at {head_sha}"));
+        let checked = checked.map(|c| format!("; checked: {c}")).unwrap_or_default();
+        r.log(now, agent, "submit", format!("submitted {n} finding(s) at {head_sha}{checked}"));
         self.advance(now);
         Ok(n)
     }
@@ -2243,6 +2313,7 @@ impl State {
                 joined: now,
                 dropped: None,
                 submission: None,
+                tasked: None,
             });
             r.log(now, &agent, "accept", format!("assigned again (reviewed {})", prev.id));
         }
@@ -2633,16 +2704,28 @@ fn assign(reviews: &[Review], mut pool: Vec<&Agent>) -> BTreeMap<String, usize> 
     offers
 }
 
+/// Drops reviewers silent for `drop_ms`; one that owes a task is given until its deadline,
+/// unless it has left.
 fn drop_silent(r: &mut Review, agents: &mut Agents, drop_ms: Ms, now: Ms) -> bool {
     let gone: Vec<String> = r
         .active_slots()
-        .filter(|s| agents.silent_ms(&s.agent, now) >= drop_ms)
+        .filter(|s| agents.silent_ms(&s.agent, now) >= drop_ms && (agents.gone(&s.agent) || !owes(r, &s.agent)))
         .map(|s| s.agent.clone())
         .collect();
     for a in &gone {
         drop_slot(r, agents, a, "went offline", now);
     }
     !gone.is_empty()
+}
+
+/// Whether `agent` owes `r` its findings, votes or a reply now.
+fn owes(r: &Review, agent: &str) -> bool {
+    match r.phase {
+        Phase::Reviewing => r.slot(agent).is_some_and(|s| s.submission.is_none()),
+        Phase::Voting(_) if r.replying => !r.replied.contains(agent) && !r.contested_by(agent).is_empty(),
+        Phase::Voting(_) => !r.owed_votes(agent).is_empty(),
+        _ => false,
+    }
 }
 
 fn drop_slot(r: &mut Review, agents: &mut Agents, agent: &str, why: &str, now: Ms) {
@@ -2785,10 +2868,11 @@ fn finish(r: &mut Review, agents: &mut Agents, web: &str, now: Ms) {
         text: body.clone(),
     });
     r.log(now, "relay", "result", format!("consensus: {}", verdict.as_str()));
+    log_end(r, verdict.as_str());
     agents.outcome(&r.author, &r.id, body, now);
     let names: Vec<String> = r.slots.iter().filter(|s| s.active()).map(|s| s.agent.clone()).collect();
     for a in names {
-        agents.progress(
+        agents.notify(
             &a,
             &r.id,
             format!("[{}] Review finished: {}. Thanks; you are free for other reviews. Call `wait`.", r.id, verdict.as_str()),
@@ -2797,11 +2881,34 @@ fn finish(r: &mut Review, agents: &mut Agents, web: &str, now: Ms) {
     }
 }
 
+/// One line in the relay's own log per review that ends: its numbers, never titles, URLs or text.
+fn log_end(r: &Review, outcome: &str) {
+    let end = r.ended.unwrap_or(r.created);
+    let starts: Vec<Ms> = r.log.iter().filter(|e| e.kind == "phase").map(|e| e.at).collect();
+    let secs = |from: Option<Ms>, to: Option<Ms>| Some(to.unwrap_or(end).saturating_sub(from?) / 1000);
+    let (reviewing, voting) = (starts.first().copied(), starts.get(1).copied());
+    let ran = |m: Model| r.slots.iter().filter(|s| s.model == Some(m)).count();
+    tracing::info!(
+        review = %r.id,
+        outcome = %outcome,
+        reviewers = r.slots.len(),
+        dropped = r.slots.iter().filter(|s| s.dropped.is_some()).count(),
+        claude = ran(Model::Claude),
+        codex = ran(Model::Codex),
+        rounds = starts.len().saturating_sub(1),
+        queued_secs = secs(Some(r.created), reviewing),
+        review_secs = secs(reviewing, voting),
+        voting_secs = secs(voting, None),
+        "review ended"
+    );
+}
+
 fn fail(r: &mut Review, agents: &mut Agents, why: &str, now: Ms) {
     r.phase = Phase::Failed;
     r.ended = Some(now);
     r.failure = Some(why.to_string());
     r.log(now, "relay", "failed", why);
+    log_end(r, if r.cancelled_by.is_some() { "cancelled" } else { "failed" });
     let (author, reviewer) = match &r.cancelled_by {
         Some(by) => (
             format!("[{}] {by} (a human) cancelled the review of {}.\nNEXT: don't request it again unless your human asks.", r.id, r.pr.url()),

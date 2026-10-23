@@ -249,7 +249,7 @@ fn apply(s: &mut State, now: &mut Ms, act: &Act) {
                 .enumerate()
                 .map(|(i, sev)| FindingIn { severity: sev.to_string(), url: None, title: Some(format!("issue {i}")), text: format!("{n} found {i}") })
                 .collect();
-            s.submit(n, id, SubmitIn { head_sha: SHAS[0].into(), verdict: "approve".into(), summary: "looked".into(), findings }, t).map(drop)
+            s.submit(n, id, SubmitIn { head_sha: SHAS[0].into(), verdict: "approve".into(), summary: "looked".into(), checked: "src/lib.rs".into(), findings }, t).map(drop)
         }
         Act::Vote(n, id, votes) => {
             touch(s, n);

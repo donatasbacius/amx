@@ -1,7 +1,7 @@
 //! The state machine model's safety properties, checked on the relay's real state across one
 //! step from `pre` to `s`.
 
-use amx::relay::{Agent, Choice, Model, Ms, Phase, Review, Role, State, Status};
+use amx::relay::{Agent, Choice, Model, Ms, Phase, Review, Role, State, Status, Verdict};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The first property the step breaks, as "S1: why".
@@ -102,6 +102,9 @@ pub fn check(pre: &State, s: &State, now: Ms) -> Result<(), String> {
             return fail("S18", format!("{login} has {n} unfinished reviews"));
         }
     }
+    if let Some(why) = blind_check(pre, s, now) {
+        return fail("H1", why);
+    }
     let offers: BTreeMap<&str, Vec<String>> = free.iter().map(|a| (a.name.as_str(), offered(s, &a.name, now))).collect();
     for a in &free {
         let Some(id) = offers[a.name.as_str()].first() else { continue };
@@ -134,6 +137,58 @@ fn wanted<'a>(reviews: &[&Review], mut pool: Vec<&'a Agent>) -> BTreeMap<&'a str
         want.extend(takers.iter().map(|a| (a.name.as_str(), r.id.clone())));
     }
     want
+}
+
+/// H1: no findings count or content is visible to other reviewers before every reviewer has
+/// submitted. Whatever the others have submitted, the web pages, the JSON API and `review_status`
+/// show each viewer exactly what they would if the others had submitted nothing but their head.
+/// Checked on the reviews the step changed.
+fn blind_check(pre: &State, s: &State, now: Ms) -> Option<String> {
+    let changed = |r: &Review| pre.review(&r.id).is_none_or(|p| p.log.len() != r.log.len());
+    let hidden = |r: &Review| !r.revealed() && r.slots.iter().any(|x| x.submission.is_some()) && changed(r);
+    if !s.reviews.iter().any(hidden) {
+        return None;
+    }
+    let mut seen = s.clone();
+    seen.reviews.retain(hidden);
+    let mut b = seen.clone();
+    for r in &mut b.reviews {
+        *r = blind(r, "");
+    }
+    if amx::web::render_index(&seen, now, &amx::web::View::anyone()) != amx::web::render_index(&b, now, &amx::web::View::anyone()) {
+        return Some("the index".into());
+    }
+    for r in s.reviews.iter().filter(|r| hidden(r)) {
+        let shown = |x: &Review| {
+            let page = amx::web::render_review_page(x, &[], None, now, &|_| false);
+            (page, amx::web::review_json(x, &[], now, ""), amx::web::list_json(x, now))
+        };
+        if shown(r) != shown(&blind(r, "")) {
+            return Some(format!("{}'s page or JSON", r.id));
+        }
+        for viewer in r.slots.iter().map(|x| x.agent.as_str()).chain([r.author.as_str()]) {
+            if amx::text::status(r, viewer, now, "") != amx::text::status(&blind(r, viewer), viewer, now, "") {
+                return Some(format!("review_status of {} for {viewer}", r.id));
+            }
+        }
+    }
+    None
+}
+
+/// `r` as if reviewers other than `viewer` had submitted no findings, summary or note.
+fn blind(r: &Review, viewer: &str) -> Review {
+    let mut b = r.clone();
+    b.findings.retain(|f| f.by.is_none() || f.by.as_deref() == Some(viewer));
+    for sub in b.slots.iter_mut().filter(|x| x.agent != viewer).filter_map(|x| x.submission.as_mut()) {
+        sub.summary.clear();
+        sub.verdict = Verdict::Approve;
+        sub.checked = None;
+    }
+    for e in b.log.iter_mut().filter(|e| e.kind == "submit" && e.who != viewer) {
+        let sha = e.text.split_once(" at ").map_or("", |(_, t)| t.split("; ").next().unwrap_or(t)).to_string();
+        e.text = format!("submitted 0 finding(s) at {sha}");
+    }
+    b
 }
 
 /// C1's memory along one run: what teams could form, and how often each review released each

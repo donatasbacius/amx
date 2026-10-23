@@ -382,7 +382,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
         {"severity": "minor", "title": "Short title", "text": "Retries reuse one idempotency key."},
     ]);
     hub.reviewer("rv1", "submit_findings", json!({"review_id": "r1", "head_sha": SHA, "verdict": "changes_requested", "findings": findings})).await;
-    hub.reviewer("rv2", "submit_findings", json!({"review_id": "r1", "head_sha": SHA, "verdict": "approve", "findings": []})).await;
+    hub.reviewer("rv2", "submit_findings", json!({"review_id": "r1", "head_sha": SHA, "verdict": "approve", "checked": "src/lib.rs", "findings": []})).await;
     let votes = json!([{"finding": "F1", "vote": "disagree", "reason": "It backs off."}, {"finding": "F2", "vote": "disagree", "reason": "Keys differ."}]);
     hub.reviewer("rv2", "vote", json!({"review_id": "r1", "votes": votes})).await;
     let r1 = hub.api("r1").await;
@@ -391,7 +391,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
 
     let page = hub.page("friend", "r1").await;
     assert!(page.contains("value=\"must_fix\">Must fix<span class=\"sr\"> F1</span>"), "{page}");
-    assert!(page.contains("<p class=\"vt\">Needs your call</p><p class=\"vd\"><span><span class=\"needs\">2 to decide</span>") && page.contains("<title>Needs your call · "), "{page}");
+    assert!(page.contains("<p class=\"vt\">Decide</p><p class=\"vd\"><span><span class=\"needs\">2 to decide</span>") && page.contains("<title>Decide · "), "{page}");
     let index = |who: &'static str, h: Option<&'static str>| {
         let url = format!("{}/", hub.base(who));
         async move {
@@ -400,13 +400,13 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
             req.send().await.unwrap().text().await.unwrap()
         }
     };
-    let yours = "<li class=\"rv call\"><span class=\"st s-judge\">Needs your call</span>";
-    let authors = "<span class=\"st s-judge\">Needs the author's call</span>";
+    let yours = "<li class=\"rv call\"><span class=\"st s-judge\">Decide</span>";
+    let authors = "<span class=\"st s-judge\">Unresolved</span>";
     assert!(index("friend", None).await.contains(yours));
     let owner = index("owner", None).await;
     assert!(owner.contains(authors) && owner.contains("<span>fa ·</span> <span>you can rule</span>") && !owner.contains("f-call") && !owner.contains("rv call"), "the owner's own PRs only: {owner}");
     let page = hub.page("stranger", "r1").await;
-    assert!(page.contains("<p class=\"vt\">Needs the author's call</p>") && page.contains("<title>Needs the author&#39;s call · "), "{page}");
+    assert!(page.contains("<p class=\"vt\">Unresolved</p>") && page.contains("<title>Unresolved · "), "{page}");
     assert!(index("stranger", None).await.contains(authors));
     assert!(index("owner", Some("via")).await.contains(authors), "not identified");
     // A cancel that arrives after the review ended says how it ended.
@@ -480,7 +480,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     .await;
     let r1 = hub.api("r1").await;
     assert_eq!((r1["verdict"].as_str(), r1["result"]["verdict"].as_str()), (Some("approve"), Some("approve")), "{r1}");
-    assert!(hub.page("friend", "r1").await.contains("<p class=\"vt\">Needs your call</p>"), "approve, with the reviewers' split left to decide");
+    assert!(hub.page("friend", "r1").await.contains("<p class=\"vt\">Decide</p>"), "approve, with the reviewers' split left to decide");
     let (code, _) = hub.post("friend", "/r/r1/f/F1", &[("ruling", "must_fix")]).await;
     assert_eq!(code, StatusCode::SEE_OTHER);
     wait_for(&hub.tailnet, "fa", "ruled F1 must fix (verdict: changes requested)").await;
@@ -522,7 +522,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
 
     // The reviewers split on whether it is fixed, so the ruling stands.
     for r in ["rv1", "rv2"] {
-        hub.reviewer(r, "submit_findings", json!({"review_id": "r2", "head_sha": SHA2, "verdict": "approve", "findings": []})).await;
+        hub.reviewer(r, "submit_findings", json!({"review_id": "r2", "head_sha": SHA2, "verdict": "approve", "checked": "src/lib.rs", "findings": []})).await;
     }
     hub.reviewer("rv1", "vote", json!({"review_id": "r2", "votes": [{"finding": "C1", "vote": "agree"}]})).await;
     hub.reviewer("rv2", "vote", json!({"review_id": "r2", "votes": [{"finding": "C1", "vote": "disagree", "reason": "Fixed."}]})).await;

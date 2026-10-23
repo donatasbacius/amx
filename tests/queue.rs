@@ -204,7 +204,7 @@ impl World {
                     text: format!("{name} found {i}"),
                 })
                 .collect();
-            let sub = SubmitIn { head_sha: SHAS[0].into(), verdict: "approve".into(), summary: "looked".into(), findings };
+            let sub = SubmitIn { head_sha: SHAS[0].into(), verdict: "approve".into(), summary: "looked".into(), checked: "src/lib.rs".into(), findings };
             self.s.submit(name, &id, sub, self.now).map(|n| format!("submitted {n}"))
         } else if task.contains(":vote:") {
             let owed: Vec<String> = self.s.review(&id).unwrap().owed_votes(name).iter().map(|f| f.id.clone()).collect();
