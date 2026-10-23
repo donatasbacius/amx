@@ -657,7 +657,10 @@ async fn mcp(
     };
     let default = default_for(&headers, &who);
     let active = value["method"] == "tools/call" && value["params"]["name"].as_str().is_some_and(|t| crate::mcp::ACTIVE_TOOLS.contains(&t));
-    let named = if value["method"] == "initialize" {
+    let ticket = crate::mcp::ticket(&value);
+    let named = if let Some(t) = &ticket {
+        hub.read(|s, _| s.ticket_holder(t, &who.login)).map(|a| (a, None, String::new(), None, None)).map_err(|e| format!("{e:#}"))
+    } else if value["method"] == "initialize" {
         let id = new_session_id();
         chosen
             .as_deref()
@@ -669,7 +672,7 @@ async fn mcp(
     } else {
         Ok((chosen.unwrap_or(default), role_given(&value).or(role), String::new(), None, None))
     };
-    let named = named.and_then(|n| if active { held(&hub, &who, &n.0).map(|_| n) } else { Ok(n) });
+    let named = named.and_then(|n| if active && ticket.is_none() { held(&hub, &who, &n.0).map(|_| n) } else { Ok(n) });
     let (agent, role, note, key, new_id) = match named {
         Ok(n) => n,
         Err(e) => return Json(crate::mcp::error_response(value.get("id").cloned().unwrap_or(Value::Null), -32000, &e)).into_response(),
@@ -689,7 +692,7 @@ async fn mcp(
             move |n| answered(&hub, &key, &id, n)
         };
         tokio::spawn(async move {
-            let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: true, stream: true, note: &note };
+            let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: true, stream: true, note: &note, delegate: false };
             let call = crate::mcp::handle(&hub, &c, value);
             tokio::pin!(call);
             let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
@@ -719,7 +722,7 @@ async fn mcp(
         });
         return sse(rx, done);
     }
-    let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: key.is_some(), stream: false, note: &note };
+    let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: key.is_some(), stream: false, note: &note, delegate: ticket.is_some() };
     let asks = requests(&value);
     match crate::mcp::handle(&hub, &c, value).await {
         Some(resp) => {

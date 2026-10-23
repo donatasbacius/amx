@@ -388,7 +388,8 @@ fn failure(r: &Review) -> (String, String) {
         let n = r.params.reviewers;
         let mix = if n >= 2 { ", claude and codex," } else { "" };
         let within = span(r.params.queue_secs);
-        (format!("no team within {within}"), format!("No team of {}{mix} joined within {within}.", plural(&n.to_string(), "reviewer")))
+        let short = r.failure.as_deref().and_then(|f| f.split_once(": ")).map(|(_, w)| format!(": {w}")).unwrap_or_default();
+        (format!("no team within {within}"), format!("No team of {}{mix} joined within {within}{short}.", plural(&n.to_string(), "reviewer")))
     } else if let Some(m) = r.missing.map(|m| m.as_str()) {
         let why = format!("No {m} reviewer accepted in time; every review needs both claude and codex. {} accepted.", names(&who));
         (format!("no {m} reviewer"), why)
@@ -1038,7 +1039,9 @@ fn waiting_for(who: Vec<&String>, to: &str) -> String {
 /// `can`: the viewer may cancel it while it runs.
 /// `locked`: a re-review has taken over this review's open findings.
 /// `q`: the relay's queue, to say whether a queued review's missing program has a reviewer idle.
-fn render_verdict(out: &mut String, r: &Review, q: Option<&Queue>, old: bool, can: bool, locked: bool, now: Ms) {
+/// `prs`: all reviews of its PR, oldest first.
+fn render_verdict(out: &mut String, r: &Review, prs: &[Review], q: Option<&Queue>, can: bool, locked: bool, now: Ms) {
+    let old = prs.last().is_some_and(|l| l.id != r.id);
     let (cls, label) = status(r, locked, can);
     let detail = match r.phase {
         Phase::Done => {
@@ -1064,10 +1067,11 @@ fn render_verdict(out: &mut String, r: &Review, q: Option<&Queue>, old: bool, ca
             dotted(&parts)
         }
         Phase::Failed => {
-            let again = match &r.parent {
+            let again = match (&r.parent, retried(r, prs)) {
+                (_, Some(c)) => format!("The hub retried it as {}.", c.id),
                 _ if r.broke_off() => "The author can request a re-review.".into(),
-                Some(p) => format!("The author can re-review it from {p}."),
-                None => "The author can request it again.".into(),
+                (Some(p), _) => format!("The author can re-review it from {p}."),
+                (None, _) => "The author can request it again.".into(),
             };
             let sent: Vec<&String> = r.slots.iter().filter(|s| s.submission.is_some()).map(|s| &s.agent).collect();
             let lost = if sent.is_empty() { String::new() } else { format!(" What {} submitted was discarded with it.", names(&sent)) };
@@ -1258,6 +1262,11 @@ fn gist(r: &Review, can: bool, locked: bool) -> String {
     }
 }
 
+/// The review the hub queued to finish `r`, of `prs`.
+fn retried<'a>(r: &Review, prs: &'a [Review]) -> Option<&'a Review> {
+    prs.iter().find(|x| x.retries > 0 && x.parent.as_deref() == Some(&r.id))
+}
+
 /// On an old review, one line naming the PR's latest review and, if that one hasn't finished, the last result.
 fn render_newer(out: &mut String, r: &Review, prs: &[Review], may: &dyn Fn(&Review) -> bool) {
     let Some(latest) = prs.last().filter(|l| l.id != r.id) else {
@@ -1329,6 +1338,12 @@ pub fn render_review_page(r: &Review, prs: &[Review], q: Option<&Queue>, now: Ms
         meta.push(format!("<code>{}</code>", esc(short_sha(h))));
     }
     meta.push(format!("requested {}", time_tag(r.created, now)));
+    if let Some(p) = r.parent.as_deref().filter(|_| r.retries > 0) {
+        meta.push(format!("retry of <a href=\"/r/{0}\">{0}</a>", esc(p)));
+    }
+    if let Some(c) = retried(r, prs) {
+        meta.push(format!("retried as <a href=\"/r/{0}\">{0}</a>", esc(&c.id)));
+    }
     let mut out = String::new();
     render_newer(&mut out, r, prs, may);
     let _ = write!(
@@ -1341,7 +1356,7 @@ pub fn render_review_page(r: &Review, prs: &[Review], q: Option<&Queue>, now: Ms
         meta = dotted(&meta),
     );
     let locked = rereview(prs, &r.id).is_some();
-    render_verdict(&mut out, r, q, prs.last().is_some_and(|l| l.id != r.id), can, locked, now);
+    render_verdict(&mut out, r, prs, q, can, locked, now);
     render_findings(&mut out, r, can && r.phase == Phase::Done && !locked);
     render_discussion(&mut out, r);
     if r.phase == Phase::Offering {
@@ -1477,7 +1492,7 @@ fn summary_json(r: &Review, f: &Finding) -> Value {
 
 /// A review's row in `/api/reviews`.
 pub fn list_json(r: &Review, now: Ms) -> Value {
-    json!({
+    let mut v = json!({
         "id": r.id,
         "pr": r.pr.url(),
         "repo": r.pr.short(),
@@ -1497,7 +1512,11 @@ pub fn list_json(r: &Review, now: Ms) -> Value {
         "reviewers": r.slots.iter().map(|s| &s.agent).collect::<Vec<_>>(),
         "findings": visible(r).count(),
         "path": format!("/r/{}", r.id),
-    })
+    });
+    if r.retries > 0 {
+        v["retries"] = json!(r.retries);
+    }
+    v
 }
 
 /// The whole review as JSON, with what the page hides before every reviewer has submitted left out.
@@ -1507,6 +1526,9 @@ pub fn review_json(r: &Review, rereviews: &[String], now: Ms, web: &str) -> Valu
         return v;
     };
     m.remove("next_finding");
+    for s in m.get_mut("slots").and_then(Value::as_array_mut).into_iter().flatten() {
+        s.as_object_mut().map(|s| s.remove("tickets"));
+    }
     m.insert("result".into(), json!(r.result_now(web)));
     if !r.revealed() {
         let shown: Vec<Value> = visible(r).filter_map(|f| serde_json::to_value(f).ok()).collect();

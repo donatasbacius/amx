@@ -157,7 +157,11 @@ impl Sim {
                     finding: f.to_string(),
                     vote: vote.into(),
                     severity: None,
-                    reason: (vote == "disagree").then(|| format!("{agent} thinks {f} is wrong")),
+                    reason: match vote {
+                        "disagree" => Some(format!("{agent} thinks {f} is wrong")),
+                        "agree" => Some(format!("{agent} checked {f}")),
+                        _ => None,
+                    },
                     duplicate_of: dup,
                 }
             })
@@ -499,7 +503,7 @@ fn no_reviewers_fails_back_to_author() {
     sim.advance(10);
     assert_eq!(sim.phase(&id), Phase::Failed);
     let failed = sim.events("alice-codex");
-    assert!(failed.contains("failed: no full team of 2 reviewer(s), claude and codex, accepted it within 2h00m."), "{failed}");
+    assert!(failed.contains("failed: no full team of 2 reviewer(s), claude and codex, accepted it within 2h00m: no claude reviewer was online.\nNEXT: you can try `request_review` again later."), "{failed}");
 }
 
 #[test]
@@ -1514,7 +1518,7 @@ fn the_open_cancel_row_tabs_in_the_order_it_reads() {
 }
 
 #[test]
-fn a_review_whose_reviewers_all_dropped_fails() {
+fn a_review_whose_reviewers_all_dropped_is_retried_by_the_hub() {
     let mut sim = setup(&["rev-a", "rev-b"]);
     let id = sim.request("alice-codex", 2);
     sim.accept("rev-a", &id);
@@ -1525,12 +1529,19 @@ fn a_review_whose_reviewers_all_dropped_fails() {
     sim.leave("rev-b");
     sim.advance(301);
     assert_eq!(sim.phase(&id), Phase::Failed);
-    let result = sim.events("alice-codex");
-    assert!(result.contains("failed: all reviewers dropped out") && !result.contains("APPROVE"), "{result}");
-    let page = amx::web::render_review(sim.s.review(&id).unwrap());
+    let r2 = sim.s.reviews.last().unwrap().clone();
+    assert_eq!((r2.parent.as_deref(), r2.retries, r2.phase, r2.slots.len()), (Some(id.as_str()), 1, Phase::Offering, 0), "both left, so the whole team goes through the queue");
+    let events = sim.events("alice-codex");
+    assert!(events.contains(&format!("[{0}] {id} lost all its reviewers; the hub queued {0} to finish it.\nNEXT: nothing to do; keep calling `wait`.", r2.id)), "{events}");
+    assert!(!events.contains("failed") && !events.contains("APPROVE"), "{events}");
+    let prs = sim.s.reviews.clone();
+    let page = amx::web::render_review_page(sim.s.review(&id).unwrap(), &prs, None, sim.now, &|_| false);
     assert!(page.contains("says blocker"), "the findings stay readable");
-    assert!(page.contains("All reviewers dropped out: rev-a and rev-b. The author can request a re-review. What rev-a and rev-b submitted was discarded with it."), "{page}");
+    assert!(page.contains(&format!("All reviewers dropped out: rev-a and rev-b. The hub retried it as {0}. What rev-a and rev-b submitted was discarded with it.", r2.id)), "{page}");
+    assert!(page.contains(&format!("retried as <a href=\"/r/{0}\">{0}</a>", r2.id)), "{page}");
     assert!(page.contains("<span class=\"badge s-closed\">not voted on</span>") && !page.contains("undecided"), "{page}");
+    let page = amx::web::render_review_page(&r2, &prs, None, sim.now, &|_| false);
+    assert!(page.contains(&format!("retry of <a href=\"/r/{id}\">{id}</a>")), "{page}");
 }
 
 #[test]
@@ -1944,7 +1955,7 @@ fn a_failed_rereview_points_back_to_the_review_it_follows() {
     let ev = sim.events("alice-codex");
     assert!(ev.contains(&format!("call `request_rereview` with review_id \"{id}\"")), "{ev}");
     let page = amx::web::render_review(sim.s.review(&id2).unwrap());
-    assert!(page.contains(&format!("joined within 2 hours. The author can re-review it from {id}.</p>")), "{page}");
+    assert!(page.contains(&format!("joined within 2 hours: no claude reviewer was online. The author can re-review it from {id}.</p>")), "{page}");
 }
 
 fn reasoned(finding: &str, vote: &str, reason: &str) -> VoteIn {
@@ -2615,7 +2626,7 @@ fn a_one_reviewer_review_from_an_old_state_file_needs_two_until_it_starts_and_it
 }
 
 #[test]
-fn a_review_left_without_codex_fails_and_a_rereview_runs_it_again() {
+fn a_review_left_without_codex_is_retried_by_the_hub() {
     let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex), ("cx-b", Model::Codex)]);
     let id = sim.request("alice-codex", 2);
     sim.accept("cl-a", &id);
@@ -2632,20 +2643,118 @@ fn a_review_left_without_codex_fails_and_a_rereview_runs_it_again() {
     let r2 = sim.s.review(&id2).unwrap();
     assert_eq!((r2.phase, r2.result.is_none()), (Phase::Failed, true), "no verdict from claude alone");
     assert_eq!(r2.failure.as_deref(), Some("the only codex reviewer dropped out"));
-    let failed = sim.events("alice-codex");
-    assert!(failed.contains(&format!("NEXT: call `request_rereview` with review_id \"{id2}\"")), "{failed}");
-    let page = amx::web::render_review(sim.s.review(&id2).unwrap());
-    assert!(page.contains("No codex reviewer was left to finish it, so it gave no verdict. Dropped: cx-a."), "{page}");
+    let id3 = sim.s.reviews.last().unwrap().id.clone();
+    let events = sim.events("alice-codex");
+    assert_eq!(events, format!("[{id3}] {id2} lost its codex reviewer; the hub queued {id3} to finish it.\nNEXT: nothing to do; keep calling `wait`."));
+    let next = sim.task("alice-codex");
+    assert!(next.starts_with(&format!("{id3}: your review of rust-lang/rust#1 is queued")), "{next}");
 
-    let id3 = sim.s.rereview("alice-codex", &id2, SHA2, "", None, sim.now).unwrap();
     let r3 = sim.s.review(&id3).unwrap();
-    assert_eq!((r3.phase, r3.parent.as_deref(), r3.since_sha.as_deref()), (Phase::Offering, Some(id2.as_str()), Some(SHA)));
+    assert_eq!((r3.phase, r3.parent.as_deref(), r3.retries, r3.iteration), (Phase::Offering, Some(id2.as_str()), 1, 2));
+    assert_eq!((r3.head_sha.as_deref(), r3.since_sha.as_deref(), r3.note.as_str()), (Some(SHA2), Some(SHA), "invalidate on write"), "the same head, re-checked since the same commit");
     assert_eq!(r3.findings.iter().map(|f| f.origin.clone().unwrap()).collect::<Vec<_>>(), [format!("{id}/F1")], "what the failed review was re-checking");
-    assert_eq!(r3.slots.iter().map(|s| s.agent.as_str()).collect::<Vec<_>>(), ["cl-a"], "the claude reviewer comes back; the codex seat goes through the queue");
-    assert!(sim.events("cx-b").contains(&format!("[{id3}]")));
+    assert_eq!(r3.slots.iter().map(|s| s.agent.as_str()).collect::<Vec<_>>(), ["cl-a"], "the claude reviewer stays; the codex seat goes through the queue");
+    assert!(sim.events("cl-a").contains(&format!("[{id3}] You are in its team again, as you reviewed {id2}: waiting for 1 more reviewer(s) (a codex one).")));
+    let offer = sim.events("cx-b");
+    assert!(offer.contains(&format!("[{id3}] Review offer")) && offer.contains(&format!("It finishes {id2}, which lost reviewers.")), "{offer}");
+    assert_eq!(sim.s.rereview("alice-codex", &id2, SHA2, "", None, sim.now).unwrap(), id3, "asking for it returns the retry");
+    let status = amx::text::status(sim.s.review(&id3).unwrap(), "alice-codex", sim.now, "");
+    assert!(status.contains(&format!(", retry of {id2}")), "{status}");
+
     sim.accept("cx-b", &id3);
     assert_eq!(sim.phase(&id3), Phase::Reviewing);
-    assert_eq!(sim.s.rereview("alice-codex", &id2, SHA2, "", None, sim.now).unwrap(), id3, "asking again returns it");
+    sim.submit("cl-a", &id3, &[]);
+    sim.submit("cx-b", &id3, &[]);
+    sim.vote("cl-a", &id3, &[("C1", "disagree")]);
+    sim.vote("cx-b", &id3, &[("C1", "disagree")]);
+    assert_eq!(sim.verdict(&id3), Verdict::Approve);
+    let result = sim.events("alice-codex");
+    assert!(result.contains(&format!("[{id3}] Review result for {PR}: APPROVE")), "{result}");
+}
+
+/// A review whose only codex reviewer, `cx`, takes it and never submits, so it fails.
+fn lose_codex(sim: &mut Sim, id: &str, cx: &str) {
+    sim.accept(cx, id);
+    sim.submit("cl-a", id, &[]);
+    sim.advance(Timing::default().review_secs);
+    assert_eq!(sim.s.review(id).unwrap().failure.as_deref(), Some("the only codex reviewer dropped out"));
+}
+
+#[test]
+fn the_hub_retries_a_line_of_reviews_twice() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    let mut req = titled("https://github.com/example-org/app/pull/7");
+    req.head_sha = Some(SHA.into());
+    let id = sim.s.request_review("alice-codex", req, sim.now).unwrap();
+    sim.accept("cl-a", &id);
+    lose_codex(&mut sim, &id, "cx-a");
+    let mut ids = vec![id];
+    for n in 1..=2 {
+        let r = sim.s.reviews.last().unwrap().clone();
+        assert_eq!((r.retries, r.parent.as_ref(), r.head_sha.as_deref()), (n, ids.last(), Some(SHA)));
+        assert_eq!(r.slots.iter().map(|s| s.agent.as_str()).collect::<Vec<_>>(), ["cl-a"]);
+        lose_codex(&mut sim, &r.id, "cx-a");
+        ids.push(r.id);
+    }
+    assert_eq!(sim.s.reviews.len(), 3, "no third retry");
+    let events = sim.events("alice-codex");
+    let last = ids.last().unwrap();
+    assert!(events.ends_with(&format!("[{last}] Review of https://github.com/example-org/app/pull/7 failed: the only codex reviewer dropped out.\nNEXT: call `request_rereview` with review_id \"{last}\" and new_head_sha (the same commit if nothing changed).")), "{events}");
+    assert_eq!(events.matches("the hub queued").count(), 2, "{events}");
+    let id4 = sim.s.rereview("alice-codex", last, SHA, "", None, sim.now).unwrap();
+    assert_eq!(sim.s.review(&id4).unwrap().retries, 0, "one the author asks for starts a new count");
+}
+
+#[test]
+fn no_retry_once_the_author_has_asked_for_another_review_of_the_pr() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    sim.join("alice-claude", "alice@example.com", Role::Author);
+    let pr = "https://github.com/example-org/app/pull/8";
+    let id = sim.s.request_review("alice-codex", titled(pr), sim.now).unwrap();
+    sim.accept("cl-a", &id);
+    let mut req = titled(pr);
+    req.head_sha = Some(SHA2.into());
+    let newer = sim.s.request_review("alice-claude", req, sim.now).unwrap();
+    sim.s.cancel(&newer, "a human", sim.now).unwrap();
+    lose_codex(&mut sim, &id, "cx-a");
+    assert_eq!(sim.s.reviews.len(), 2, "a newer head was asked for");
+    let events = sim.events("alice-codex");
+    assert!(events.contains(&format!("[{id}] Review of {pr} failed: the only codex reviewer dropped out.\nNEXT: call `request_rereview` with review_id \"{id}\"")), "{events}");
+
+    let id = sim.s.request_review("alice-codex", titled(pr), sim.now).unwrap();
+    sim.accept("cl-a", &id);
+    let other = sim.s.request_review("alice-claude", titled(pr), sim.now).unwrap();
+    lose_codex(&mut sim, &id, "cx-a");
+    assert_eq!(sim.s.reviews.last().unwrap().id, other, "{other} of the same PR and login is still queued");
+    assert!(sim.events("alice-codex").contains(&format!("[{id}] Review of {pr} failed")));
+}
+
+#[test]
+fn no_retry_of_a_review_a_human_cancelled_after_a_drop() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex), ("cl-b", Model::Claude)]);
+    let id = sim.request("alice-codex", 3);
+    for a in ["cl-a", "cx-a", "cl-b"] {
+        sim.accept(a, &id);
+    }
+    sim.leave("cl-b");
+    sim.advance(Timing::default().drop_after_secs);
+    assert!(sim.s.review(&id).unwrap().slot("cl-b").unwrap().dropped.is_some());
+    sim.s.cancel(&id, "a human", sim.now).unwrap();
+    sim.s.tick(sim.now);
+    assert_eq!(sim.s.reviews.len(), 1);
+    assert!(sim.events("alice-codex").contains(&format!("[{id}] a human (a human) cancelled the review")));
+}
+
+#[test]
+fn a_review_that_lost_reviewers_before_an_upgrade_is_not_retried() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("cl-a", &id);
+    lose_codex(&mut sim, &id, "cx-a");
+    sim.s.reviews.retain(|r| r.retries == 0);
+    sim.s = reload(&sim.s, sim.now, sim.now);
+    sim.advance(60);
+    assert_eq!(sim.s.reviews.len(), 1, "a failure an older relay left stays failed");
 }
 
 #[test]
@@ -2972,7 +3081,7 @@ fn a_queued_review_near_its_cap_says_when_it_fails() {
     sim.advance(6 * 60);
     assert_eq!(sim.phase(&id), Phase::Failed);
     let page = amx::web::render_review(sim.s.review(&id).unwrap());
-    assert!(page.contains("No team of 2 reviewers, claude and codex, joined within 2 hours. The author can request it again."), "{page}");
+    assert!(page.contains("No team of 2 reviewers, claude and codex, joined within 2 hours: no codex reviewer was online. The author can request it again."), "{page}");
     let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
     assert!(index.contains("<span>no team within 2 hours ·</span>"), "{index}");
 }
@@ -3597,7 +3706,7 @@ fn an_empty_submission_says_what_was_checked() {
     sim.accept("rev-a", &id);
     sim.accept("rev-b", &id);
     let task = sim.task("rev-a");
-    assert!(task.contains("`checked`") && task.contains("read the diff and the code it touches"), "{task}");
+    assert!(task.contains("with `checked`: one line on what you read in full and traced"), "{task}");
     let empty = |checked: &str| SubmitIn { head_sha: SHA.into(), verdict: "approve".into(), summary: String::new(), checked: checked.into(), findings: vec![] };
     let err = sim.s.submit("rev-a", &id, empty(" \n "), sim.now).unwrap_err().to_string();
     assert!(err.contains("`checked` is required"), "{err}");
@@ -3813,4 +3922,114 @@ fn the_transcript_shows_when_each_reviewer_got_its_task() {
     assert_eq!(r.slot("rev-b").unwrap().took(), Some(0), "counted from the same moment");
     let page = amx::web::render_review(r);
     assert!(page.contains("<b>rev-b</b> got the review task"), "{page}");
+}
+
+#[test]
+fn every_task_goes_to_a_fresh_sub_agent_and_a_new_review_starts_from_scratch() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    let fresh = "in a fresh sub-agent (Claude Code: the Agent tool, general-purpose, not a fork; Codex: spawn_agent with fork_turns \"none\") with no memory of earlier reviews";
+    let scratch = "This is a new, independent review: read the full diff from scratch, even if you have seen this PR or approved it before";
+    let task = sim.task("rev-a");
+    assert!(task.contains(&format!("You must do this review {fresh}")) && task.contains("It calls `submit_findings` itself"), "{task}");
+    assert!(task.contains("pass it the whole text of this task and nothing of your own") && task.contains("If you are that sub-agent, or your client has none, do it yourself, from scratch."), "{task}");
+    assert!(task.contains(scratch) && task.contains("How to review, correctness first:") && !task.contains("Focus on what changed"), "{task}");
+    assert!(task.contains("gh api -H 'Accept: application/vnd.github.raw' 'repos/rust-lang/rust/contents/<path>?ref=<head_sha>'"), "{task}");
+    sim.submit("rev-a", &id, &[("major", "cache never invalidated")]);
+    sim.submit("rev-b", &id, &[("minor", "typo")]);
+    let vote = sim.task("rev-b");
+    assert!(vote.contains(&format!("You must do this vote {fresh}")) && vote.contains("It calls `vote` itself"), "{vote}");
+    sim.vote("rev-a", &id, &[("F2", "disagree")]);
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    let reply = sim.events("rev-b");
+    assert!(reply.contains("your findings F2 drew objections") && reply.contains(&format!("You must do this reply {fresh}")) && reply.contains("It calls `amend_finding`, `withdraw_finding` or `say` itself"), "{reply}");
+    sim.skip_replies();
+    sim.vote("rev-a", &id, &[("F2", "disagree")]);
+    sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
+    let task = sim.task("rev-a");
+    assert!(task.contains("Focus on what changed since 0123456") && !task.contains(scratch) && task.contains(&format!("You must do this review {fresh}")), "{task}");
+    let s = amx::text::instructions(Some(Role::Reviewer));
+    assert!(s.contains("Each review is a new one: you must do its review, vote and reply tasks in a fresh sub-agent as each task says, never from memory of an earlier review"), "{s}");
+    let tools = amx::mcp::tools().to_string();
+    assert!(tools.contains("Review from scratch: read the whole diff and the files it touches at the head") && tools.contains("agree and disagree each need a short reason"), "{tools}");
+}
+
+#[test]
+fn an_agree_vote_says_what_was_checked() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "cache never invalidated")]);
+    sim.submit("rev-b", &id, &[]);
+    let next = sim.task("rev-b").lines().skip_while(|l| !l.starts_with("NEXT:")).collect::<String>();
+    assert!(next.contains("{finding: \"F1\", vote: \"agree\", reason: \"what you checked\"} if the problem is real"), "{next}");
+    assert!(next.contains("{finding: \"F1\", vote: \"disagree\", reason: \"why it is wrong\"} if it is not") && !next.contains("votes like"), "neither reads as the default: {next}");
+    let bare = VoteIn { finding: "F1".into(), vote: "agree".into(), severity: None, reason: Some("  ".into()), duplicate_of: None };
+    let err = sim.s.vote("rev-b", &id, vec![bare], sim.now).unwrap_err().to_string();
+    assert!(err.contains("agreeing with F1 needs a reason"), "{err}");
+    sim.s.vote("rev-b", &id, vec![reasoned("F1", "agree", "Traced `put`: nothing clears it.")], sim.now).unwrap();
+    assert_eq!(sim.status(&id, "F1"), Status::Confirmed);
+}
+
+#[test]
+fn task_tickets_name_the_slot_survive_a_restart_and_end_with_the_task() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    let ticket = sim.s.review(&id).unwrap().ticket("rev-b", "review").unwrap().to_string();
+    let task = sim.task("rev-b");
+    assert!(task.contains(&format!("It calls `submit_findings` itself with ticket \"{ticket}\", which makes its calls count as yours, and never calls `wait`, `hello` or `online`")), "{task}");
+    assert!(task.contains(&format!("call `submit_findings` with review_id \"{id}\", ticket \"{ticket}\", head_sha")), "{task}");
+    assert_ne!(sim.s.review(&id).unwrap().ticket("rev-a", "review"), Some(ticket.as_str()));
+    let login = sim.s.agents.get("rev-b").unwrap().login.clone();
+    sim.s = reload(&sim.s, sim.now, sim.now + 60_000);
+    sim.now += 60_000;
+    assert_eq!(sim.s.ticket_holder(&ticket, &login.to_uppercase()).unwrap(), "rev-b", "it survives a restart; logins compare ignoring case");
+    assert!(sim.s.ticket_holder(&ticket, "mallory@example.com").unwrap_err().to_string().contains("another Tailscale login's"));
+    sim.submit("rev-b", &id, &[("major", "cache never invalidated")]);
+    assert!(sim.s.ticket_holder(&ticket, &login).unwrap_err().to_string().contains("its task is done"));
+    sim.submit("rev-a", &id, &[("minor", "typo")]);
+    let vote = sim.s.review(&id).unwrap().ticket("rev-a", "vote1").unwrap().to_string();
+    assert!(sim.task("rev-a").contains(&format!("call `vote` with review_id \"{id}\", ticket \"{vote}\" and one vote per finding")));
+    sim.vote("rev-a", &id, &[("F1", "disagree")]);
+    sim.vote("rev-b", &id, &[("F2", "agree")]);
+    let reply = sim.s.review(&id).unwrap().ticket("rev-b", "reply2").unwrap().to_string();
+    assert!(sim.events("rev-b").contains(&format!("reply within 1m30s, with review_id \"{id}\", ticket \"{reply}\": `amend_finding`")));
+    sim.leave("rev-b");
+    sim.advance(Timing::default().drop_after_secs + 10);
+    assert!(sim.s.ticket_holder(&reply, &login).is_err(), "a dropped reviewer's tickets end with its slot");
+}
+
+#[test]
+fn the_api_lists_a_retry_with_its_count() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("cl-a", &id);
+    lose_codex(&mut sim, &id, "cx-a");
+    let retry = sim.s.reviews.last().unwrap();
+    assert_eq!(amx::web::list_json(retry, sim.now)["retries"], 1);
+    assert!(amx::web::list_json(sim.s.review(&id).unwrap(), sim.now).get("retries").is_none());
+}
+
+#[test]
+fn a_restart_freezes_deadlines_so_reviewers_have_their_time_when_they_reconnect() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("cl-a", &id);
+    sim.accept("cx-a", &id);
+    sim.advance(Timing::default().review_secs - 60);
+    let left = sim.s.review(&id).unwrap().deadline_left(sim.now);
+    let down = 3600 * 1000;
+    sim.s = reload(&sim.s, sim.now, sim.now + down);
+    sim.now += down;
+    sim.s.tick(sim.now);
+    assert_eq!((sim.phase(&id), sim.s.review(&id).unwrap().deadline_left(sim.now)), (Phase::Reviewing, left), "an hour down takes none of its time");
+    sim.advance(30);
+    sim.submit("cl-a", &id, &[]);
+    sim.submit("cx-a", &id, &[]);
+    assert_eq!(sim.phase(&id), Phase::Done);
 }

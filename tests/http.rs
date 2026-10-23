@@ -226,7 +226,9 @@ async fn review_over_mcp_with_long_polls() {
     .await;
     assert!(sub.contains("Submitted 1 finding"), "{sub}");
     ok_tool(&author, "owner-rev", "submit_findings", json!({"review_id":"r1","head_sha":"0123456789abcdef","verdict":"approve","checked": "src/lib.rs", "findings":[]})).await;
-    ok_tool(&author, "owner-rev", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree"}]})).await;
+    let (err, bare) = tool(&author, "owner-rev", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree"}]})).await;
+    assert!(err && bare.contains("agreeing with F1 needs a reason (say briefly what you checked in the code); nothing was recorded; resend all your votes, each with a reason"), "{bare}");
+    ok_tool(&author, "owner-rev", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree","reason":"checked"}]})).await;
     let result = ok_tool(&author, "owner-codex", "wait", json!({"timeout_seconds": 5})).await;
     assert!(result.contains("CHANGES REQUESTED") && result.contains("Short title"), "{result}");
 
@@ -275,14 +277,14 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     assert!(v["deadline_left_ms"].as_u64().unwrap() > 0);
 
     ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","checked": "src/lib.rs", "findings":[]})).await;
-    ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree","severity":"major"}]})).await;
+    ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree","severity":"major","reason":"checked"}]})).await;
     let v: Value = get("/api/reviews/r1").await.unwrap().json().await.unwrap();
     assert_eq!(v["phase"], "done");
     assert_eq!(v["verdict"], "changes_requested");
     assert_eq!((v["findings"][0]["title"].as_str(), v["findings"][0]["text"].as_str()), (Some("SECRET title"), Some("SECRET until revealed\nsecond line")));
     assert_eq!(v["findings"][0]["votes"]["rev-b"]["choice"], "Agree");
     assert_eq!(v["findings"][0]["votes"]["rev-b"]["severity"], "major", "the severity the vote backs");
-    assert!(v["log"].as_array().unwrap().iter().any(|e| e["text"] == "F1: agree (major)"), "{}", v["log"]);
+    assert!(v["log"].as_array().unwrap().iter().any(|e| e["text"] == "F1: agree (major) — checked"), "{}", v["log"]);
     assert_eq!(v["summary"][0], json!({"id":"F1","title":"SECRET title","severity":"major","severity_split":null,"by":"rev-a","origin":null,"outcome":"confirmed","agree":2,"disagree":0}));
     assert!(v["result"]["text"].as_str().unwrap().contains("CHANGES REQUESTED"));
     assert!(v["log"].as_array().unwrap().iter().any(|e| e["kind"] == "result"));
@@ -523,12 +525,12 @@ async fn owed_tasks_are_given_in_full_once_per_result() {
     assert!(again.contains("You must vote on: F3.") && again.contains("rename x"), "a new session gets the task in full: {again}");
 
     ok_tool(&base, "rev-a", "withdraw_finding", json!({"review_id":"r1","finding":"F2","reason":"fixed upstream"})).await;
-    let voted = ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree"},{"finding":"F2","vote":"agree"}]})).await;
+    let voted = ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree","reason":"checked"},{"finding":"F2","vote":"agree","reason":"checked"}]})).await;
     assert!(voted.contains("Recorded 1 vote(s) on r1. Ignored your votes on F2: withdrawn by their authors."), "{voted}");
 
     let quiet = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 1})).await;
     assert!(quiet.starts_with("No new events.") && quiet.lines().count() == 3, "progress doesn't wake the author: {quiet}");
-    ok_tool(&base, "rev-a", "vote", json!({"review_id":"r1","votes":[{"finding":"F3","vote":"agree"}]})).await;
+    ok_tool(&base, "rev-a", "vote", json!({"review_id":"r1","votes":[{"finding":"F3","vote":"agree","reason":"checked"}]})).await;
     let result = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 5})).await;
     assert!(result.starts_with("[r1] Review result") && !result.contains("===") && !result.contains("nothing pending"), "{result}");
     let finished = ok_tool(&base, "rev-b", "wait", json!({"timeout_seconds": 1, "progress": true})).await;
@@ -1225,5 +1227,64 @@ async fn a_repeated_rereview_says_who_asked_and_gets_the_result() {
     assert!(ok_tool(&base, "author", "request_rereview", again.clone()).await.starts_with("Re-review r2 queued"));
     let other = ok_tool(&base, "author-2", "request_rereview", again).await;
     assert!(other.starts_with("author already requested this re-review as r2; it is not queued twice, and its result goes to author."), "{other}");
+    relay.running.stop().await;
+}
+
+/// The ticket a task's text gives its sub-agent.
+fn ticket_in(task: &str) -> String {
+    let at = task.find("ticket \"").expect("a ticket") + 8;
+    task[at..at + 32].to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sub_agent_in_its_own_session_acts_for_its_reviewer_with_the_tasks_ticket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let relay = start(Some(whois_ok(tmp.path())), vec![]).await;
+    let (local, tailnet) = (relay.local.clone(), relay.tailnet.clone());
+    let names = || relay.running.hub.read(|s, _| s.agents.all().map(|a| a.name.clone()).collect::<Vec<_>>());
+    ok_tool(&local, "owner-codex", "hello", json!({"role":"reviewer","model":"codex"})).await;
+    let (parent, _) = initialize(&tailnet, "").await;
+    let hello = text_of(&session_rpc(&tailnet, &parent, call(1, "hello", json!({"role":"reviewer","model":"claude"})), false).await);
+    let name = hello.split('`').nth(1).unwrap().to_string();
+    ok_tool(&local, "owner-author", "request_review", json!({"pr_url": "https://github.com/example-org/app/pull/5", "title": "Add a cache", "count": 2})).await;
+    ok_tool(&local, "owner-codex", "accept_review", json!({"review_id":"r1"})).await;
+    session_rpc(&tailnet, &parent, call(2, "accept_review", json!({"review_id":"r1"})), false).await;
+    let task = text_of(&session_rpc(&tailnet, &parent, call(3, "wait", json!({"timeout_seconds": 1})), false).await);
+    assert!(task.contains("never calls `wait`, `hello` or `online`") && task.contains(&format!("review_id \"r1\", ticket \"{}\"", ticket_in(&task))), "{task}");
+    let review = ticket_in(&task);
+    let before = names();
+    let submit = |ticket: Option<&str>| {
+        let mut a = json!({"review_id":"r1","head_sha":"0123456789abcdef","verdict":"approve","summary":"ok","checked":"src/lib.rs","findings":[]});
+        if let Some(t) = ticket {
+            a["ticket"] = json!(t);
+        }
+        call(4, "submit_findings", a)
+    };
+
+    let (other, _) = initialize(&local, "").await;
+    let refused = session_rpc(&local, &other, submit(Some(&review)), false).await;
+    assert!(refused["error"]["message"].as_str().unwrap().contains("that ticket is another Tailscale login's"), "{refused}");
+    let (sub, _) = initialize(&tailnet, "").await;
+    let done = text_of(&session_rpc(&tailnet, &sub, submit(Some(&review)), false).await);
+    assert!(done.starts_with("Submitted 0 finding(s) for r1.") && done.contains("don't call `wait`"), "{done}");
+    let slots = relay.running.hub.read(|s, _| s.review("r1").unwrap().slots.iter().map(|x| (x.agent.clone(), x.submission.is_some())).collect::<Vec<_>>());
+    assert!(slots.contains(&(name.clone(), true)), "{slots:?}");
+    assert_eq!(names(), before, "no agent is registered for the sub-agent's session");
+    let stale = session_rpc(&tailnet, &sub, submit(Some(&review)), false).await;
+    assert!(stale["error"]["message"].as_str().unwrap().contains("that ticket isn't valid now"), "{stale}");
+
+    ok_tool(&local, "owner-codex", "submit_findings", json!({"review_id":"r1","head_sha":"0123456789abcdef","verdict":"changes_requested","summary":"ok",
+        "findings":[{"severity":"major","url":"https://github.com/example-org/app/blob/0123456/src/a.rs#L3","title":"Stale entries","text":"Never cleared."}]})).await;
+    let task = text_of(&session_rpc(&tailnet, &parent, call(5, "wait", json!({"timeout_seconds": 1})), false).await);
+    let vote = ticket_in(&task);
+    assert_ne!(vote, review);
+    let (stray, _) = initialize(&tailnet, "").await;
+    let bare = text_of(&session_rpc(&tailnet, &stray, call(6, "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree","reason":"checked"}]})), false).await);
+    assert!(bare.contains("you are not an active reviewer on r1"), "without the ticket it is a new agent: {bare}");
+    let voted = text_of(&session_rpc(&tailnet, &sub, call(7, "vote", json!({"review_id":"r1","ticket": vote,"votes":[{"finding":"F1","vote":"agree","reason":"Traced `put`: nothing clears it."}]})), false).await);
+    assert!(voted.starts_with("Recorded 1 vote(s) on r1."), "{voted}");
+    assert_eq!(relay.running.hub.read(|s, _| s.review("r1").unwrap().verdict()), Some(amx::relay::Verdict::ChangesRequested));
+    let json = reqwest::get(format!("{local}/api/reviews/r1")).await.unwrap().text().await.unwrap();
+    assert!(!json.contains(&review) && !json.contains(&vote) && !json.contains("tickets"), "tickets are never shown");
     relay.running.stop().await;
 }

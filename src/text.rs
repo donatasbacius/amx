@@ -87,8 +87,12 @@ pub fn offer(r: &Review) -> String {
         r.author,
         r.params.reviewers
     );
-    if r.parent.is_some() {
-        s.push_str(" This is a re-review after fixes.");
+    match &r.parent {
+        Some(p) if r.retries > 0 => {
+            let _ = write!(s, " It finishes {p}, which lost reviewers.");
+        }
+        Some(_) => s.push_str(" This is a re-review after fixes."),
+        None => {}
     }
     if !r.note.is_empty() {
         let _ = write!(s, "\nNote from the author:\n{}", quote(&r.note));
@@ -102,8 +106,9 @@ pub fn offer(r: &Review) -> String {
     s
 }
 
-pub fn review_task(r: &Review, left: &str) -> String {
+pub fn review_task(r: &Review, agent: &str, left: &str) -> String {
     let url = r.pr.url();
+    let ticket = r.ticket(agent, "review");
     let mut s = format!("Review {url} (requested by {}", r.author);
     if let Some(h) = &r.head_sha {
         let _ = write!(s, ", head {}", short_sha(h));
@@ -112,9 +117,11 @@ pub fn review_task(r: &Review, left: &str) -> String {
     if !r.note.is_empty() {
         let _ = write!(s, "Author's note:\n{}", quote(&r.note));
     }
+    s.push_str(&fresh_context("review", "`submit_findings`", ticket));
     let _ = write!(
         s,
-        "NEXT: review the PR read-only, on your own. {UNTRUSTED}\n    gh pr view {url} --json title,body,headRefOid,files\n    gh pr diff {url}\n"
+        "NEXT: review the PR read-only, on your own. {UNTRUSTED}\n    gh pr view {url} --json title,body,headRefOid,files\n    gh pr diff {url}\n    gh api -H 'Accept: application/vnd.github.raw' 'repos/{}/{}/contents/<path>?ref=<head_sha>'   (a whole file at the head)\n",
+        r.pr.owner, r.pr.repo
     );
     if let Some(since) = &r.since_sha {
         let _ = write!(
@@ -139,17 +146,47 @@ pub fn review_task(r: &Review, left: &str) -> String {
             }
         }
         s.push_str("Report only NEW problems in submit_findings.\n");
+    } else {
+        s.push_str("This is a new, independent review: read the full diff from scratch, even if you have seen this PR or approved it before; earlier reviews don't count.\n");
     }
+    s.push_str(RIGOUR);
     let _ = write!(
         s,
-        "Never write to GitHub (no comments, reviews, pushes). Then call `submit_findings` with review_id \"{}\", head_sha (the headRefOid you reviewed), verdict (approve | changes_requested), a one-sentence summary, and findings: \
-         [{{severity: blocking|major|minor|nit, url: \"https://github.com/{}/{}/blob/<head_sha>/<path>#L<line>\", title, text}}] (an empty list if you found nothing, with `checked`: one line on the files or areas you read). \
+        "Never write to GitHub (no comments, reviews, pushes). Then call `submit_findings` with review_id \"{}\"{}, head_sha (the headRefOid you reviewed), verdict (approve | changes_requested), a one-sentence summary, and findings: \
+         [{{severity: blocking|major|minor|nit, url: \"https://github.com/{}/{}/blob/<head_sha>/<path>#L<line>\", title, text}}] (an empty list if you found nothing, with `checked`: one line on what you read in full and traced). \
          Severity: blocking = must not merge (bug, data loss, security hole); major = should be fixed before merge; minor = small but real, must be fixed before merge; nit = style or taste, never blocks. Blocking, major and minor all hold back approval. \
-         Be terse, but read the diff and the code it touches before you submit; title = what's wrong in a few words (at most 80 characters); text = one to three sentences: where, why it matters, the fix; no preamble, don't restate the code or the title. {MARKDOWN} \
+         Be terse; title = what's wrong in a few words (at most 80 characters); text = one to three sentences: where, why it matters, the fix; no preamble, don't restate the code or the title. {MARKDOWN} \
          Other reviewers' findings stay hidden until everyone has submitted. Deadline: {left}.",
-        r.id, r.pr.owner, r.pr.repo
+        r.id,
+        ticket_arg(ticket),
+        r.pr.owner,
+        r.pr.repo
     );
     s
+}
+
+/// How to review, so a quick pass that finds nothing is not mistaken for a review.
+const RIGOUR: &str = "How to review, correctness first:\n\
+    1. Spec: does the change do what the title, body and the repo's docs (README, CLAUDE.md, AGENTS.md) say, and do changed docs match the code?\n\
+    2. Correctness: for each changed function, read the whole file at the head and trace its callers and what it changes: saved or restored state, older data, errors, limits, restarts, concurrency, every branch of a match. Look for what the change breaks elsewhere, not only what it adds.\n\
+    3. Tests: is each new rule tested, including the cases above?\n\
+    Report every real problem you can point to with a line link, however small, and nothing you can't; no praise. Finding nothing is a fine result only after all of this.\n";
+
+/// Tells the agent looping on `wait` to give a task to a fresh sub-agent, so a long-lived
+/// session's memory of earlier reviews can't stand in for reading the code.
+fn fresh_context(what: &str, tool: &str, ticket: Option<&str>) -> String {
+    let with = match ticket {
+        Some(t) => format!(" with ticket \"{t}\", which makes its calls count as yours, and never calls `wait`, `hello` or `online`"),
+        None => String::new(),
+    };
+    format!(
+        "You must do this {what} in a fresh sub-agent (Claude Code: the Agent tool, general-purpose, not a fork; Codex: spawn_agent with fork_turns \"none\") with no memory of earlier reviews: pass it the whole text of this task and nothing of your own. It calls {tool} itself{with}; you wait for it, then call `wait` again. If you are that sub-agent, or your client has none, do it yourself, from scratch.\n"
+    )
+}
+
+/// `, ticket "…"` for a tool call, if the task has one.
+fn ticket_arg(ticket: Option<&str>) -> String {
+    ticket.map(|t| format!(", ticket \"{t}\"")).unwrap_or_default()
 }
 
 /// How agents' text is shown to people.
@@ -260,8 +297,9 @@ pub fn round_findings(r: &Review, owed: &[&Finding]) -> String {
     s
 }
 
-pub fn vote_task(r: &Review, owed: &[&Finding], left: &str) -> String {
+pub fn vote_task(r: &Review, agent: &str, owed: &[&Finding], left: &str) -> String {
     let round = r.round();
+    let ticket = r.ticket(agent, &format!("vote{round}"));
     let ids: Vec<&str> = owed.iter().map(|f| f.id.as_str()).collect();
     let mut s = if round == 1 {
         format!(
@@ -273,6 +311,7 @@ pub fn vote_task(r: &Review, owed: &[&Finding], left: &str) -> String {
             "Cross-examination round {round}: these findings drew disagreement on whether they are real or on their severity. Read the reasons and any replies, re-check the code, and vote again (you may change your mind).\n"
         )
     };
+    s.push_str(&fresh_context("vote", "`vote`", ticket));
     let _ = writeln!(s, "You must vote on: {}.", ids.join(", "));
     if owed.iter().any(|f| f.by.is_none()) {
         s.push_str("Carried-over findings (C…): agree = still present at the new head, disagree = fixed.\n");
@@ -284,10 +323,13 @@ pub fn vote_task(r: &Review, owed: &[&Finding], left: &str) -> String {
     s.push_str(&round_findings(r, owed));
     let _ = write!(
         s,
-        "\nNEXT: call `vote` with review_id \"{}\" and votes like [{{finding: \"{}\", vote: \"agree\"}}]. Other forms: {{vote: \"agree\", severity: \"minor\", reason: \"real, but overstated\"}}, {{vote: \"disagree\", reason: \"why it is wrong\"}}, {{vote: \"duplicate\", duplicate_of: \"<finding id>\"}}. \
-         Disagree only when the problem is not real (with a concrete reason); if it is real but its severity is wrong, agree and give the severity you think is fair. Use `say` to discuss briefly with the other reviewers. Round ends in {left}; reviewers who have not voted by then are dropped.",
+        "\nNEXT: open the cited lines and the code around them for each finding, then call `vote` with review_id \"{}\"{} and one vote per finding, each with a short reason: \
+         {{finding: \"{f}\", vote: \"agree\", reason: \"what you checked\"}} if the problem is real (add severity: \"minor\" or another if it is over- or understated), \
+         {{finding: \"{f}\", vote: \"disagree\", reason: \"why it is wrong\"}} if it is not, or {{finding: \"{f}\", vote: \"duplicate\", duplicate_of: \"<finding id>\"}}. \
+         Use `say` to discuss briefly with the other reviewers. Round ends in {left}; reviewers who have not voted by then are dropped.",
         r.id,
-        ids.first().copied().unwrap_or("F1")
+        ticket_arg(ticket),
+        f = ids.first().copied().unwrap_or("F1")
     );
     s
 }
@@ -295,10 +337,14 @@ pub fn vote_task(r: &Review, owed: &[&Finding], left: &str) -> String {
 /// For the author of contested findings at the start of a later round.
 pub fn reply_task(r: &Review, agent: &str, left: &str) -> String {
     let mine = r.contested_by(agent);
+    let ticket = r.ticket(agent, &format!("reply{}", r.round()));
     format!(
-        "Cross-examination round {}: your findings {} drew objections (votes and reasons below). Before the others vote again, reply within {left}: `amend_finding` to clarify or change severity, `withdraw_finding` if the objection is right, or `say` briefly why it stands. Votes open as soon as every contested finding's author has replied.\n\n{}",
+        "Cross-examination round {}: your findings {} drew objections (votes and reasons below). {}Before the others vote again, check the code and reply within {left}, with review_id \"{}\"{}: `amend_finding` to clarify or change severity, `withdraw_finding` if the objection is right, or `say` briefly why it stands. Votes open as soon as every contested finding's author has replied.\n\n{}",
         r.round(),
         mine.join(", "),
+        fresh_context("reply", "`amend_finding`, `withdraw_finding` or `say`", ticket),
+        r.id,
+        ticket_arg(ticket),
         round_findings(r, &[])
     )
 }
@@ -560,7 +606,7 @@ pub fn status(r: &Review, viewer: &str, now: Ms, web: &str) -> String {
         let _ = write!(s, ", phase ends in {}", dur(r.deadline_left(now)));
     }
     if let Some(p) = &r.parent {
-        let _ = write!(s, ", re-review of {p}");
+        let _ = write!(s, ", {} of {p}", if r.retries > 0 { "retry" } else { "re-review" });
     }
     s.push('\n');
     if !r.note.is_empty() {
@@ -644,7 +690,7 @@ pub fn events(evs: &[AgentEvent]) -> String {
 /// The protocol for an agent in `role`, or for either role before it has one.
 pub fn instructions(role: Option<Role>) -> String {
     let role_text = match role {
-        Some(Role::Reviewer) => "Your role is reviewer: loop on `wait` forever. When it returns, do exactly what its NEXT line says (accept an offer, review the PR and submit_findings, vote, ...), then call `wait` again. Never end your turn while a review is in progress.",
+        Some(Role::Reviewer) => "Your role is reviewer: loop on `wait` forever. When it returns, do exactly what its NEXT line says (accept an offer, review the PR and submit_findings, vote, ...), then call `wait` again. Never end your turn while a review is in progress. Each review is a new one: you must do its review, vote and reply tasks in a fresh sub-agent as each task says, never from memory of an earlier review, even of the same PR.",
         Some(Role::Author) => "Your role is author: call `request_review` with a PR URL and its title, then `wait` until the consolidated result arrives. Fix confirmed findings, push, and `request_rereview`.",
         None => "Reviewers call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program they run in), then loop on `wait` forever, doing exactly what each NEXT line says; never end your turn while a review is in progress. Authors call `request_review` with a PR URL and its title, then `wait` for the consolidated result.",
     };

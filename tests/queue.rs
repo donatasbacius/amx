@@ -238,7 +238,7 @@ impl World {
                         finding: f,
                         vote: if agree { "agree" } else { "disagree" }.into(),
                         severity: None,
-                        reason: (!agree).then(|| "not real".into()),
+                        reason: Some(if agree { "checked" } else { "not real" }.into()),
                         duplicate_of: None,
                     }
                 })
@@ -277,8 +277,14 @@ fn random_actors_never_break_the_queue_rules() {
                 _ => "unfinished",
             };
             *seen.entry(kind).or_default() += 1;
-            if r.parent.is_some() {
+            if r.parent.is_some() && r.retries == 0 {
                 *seen.entry("re-review").or_default() += 1;
+            }
+            if r.retries > 0 {
+                *seen.entry(if r.phase == Phase::Done { "retry done" } else { "retried" }).or_default() += 1;
+            }
+            if r.retries == 2 && r.broke_off() {
+                *seen.entry("retry cap").or_default() += 1;
             }
             if r.params.reviewers >= 3 && r.phase == Phase::Done && r.slots.len() == 2 {
                 *seen.entry("started with fewer").or_default() += 1;
@@ -299,7 +305,7 @@ fn random_actors_never_break_the_queue_rules() {
             }
         }
     }
-    for kind in ["done", "cancelled", "queue timeout", "dropped out", "re-review", "started with fewer", "released", "released for an older review", "lapsed", "asked again after declining", "ruled"] {
+    for kind in ["done", "cancelled", "queue timeout", "dropped out", "re-review", "retried", "retry done", "retry cap", "started with fewer", "released", "released for an older review", "lapsed", "asked again after declining", "ruled"] {
         assert!(seen.get(kind).is_some_and(|n| *n > 0), "no run reached {kind}: {seen:?}");
     }
 }
