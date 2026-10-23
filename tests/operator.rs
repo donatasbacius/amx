@@ -577,3 +577,32 @@ async fn every_page_names_its_viewer_as_tailscale_reports_them_and_is_not_cached
     }
     hub.running.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_0_15_0_approved_with_a_confirmed_minor_reads_approved_over_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("state.json"), include_str!("fixtures/state-0.15.0.json")).unwrap();
+    let mut hub = start(tmp.path(), 2).await;
+    for _ in 0..2 {
+        let r1 = hub.api("r1").await;
+        assert_eq!((r1["verdict"].as_str(), r1["result"]["verdict"].as_str()), (Some("approve"), Some("approve")), "{r1}");
+        assert!(r1["result"]["text"].as_str().unwrap().contains(": DECIDE ("), "{r1}");
+        let list: Value = reqwest::get(format!("{}/api/reviews", hub.local)).await.unwrap().json().await.unwrap();
+        assert_eq!(list["reviews"][0]["verdict"], "approve");
+        let page = hub.page("owner", "r1").await;
+        assert!(page.contains("<p class=\"vt\">Decide</p>") && !page.contains(" to fix"), "{page}");
+        let index = browser("owner").get(format!("{}/", hub.local)).send().await.unwrap().text().await.unwrap();
+        assert!(index.contains("Decide</span>") && !index.contains("to fix"), "{index}");
+        let status = hub.owner("al-author", "review_status", json!({"review_id": "r1"})).await;
+        assert!(status.contains(": DECIDE (") && !status.contains("CHANGES REQUESTED"), "{status}");
+        hub = hub.restart().await;
+    }
+    let (code, _) = hub.post("owner", "/r/r1/f/F2", &[("ruling", "dismiss")]).await;
+    assert_eq!(code, StatusCode::SEE_OTHER);
+    let ev = wait_for(&hub.local, "al-author", "dismissed F2").await;
+    assert!(ev.contains("dismissed F2 (verdict: approve).\nNEXT: nothing to fix.") && !ev.contains("NEXT: fix"), "{ev}");
+    assert_eq!(hub.api("r1").await["verdict"], "approve");
+    let page = browser("owner").get(format!("{}/r/r9", hub.local)).send().await.unwrap().text().await.unwrap();
+    assert!(page.contains("r9 isn't in the hub's history any more (older reviews are trimmed)."), "{page}");
+    hub.running.stop().await;
+}

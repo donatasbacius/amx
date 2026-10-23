@@ -4,7 +4,7 @@
 # tailscale_bin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 # public_url = "http://relay.example.ts.net:7341"  # base for transcript links (default: MagicDNS name, else Tailscale IP)
 # allow_logins = ["someone@example.com"]  # restrict tailnet callers; empty allows any identified caller
-# history = 50                      # finished reviews kept in memory (plus up to 10 nobody took)
+# history = 200                     # finished reviews kept in memory (plus up to 10 nobody took)
 # state = "/var/lib/amx/state.json" # keep reviews across restarts (default: memory only)
 
 # [timing]                          # seconds

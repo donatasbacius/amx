@@ -101,7 +101,7 @@ impl Default for Config {
             timing: Timing::default(),
             consensus: Consensus::default(),
             conn_limits: crate::server::ConnLimits::default(),
-            history: 50,
+            history: 200,
             state: None,
         }
     }

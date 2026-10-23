@@ -372,7 +372,8 @@ fn linked(f: &Finding) -> String {
 }
 
 pub fn result(r: &Review, web: &str) -> String {
-    let verdict = crate::relay::verdict_of(&r.findings);
+    let verdict = r.verdict().unwrap_or_else(|| r.judged());
+    let minor = r.blocks(Severity::Minor);
     let open = r.findings.iter().any(|f| f.ruled().is_none() && f.outcome.as_ref().is_some_and(|o| matches!(o.status, Status::Disputed | Status::Unverified)));
     let mut s = format!(
         "[{}] Review result for {}: {}\n",
@@ -487,7 +488,8 @@ pub fn result(r: &Review, web: &str) -> String {
         Verdict::ChangesRequested => {
             let _ = write!(
                 s,
-                "NEXT: fix the confirmed blocking, major and minor findings{} (and any disputed ones you agree with){}, push, then call `request_rereview` with review_id \"{}\", new_head_sha and a note on what you changed. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                "NEXT: fix the confirmed {} findings{} (and any disputed ones you agree with){}, push, then call `request_rereview` with review_id \"{}\", new_head_sha and a note on what you changed. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                if minor { "blocking, major and minor" } else { "blocking and major" },
                 if r.findings.iter().any(|f| f.ruled().is_some_and(|x| x.must_fix)) { " and those ruled must fix" } else { "" },
                 if unverified_ids.is_empty() { String::new() } else { format!("; check {} against the code yourself and fix the real ones", unverified_ids.join(", ")) },
                 r.id,
@@ -504,20 +506,27 @@ pub fn result(r: &Review, web: &str) -> String {
             }
             let _ = write!(
                 s,
-                "NEXT: nothing is confirmed to fix, but {}: check them against the code yourself and fix the real ones (ask your human if unsure). Address nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                "NEXT: nothing is confirmed to fix, but {}: check them against the code yourself and fix the real ones (ask your human if unsure). Address {} if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
                 open.join(", and "),
+                optional(minor),
                 r.id
             );
         }
         Verdict::Approve => {
             let _ = write!(
                 s,
-                "NEXT: nothing required. Address nits if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                "NEXT: nothing required. Address {} if you like; after pushing changes you can `request_rereview`. You may `say` a closing remark on {} (recorded in the transcript; it does not change the result).",
+                optional(minor),
                 r.id
             );
         }
     }
     s
+}
+
+/// What confirmed findings the author may leave, when minor ones block (`minor`) or not.
+fn optional(minor: bool) -> &'static str {
+    if minor { "nits" } else { "minor findings or nits" }
 }
 
 /// The NEXT line for the author of finished review `r` as it stands now, as `result` decides it.
@@ -526,8 +535,8 @@ pub fn next_step(r: &Review) -> String {
         let v: Vec<&str> = r.findings.iter().filter(|f| f.outcome.as_ref().is_some_and(|o| keep(f, &o.status))).map(|f| f.id.as_str()).collect();
         v.join(", ")
     };
-    if crate::relay::verdict_of(&r.findings) == Verdict::ChangesRequested {
-        let fix = ids(&|f, s| (*s == Status::Confirmed && f.outcome.as_ref().is_some_and(|o| o.severity.blocks())) || f.ruled().is_some_and(|x| x.must_fix));
+    if r.verdict() == Some(Verdict::ChangesRequested) {
+        let fix = ids(&|f, s| (*s == Status::Confirmed && f.outcome.as_ref().is_some_and(|o| r.blocks(o.severity))) || f.ruled().is_some_and(|x| x.must_fix));
         return format!("NEXT: fix {fix}, push, then call `request_rereview` with review_id \"{}\".", r.id);
     }
     match ids(&|f, s| matches!(s, Status::Disputed | Status::Unverified) && f.ruled().is_none()) {
