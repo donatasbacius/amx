@@ -43,6 +43,8 @@ const CLOSING_REMARKS: usize = 3;
 const AMENDS_PER_FINDING: u32 = 3;
 /// Reviews that failed before anyone took them, kept on top of `history`.
 const FAILED_KEPT: usize = 10;
+/// Re-reviews the hub queues by itself along one line of reviews that reviewers' drops failed.
+const MAX_RETRIES: u32 = 2;
 /// Unfinished reviews one Tailscale login may have requested at a time.
 const REVIEWS_PER_LOGIN: usize = 5;
 const AGENTS_PER_LOGIN: usize = 20;
@@ -270,6 +272,13 @@ impl Agents {
         }
     }
 
+    /// `name` acted through a sub-agent with its ticket: as alive as if it had called itself.
+    pub fn seen(&mut self, name: &str, now: Ms) {
+        if let Some(a) = self.map.get_mut(name) {
+            a.last_seen = now;
+        }
+    }
+
     /// `name`'s session has ended.
     pub fn leave(&mut self, name: &str) {
         self.gone.insert(name.to_string());
@@ -391,6 +400,10 @@ pub struct Slot {
     /// When the review task reached it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasked: Option<Ms>,
+    /// The ticket each of its tasks carries (see `Review::open_tasks`), with which a sub-agent
+    /// acts for it; never shown.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tickets: BTreeMap<String, String>,
 }
 
 impl Slot {
@@ -565,6 +578,20 @@ pub struct Review {
     /// Major in reviews that finished before 0.15.1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocks_from: Option<Severity>,
+    /// How many reviews before it in its line failed for reviewers' drops and were retried by
+    /// the hub; 0 for one an author asked for.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn token() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    let n = || RandomState::new().hash_one(std::time::SystemTime::now());
+    format!("{:016x}{:016x}", n(), n())
 }
 
 impl Review {
@@ -623,6 +650,33 @@ impl Review {
             .filter(|f| f.by.as_deref() == Some(agent) && f.withdrawn.is_none() && f.open_round == round && round > 1)
             .map(|f| f.id.clone())
             .collect()
+    }
+
+    /// The tasks `slot` has open, as its tickets name them: its review, its round's votes and,
+    /// in a reply window, its reply.
+    pub fn open_tasks(&self, slot: &Slot) -> Vec<String> {
+        match self.phase {
+            _ if !slot.active() => Vec::new(),
+            Phase::Reviewing if slot.submission.is_none() => vec!["review".into()],
+            Phase::Voting(n) if self.replying && !self.contested_by(&slot.agent).is_empty() => vec![format!("vote{n}"), format!("reply{n}")],
+            Phase::Voting(n) => vec![format!("vote{n}")],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The ticket for `agent`'s open task `kind`.
+    pub fn ticket(&self, agent: &str, kind: &str) -> Option<&str> {
+        self.slot(agent)?.tickets.get(kind).map(String::as_str)
+    }
+
+    /// Gives every open task of its reviewers a ticket, if it has none yet.
+    fn grant_tickets(&mut self) {
+        let open: Vec<(usize, Vec<String>)> = self.slots.iter().enumerate().map(|(i, s)| (i, self.open_tasks(s))).collect();
+        for (i, kinds) in open {
+            for k in kinds {
+                self.slots[i].tickets.entry(k).or_insert_with(token);
+            }
+        }
     }
 
     /// Whether it failed once under way because reviewers dropped out, not by a human's cancel.
@@ -1244,6 +1298,7 @@ impl State {
                     s.tasked = s.tasked.map(|t| t + down);
                 }
             }
+            r.grant_tickets();
             if r.result.is_some() {
                 let since = r.slots.iter().any(|s| s.tasked.is_some());
                 r.blocks_from.get_or_insert(if since { Severity::Minor } else { Severity::Major });
@@ -1257,6 +1312,22 @@ impl State {
         for a in self.agents.map.values_mut() {
             a.events.retain(|e| e.task.as_ref().is_none_or(|t| !queued.contains(t)));
         }
+    }
+
+    /// The reviewer whose open task carries `ticket`, if `login` is its Tailscale login.
+    pub fn ticket_holder(&self, ticket: &str, login: &str) -> Result<String> {
+        let ticket = ticket.trim();
+        for r in self.reviews.iter().filter(|r| r.phase.active()) {
+            for s in &r.slots {
+                if r.open_tasks(s).iter().any(|k| s.tickets.get(k).is_some_and(|t| t == ticket)) {
+                    if !s.login.eq_ignore_ascii_case(login) {
+                        bail!("that ticket is another Tailscale login's; nothing was recorded");
+                    }
+                    return Ok(s.agent.clone());
+                }
+            }
+        }
+        bail!("that ticket isn't valid now: its task is done, or its reviewer was dropped; nothing was recorded")
     }
 
     pub fn review(&self, id: &str) -> Option<&Review> {
@@ -1579,7 +1650,7 @@ impl State {
                     Phase::Reviewing if slot.submission.is_none() => out.push(Action {
                         review: id.clone(),
                         urgent: true,
-                        text: text::review_task(r, &left),
+                        text: text::review_task(r, name, &left),
                         task: Some(review_task(id)),
                         short: Some(format!("{id}: review the PR as described above, then call `submit_findings`.")),
                     }),
@@ -1624,7 +1695,7 @@ impl State {
                             out.push(Action {
                                 review: id.clone(),
                                 urgent: true,
-                                text: text::vote_task(r, &owed, &left),
+                                text: text::vote_task(r, name, &owed, &left),
                                 task: Some(vote_task(r, &owed)),
                                 short: Some(format!("{id}: vote on {} as described above.", ids.join(", "))),
                             });
@@ -1776,6 +1847,7 @@ impl State {
             cancelled_by: None,
             missing: None,
             blocks_from: None,
+            retries: 0,
         };
         let from = if r.picked.is_empty() { String::new() } else { format!(" from {}", r.picked.join(", ")) };
         r.log(now, author, "request", format!("requested {reviewers} reviewer(s){from}. {}", r.note));
@@ -1866,6 +1938,7 @@ impl State {
             dropped: None,
             submission: None,
             tasked: None,
+            tickets: BTreeMap::new(),
         });
         r.log(now, agent, "accept", "accepted the review");
         self.advance(now);
@@ -2024,7 +2097,12 @@ impl State {
                 .map(|s| Severity::parse(s).ok_or_else(|| anyhow!("{}: severity must be blocking, major, minor or nit", f.id)))
                 .transpose()?;
             let choice = match v.vote.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-                "agree" => Choice::Agree,
+                "agree" => {
+                    if reason.is_none() {
+                        bail!("agreeing with {} needs a reason (say briefly what you checked in the code); nothing was recorded; resend all your votes, each with a reason", f.id);
+                    }
+                    Choice::Agree
+                }
                 "disagree" => {
                     if reason.is_none() {
                         bail!("disagreeing with {} needs a reason", f.id);
@@ -2250,6 +2328,16 @@ impl State {
             }
             bail!("{} is already re-reviewed as {}", prev.id, r.id);
         }
+        let mut req = NewReview::new(&prev.pr.url());
+        req.note = note.to_string();
+        req.title = title.and_then(|t| one_line(t, MAX_TITLE));
+        req.head_sha = Some(head_sha.to_string());
+        self.follow(author, prev, req, 0, now)
+    }
+
+    /// Queues `req`, a re-review of `prev`: the `retries`th the hub made by itself.
+    fn follow(&mut self, author: &str, prev: Review, mut req: NewReview, retries: u32, now: Ms) -> Result<String> {
+        let failed = prev.broke_off();
         let reviewed = if failed {
             prev.since_sha.clone()
         } else {
@@ -2259,13 +2347,10 @@ impl State {
                 .next()
                 .or(prev.head_sha.clone())
         };
-        let mut req = NewReview::new(&prev.pr.url());
-        req.note = note.to_string();
-        req.title = title.and_then(|t| one_line(t, MAX_TITLE)).or(prev.title.clone());
+        req.title = req.title.or(prev.title.clone());
         if req.title.is_none() {
             bail!("{} has no title: pass the PR's title as `title` (from `gh pr view {} --json title`)", prev.id, prev.pr.url());
         }
-        req.head_sha = Some(head_sha.to_string());
         req.reviewers = Some(prev.params.reviewers.max(2));
         let mut r = self.new_review(author, req, now)?;
         r.params = ReviewParams { reviewers: r.params.reviewers, ..prev.params };
@@ -2292,7 +2377,8 @@ impl State {
             }
         }
         r.parent = Some(prev.id.clone());
-        r.iteration = prev.iteration + 1;
+        r.iteration = prev.iteration + u32::from(retries == 0);
+        r.retries = retries;
         r.since_sha = reviewed;
         for f in prev.findings.iter() {
             let (severity, origin, ruling) = match &f.outcome {
@@ -2331,11 +2417,21 @@ impl State {
                 dropped: None,
                 submission: None,
                 tasked: None,
+                tickets: BTreeMap::new(),
             });
             r.log(now, &agent, "accept", format!("assigned again (reviewed {})", prev.id));
         }
         let new_id = r.id.clone();
         self.reviews.push(r);
+        if retries > 0 {
+            let lost = match prev.missing_model().filter(|_| prev.active_slots().next().is_some()) {
+                Some(m) if prev.slots.iter().filter(|s| s.model == Some(m)).count() > 1 => format!("its {} reviewers", m.as_str()),
+                Some(m) => format!("its {} reviewer", m.as_str()),
+                None => "all its reviewers".into(),
+            };
+            let text = format!("[{new_id}] {} lost {lost}; the hub queued {new_id} to finish it.\nNEXT: nothing to do; keep calling `wait`.", prev.id);
+            self.agents.notify(author, &new_id, text, now);
+        }
         self.advance(now);
         if let Some(r) = self.reviews.iter().find(|r| r.id == new_id && r.phase == Phase::Offering) {
             let text = format!(
@@ -2490,14 +2586,39 @@ impl State {
     fn advance(&mut self, now: Ms) -> bool {
         let mut changed = false;
         for i in 0..self.reviews.len() {
+            let active = self.reviews[i].phase.active();
             for _ in 0..8 {
                 if !self.step(i, now) {
                     break;
                 }
                 changed = true;
             }
+            if active && self.reviews[i].broke_off() {
+                self.retry(i, now);
+            }
         }
         self.queue(now) || changed
+    }
+
+    /// Re-queues review `i`, which reviewers' drops have just failed, as `request_rereview` from
+    /// it at its head would. It fails for good after `MAX_RETRIES`, once its author's login has
+    /// asked for another review of the PR, or if none can be queued.
+    fn retry(&mut self, i: usize, now: Ms) {
+        let r = self.reviews[i].clone();
+        let other = self.reviews.iter().any(|o| {
+            o.id != r.id && o.pr == r.pr && o.author_login.eq_ignore_ascii_case(&r.author_login) && (o.phase.active() || o.seq() > r.seq())
+        });
+        let (author, id, notice) = (r.author.clone(), r.id.clone(), failure_notice(&r));
+        let queued = r.retries < MAX_RETRIES && !other && {
+            let mut req = NewReview::new(&r.pr.url());
+            req.note = r.note.clone();
+            req.head_sha = r.head_sha.clone();
+            let retries = r.retries + 1;
+            self.follow(&author, r, req, retries, now).is_ok()
+        };
+        if !queued {
+            self.agents.outcome(&author, &id, notice, now);
+        }
     }
 
     /// Reviewers free to join a team: online, with a program, and in no unfinished review.
@@ -2561,6 +2682,7 @@ impl State {
         let mut changed = false;
         for i in 0..self.reviews.len() {
             let State { agents, reviews, .. } = self;
+            let short = (reviews[i].phase == Phase::Offering && now >= reviews[i].deadline).then(|| short_of(&reviews[i], reviews, agents, now));
             let r = &mut reviews[i];
             if r.phase != Phase::Offering {
                 continue;
@@ -2587,9 +2709,10 @@ impl State {
                 }
                 let mix = if r.params.reviewers >= 2 { ", claude and codex," } else { "" };
                 let why = format!(
-                    "no full team of {} reviewer(s){mix} accepted it within {}",
+                    "no full team of {} reviewer(s){mix} accepted it within {}: {}",
                     r.params.reviewers,
-                    text::dur(r.params.queue_secs * 1000)
+                    text::dur(r.params.queue_secs * 1000),
+                    short.unwrap_or_default()
                 );
                 fail(r, agents, &why, now);
                 changed = true;
@@ -2784,6 +2907,7 @@ fn release(r: &mut Review, agents: &mut Agents, agent: &str, why: &str, now: Ms)
 fn start_reviewing(r: &mut Review, agents: &mut Agents, now: Ms) {
     r.phase = Phase::Reviewing;
     r.deadline = now + r.params.review_secs * 1000;
+    r.grant_tickets();
     let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
     r.log(now, "relay", "phase", format!("independent review started with {}", names.join(", ")));
     let team = match names.len() {
@@ -2791,7 +2915,7 @@ fn start_reviewing(r: &mut Review, agents: &mut Agents, now: Ms) {
         _ => format!("Your team is complete ({})", names.join(", ")),
     };
     for a in &names {
-        let text = format!("[{}] {team}.\n{}", r.id, text::review_task(r, text::LEFT));
+        let text = format!("[{}] {team}.\n{}", r.id, text::review_task(r, a, text::LEFT));
         agents.notify_task(a, &r.id, review_task(&r.id), text, Some(r.deadline), now);
     }
     for a in r.offered.clone() {
@@ -2830,6 +2954,7 @@ fn start_voting(r: &mut Review, agents: &mut Agents, round: u8, web: &str, now: 
         return;
     }
     r.replying = true;
+    r.grant_tickets();
     r.deadline = now + r.params.reply_secs * 1000;
     for a in &authors {
         let text = format!("[{}] {}", r.id, text::reply_task(r, a, text::LEFT));
@@ -2852,6 +2977,7 @@ fn open_votes(r: &mut Review, agents: &mut Agents, replying: bool, now: Ms) {
         return;
     }
     r.deadline = now + r.params.vote_secs * 1000;
+    r.grant_tickets();
     let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
     if names.iter().all(|a| r.owed_votes(a).is_empty()) {
         return;
@@ -2859,7 +2985,7 @@ fn open_votes(r: &mut Review, agents: &mut Agents, replying: bool, now: Ms) {
     for a in &names {
         let owed = r.owed_votes(a);
         if !owed.is_empty() {
-            let text = format!("[{}] {}", r.id, text::vote_task(r, &owed, text::LEFT));
+            let text = format!("[{}] {}", r.id, text::vote_task(r, a, &owed, text::LEFT));
             agents.notify_task(a, &r.id, vote_task(r, &owed), text, Some(r.deadline), now);
         } else if round == 1 {
             let text = format!(
@@ -2931,28 +3057,49 @@ fn fail(r: &mut Review, agents: &mut Agents, why: &str, now: Ms) {
     r.failure = Some(why.to_string());
     r.log(now, "relay", "failed", why);
     log_end(r, if r.cancelled_by.is_some() { "cancelled" } else { "failed" });
-    let (author, reviewer) = match &r.cancelled_by {
-        Some(by) => (
-            format!("[{}] {by} (a human) cancelled the review of {}.\nNEXT: don't request it again unless your human asks.", r.id, r.pr.url()),
-            format!("[{}] Review cancelled by {by} (a human). Call `wait`.", r.id),
-        ),
-        None => {
-            let retry = match &r.parent {
-                _ if r.broke_off() => format!("call `request_rereview` with review_id \"{}\" and new_head_sha (the same commit if nothing changed).", r.id),
-                Some(p) => format!(
-                    "to try again later, call `request_rereview` with review_id \"{p}\" and new_head_sha (the same commit if nothing changed), which carries its findings over; `request_review` would start afresh without them."
-                ),
-                None => "you can try `request_review` again later.".to_string(),
-            };
-            (
-                format!("[{}] Review of {} failed: {why}.\nNEXT: {retry}", r.id, r.pr.url()),
-                format!("[{}] Review {} failed: {why}. Nothing more to do; call `wait`.", r.id, r.id),
-            )
-        }
+    if !r.broke_off() {
+        agents.outcome(&r.author, &r.id, failure_notice(r), now);
+    }
+    let reviewer = match &r.cancelled_by {
+        Some(by) => format!("[{}] Review cancelled by {by} (a human). Call `wait`.", r.id),
+        None => format!("[{}] Review {} failed: {why}. Nothing more to do; call `wait`.", r.id, r.id),
     };
-    agents.outcome(&r.author, &r.id, author, now);
     let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
     for a in names {
         agents.notify(&a, &r.id, reviewer.clone(), now);
+    }
+}
+
+/// What the author of failed review `r` is told, unless the hub retries it.
+fn failure_notice(r: &Review) -> String {
+    if let Some(by) = &r.cancelled_by {
+        return format!("[{}] {by} (a human) cancelled the review of {}.\nNEXT: don't request it again unless your human asks.", r.id, r.pr.url());
+    }
+    let retry = match &r.parent {
+        _ if r.broke_off() => format!("call `request_rereview` with review_id \"{}\" and new_head_sha (the same commit if nothing changed).", r.id),
+        Some(p) => format!(
+            "to try again later, call `request_rereview` with review_id \"{p}\" and new_head_sha (the same commit if nothing changed), which carries its findings over; `request_review` would start afresh without them."
+        ),
+        None => "you can try `request_review` again later.".to_string(),
+    };
+    format!("[{}] Review of {} failed: {}.\nNEXT: {retry}", r.id, r.pr.url(), r.failure.as_deref().unwrap_or(""))
+}
+
+/// Why no full team took queued review `r`, as things stand: no reviewer of a program that may
+/// take it is online, or each one is busy in another of `reviews` under way.
+fn short_of(r: &Review, reviews: &[Review], agents: &Agents, now: Ms) -> String {
+    let busy = |a: &Agent| reviews.iter().any(|o| matches!(o.phase, Phase::Reviewing | Phase::Voting(_)) && o.slot(&a.name).is_some_and(Slot::active));
+    let online = |m: Model| -> Vec<&Agent> {
+        agents
+            .all()
+            .filter(|a| a.role == Role::Reviewer && a.model == Some(m) && a.name != r.author && (r.picked.is_empty() || r.picked.contains(&a.name)) && agents.online(&a.name, now))
+            .collect()
+    };
+    if let Some(m) = Model::ALL.into_iter().find(|m| online(*m).is_empty()) {
+        return format!("no {} reviewer was online", m.as_str());
+    }
+    match Model::ALL.into_iter().find(|m| online(*m).into_iter().all(busy)) {
+        Some(m) => format!("every {} reviewer was busy", m.as_str()),
+        None => "the reviewers online didn't make a full team".into(),
     }
 }

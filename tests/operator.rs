@@ -524,7 +524,7 @@ async fn rulings_set_the_verdict_reach_the_author_survive_a_restart_and_settle_t
     for r in ["rv1", "rv2"] {
         hub.reviewer(r, "submit_findings", json!({"review_id": "r2", "head_sha": SHA2, "verdict": "approve", "checked": "src/lib.rs", "findings": []})).await;
     }
-    hub.reviewer("rv1", "vote", json!({"review_id": "r2", "votes": [{"finding": "C1", "vote": "agree"}]})).await;
+    hub.reviewer("rv1", "vote", json!({"review_id": "r2", "votes": [{"finding": "C1", "vote": "agree", "reason": "still there"}]})).await;
     hub.reviewer("rv2", "vote", json!({"review_id": "r2", "votes": [{"finding": "C1", "vote": "disagree", "reason": "Fixed."}]})).await;
     assert_eq!(hub.api("r2").await["verdict"], "changes_requested");
     hub.running.stop().await;

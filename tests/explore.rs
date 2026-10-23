@@ -1,6 +1,6 @@
 //! Every interleaving of the actors' actions and the deadlines they race, within small bounds:
 //! a breadth-first search over the relay's real state, checking the state machine model's
-//! safety properties across every step. `EXPLORE=large` raises the bounds (about seven minutes and
+//! safety properties across every step. `EXPLORE=large` raises the bounds (about twelve minutes and
 //! 4 GB with `--release`).
 
 #[path = "common/props.rs"]
@@ -31,6 +31,8 @@ struct Bounds {
     /// Requests in all, each of a new PR; re-reviews come on top.
     requests: usize,
     rereviews: usize,
+    /// Retries the hub queues, in all; a state with more is checked but not explored further.
+    retries: usize,
     cancels: usize,
     /// Times reviewers go offline, in all.
     absences: usize,
@@ -47,6 +49,7 @@ const BASE: Bounds = Bounds {
     reviewers: 3,
     requests: 1,
     rereviews: 0,
+    retries: 0,
     cancels: 1,
     absences: 0,
     counts: &[2],
@@ -55,13 +58,14 @@ const BASE: Bounds = Bounds {
     strays: false,
 };
 
-const SMALL: [Bounds; 3] = [
+const SMALL: [Bounds; 4] = [
     Bounds { name: "two requests queue for three reviewers", requests: 2, ..BASE },
     Bounds { name: "a review and its re-review", reviewers: 2, rereviews: 1, cancels: 0, submissions: &[&["major"]], ..BASE },
     Bounds { name: "a reviewer goes offline", absences: 1, ..BASE },
+    Bounds { name: "a review that loses its reviewers is retried", reviewers: 2, retries: 1, cancels: 0, ..BASE },
 ];
 
-const LARGE: [Bounds; 3] = [
+const LARGE: [Bounds; 4] = [
     Bounds { name: "two requests queue for three reviewers", requests: 2, absences: 1, counts: &[2, 3], strays: true, ..BASE },
     Bounds { name: "two authors and four reviewers", authors: 2, reviewers: 4, requests: 2, ..BASE },
     Bounds {
@@ -72,6 +76,7 @@ const LARGE: [Bounds; 3] = [
         withdraw: true,
         ..BASE
     },
+    Bounds { name: "a review retried up to the cap", retries: 2, absences: 1, submissions: &[&[], &["major"]], ..BASE },
 ];
 
 /// States one search may keep before it gives up, a few kilobytes each.
@@ -143,6 +148,9 @@ fn deadlines(s: &State) -> Vec<Ms> {
 
 fn actions(s: &State, now: Ms, absences: usize, b: &Bounds) -> Vec<Act> {
     let mut v = Vec::new();
+    if s.reviews.iter().filter(|r| r.retries > 0).count() > b.retries {
+        return v;
+    }
     let requested = s.reviews.iter().filter(|r| r.parent.is_none()).count();
     for (a, _) in &AUTHORS[..b.authors] {
         if requested < b.requests {
@@ -153,7 +161,7 @@ fn actions(s: &State, now: Ms, absences: usize, b: &Bounds) -> Vec<Act> {
             v.extend(again.map(|r| Act::Request(a, r.pr.number as usize, r.params.reviewers)));
         }
     }
-    if s.reviews.iter().filter(|r| r.parent.is_some()).count() < b.rereviews {
+    if s.reviews.iter().filter(|r| r.parent.is_some() && r.retries == 0).count() < b.rereviews {
         let done = s.reviews.iter().filter(|r| r.phase == Phase::Done && rereview(&s.reviews, &r.id).is_none());
         v.extend(done.map(|r| Act::Rereview(r.id.clone())));
     }
@@ -259,7 +267,7 @@ fn apply(s: &mut State, now: &mut Ms, act: &Act) {
                     finding: f.clone(),
                     vote: if *agree { "agree" } else { "disagree" }.into(),
                     severity: None,
-                    reason: (!agree).then(|| "not real".into()),
+                    reason: Some(if *agree { "checked" } else { "not real" }.into()),
                     duplicate_of: None,
                 })
                 .collect();
@@ -299,7 +307,7 @@ fn key(s: &State, now: Ms) -> String {
     let mut k = String::new();
     for r in &s.reviews {
         let parent = r.parent.as_deref().map(pos);
-        write!(k, "\n{} {} {:?} {} {parent:?} {:?}", r.author, r.pr.number, r.head_sha, r.params.reviewers, r.phase).unwrap();
+        write!(k, "\n{} {} {:?} {} {parent:?} {} {:?}", r.author, r.pr.number, r.head_sha, r.params.reviewers, r.retries, r.phase).unwrap();
         if r.phase == Phase::Done && rereview(&s.reviews, &r.id).is_none() {
             for x in r.active_slots() {
                 write!(k, " {}", x.agent).unwrap();
@@ -340,12 +348,16 @@ fn reached(pre: &State, s: &State, seen: &mut BTreeMap<&'static str, usize>) {
         let was = prev.map(|p| p.phase);
         if was.is_some_and(|p| p.active()) && !r.phase.active() {
             hit(match r.phase {
+                Phase::Done if r.retries > 0 => "retry done",
                 Phase::Done if r.parent.is_some() => "re-review done",
                 Phase::Done => "done",
                 _ if r.cancelled_by.is_some() => "cancelled",
                 _ if r.failure.as_deref().is_some_and(|f| f.starts_with("no full team")) => "queue timeout",
                 _ => "dropped out",
             });
+        }
+        if prev.is_none() && r.retries > 0 {
+            hit("retried");
         }
         if was == Some(Phase::Offering) && matches!(r.phase, Phase::Reviewing) {
             hit("started");
@@ -423,6 +435,8 @@ fn every_interleaving_keeps_the_queue_rules() {
         "cancelled",
         "queue timeout",
         "dropped out",
+        "retried",
+        "retry done",
         "started",
         "second round",
         "released",

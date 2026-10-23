@@ -91,9 +91,13 @@ pub fn check(pre: &State, s: &State, now: Ms) -> Result<(), String> {
         }
         let results = s.peek_events(&r.author, 0).0.into_iter().filter(|e| e.result && e.review.as_deref() == Some(&r.id)).count();
         let rulings = r.log.iter().filter(|e| e.kind == "ruling").count();
-        if results != usize::from(!r.phase.active()) + rulings {
+        let retried = s.reviews.iter().any(|c| c.retries > 0 && c.parent.as_deref() == Some(&r.id));
+        if results != usize::from(!r.phase.active() && !retried) + rulings {
             return fail("S7", format!("{} ({:?}) has {results} result notices after {rulings} rulings", r.id, r.phase));
         }
+    }
+    if let Some(why) = retry_check(pre, s) {
+        return Err(why);
     }
     let live: Vec<&Review> = s.reviews.iter().filter(|r| r.phase.active()).collect();
     for (i, a) in live.iter().enumerate() {
@@ -130,6 +134,29 @@ pub fn check(pre: &State, s: &State, now: Ms) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// R1: the hub retries a line of reviews at most twice, each retry of one that reviewers' drops
+/// failed, and only once. R2: a retry never starts alongside another unfinished review of its PR
+/// by its author's login. R3: a retry reviews the head its failed review had.
+fn retry_check(pre: &State, s: &State) -> Option<String> {
+    for r in s.reviews.iter().filter(|r| r.retries > 0) {
+        let Some(p) = r.parent.as_deref().and_then(|p| s.review(p)) else { continue };
+        if r.retries > 2 || r.retries != p.retries + 1 || !p.broke_off() {
+            return Some(format!("R1: {} is retry {} of {} ({:?}, retry {})", r.id, r.retries, p.id, p.failure, p.retries));
+        }
+        if s.reviews.iter().filter(|c| c.retries > 0 && c.parent == r.parent).count() > 1 {
+            return Some(format!("R1: {} was retried more than once", p.id));
+        }
+        if p.head_sha != r.head_sha {
+            return Some(format!("R3: {} reviews {:?}, its failed {} {:?}", r.id, r.head_sha, p.id, p.head_sha));
+        }
+        let rival = s.reviews.iter().find(|o| o.id != r.id && o.phase.active() && o.pr == r.pr && o.author_login.eq_ignore_ascii_case(&r.author_login));
+        if let Some(o) = rival.filter(|_| pre.review(&r.id).is_none()) {
+            return Some(format!("R2: {} started beside {}, of the same PR and login", r.id, o.id));
+        }
+    }
+    None
 }
 
 /// The review each of `pool` should be offered: the oldest a team can form for from the

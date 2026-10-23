@@ -43,6 +43,7 @@ fn ok(id: Value, result: Value) -> Value {
 
 pub fn tools() -> Value {
     let rid = json!({ "type": "string", "description": "Review id, e.g. \"r3\"." });
+    let ticket = json!({ "type": "string", "description": "The ticket the task gives, when a sub-agent does the task." });
     json!([
         {
             "name": "hello",
@@ -88,13 +89,14 @@ pub fn tools() -> Value {
         },
         {
             "name": "submit_findings",
-            "description": format!("Submit your review once, after reading the PR read-only (`gh pr view`, `gh pr diff`); others' findings stay hidden until all have submitted. Each finding: severity (blocking = must not merge: bugs, data loss, security; major = fix before merge; minor = small but real, must be fixed before merge; nit = style or taste, never blocks), url of the exact line (https://github.com/<owner>/<repo>/blob/<head_sha>/<path>#L<line>), title and text. Be terse: no preamble, don't restate the code or the title. Read the diff and the code it touches before you submit. Empty list if the PR is fine, with `checked` saying what you read. {}", text::MARKDOWN),
+            "description": format!("Submit your review once, after reading the PR read-only (`gh pr view`, `gh pr diff`); others' findings stay hidden until all have submitted. Each finding: severity (blocking = must not merge: bugs, data loss, security; major = fix before merge; minor = small but real, must be fixed before merge; nit = style or taste, never blocks), url of the exact line (https://github.com/<owner>/<repo>/blob/<head_sha>/<path>#L<line>), title and text. Be terse: no preamble, don't restate the code or the title. Review from scratch: read the whole diff and the files it touches at the head, never rely on memory of an earlier review. Empty list if the PR is fine, with `checked` saying what you read. {}", text::MARKDOWN),
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
+                "ticket": ticket,
                 "head_sha": { "type": "string", "description": "The PR head commit you reviewed (headRefOid)." },
                 "verdict": { "type": "string", "enum": ["approve", "changes_requested"], "description": "Your suggestion; the consensus decides." },
                 "summary": { "type": "string", "description": "One or two sentences on the PR overall." },
-                "checked": { "type": "string", "description": "One line: the files or areas you read. Required with no findings." },
+                "checked": { "type": "string", "description": "One line: what you read in full and traced (files, functions). Required with no findings." },
                 "findings": { "type": "array", "items": { "type": "object", "properties": {
                     "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"] },
                     "url": { "type": "string" },
@@ -105,14 +107,15 @@ pub fn tools() -> Value {
         },
         {
             "name": "vote",
-            "description": "Vote on every finding the relay lists for you. agree = the problem is real (if its severity is wrong, still agree and give the fair one; most supporters' severity wins, and with only you and its author, the lower one); disagree = wrong or not a problem (specific reason required); duplicate = same issue as another (give duplicate_of). Check the code before agreeing. Several votes per call; change a vote until the round ends; votes on withdrawn findings are ignored.",
+            "description": "Vote on every finding the relay lists for you. agree = the problem is real (if its severity is wrong, still agree and give the fair one; most supporters' severity wins, and with only you and its author, the lower one); disagree = wrong or not a problem; duplicate = same issue as another (give duplicate_of). Open the cited code first: agree and disagree each need a short reason (what you checked, or why it is wrong). Several votes per call; change a vote until the round ends; votes on withdrawn findings are ignored.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
+                "ticket": ticket,
                 "votes": { "type": "array", "items": { "type": "object", "properties": {
                     "finding": { "type": "string", "description": "Finding id, e.g. F2 (or C1 for carried-over findings)." },
                     "vote": { "type": "string", "enum": ["agree", "disagree", "duplicate"] },
                     "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"], "description": "With agree: the fair severity, if different." },
-                    "reason": { "type": "string" },
+                    "reason": { "type": "string", "description": "Required with agree (what you checked) and disagree (why it is wrong)." },
                     "duplicate_of": { "type": "string" }
                 }, "required": ["finding", "vote"] } }
             }, "required": ["review_id", "votes"] }
@@ -120,13 +123,14 @@ pub fn tools() -> Value {
         {
             "name": "say",
             "description": "Message everyone in a review (author and reviewers), e.g. to argue a finding or answer a question. Reviewers can talk once findings are revealed, the author any time. After the review ends, messages are closing remarks that don't change the result. Keep it brief.",
-            "inputSchema": { "type": "object", "properties": { "review_id": rid, "text": { "type": "string" } }, "required": ["review_id", "text"] }
+            "inputSchema": { "type": "object", "properties": { "review_id": rid, "ticket": ticket, "text": { "type": "string" } }, "required": ["review_id", "text"] }
         },
         {
             "name": "amend_finding",
             "description": "In the reply window before a later round's votes, change your own finding (title, text, severity, url) to answer objections; everyone votes on it again.",
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
+                "ticket": ticket,
                 "finding": { "type": "string" },
                 "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"] },
                 "url": { "type": "string" },
@@ -137,7 +141,7 @@ pub fn tools() -> Value {
         {
             "name": "withdraw_finding",
             "description": "During cross-examination, withdraw one of your own findings when an objection convinces you.",
-            "inputSchema": { "type": "object", "properties": { "review_id": rid, "finding": { "type": "string" }, "reason": { "type": "string" } }, "required": ["review_id", "finding"] }
+            "inputSchema": { "type": "object", "properties": { "review_id": rid, "ticket": ticket, "finding": { "type": "string" }, "reason": { "type": "string" } }, "required": ["review_id", "finding"] }
         },
         {
             "name": "request_rereview",
@@ -187,6 +191,21 @@ pub struct Caller<'a> {
     /// About the name it was given: added to the instructions at `initialize`, or to the result
     /// of the call that names it.
     pub note: &'a str,
+    /// A sub-agent acting for `agent` with a task's ticket.
+    pub delegate: bool,
+}
+
+/// Tools a sub-agent may call with a task's ticket.
+pub const TICKETED: &[&str] = &["submit_findings", "vote", "say", "amend_finding", "withdraw_finding"];
+
+/// What a sub-agent is told after a call with its ticket succeeds.
+const DELEGATE_DONE: &str = "NEXT: if your task is done, end with a one-line summary for the agent that started you; don't call `wait`.";
+
+/// The ticket a call to one of `TICKETED` carries.
+pub fn ticket(msg: &Value) -> Option<String> {
+    let p = &msg["params"];
+    let t = p["arguments"]["ticket"].as_str().map(str::trim).filter(|t| !t.is_empty())?;
+    (msg["method"] == "tools/call" && p["name"].as_str().is_some_and(|n| TICKETED.contains(&n))).then(|| t.to_string())
 }
 
 /// `reviewers` was the count before it could name agents; a number is still accepted.
@@ -332,6 +351,11 @@ fn next_after(s: &State, agent: &str, events: &[AgentEvent], known: &[String], n
 
 fn owed_tasks(s: &State, agent: &str, now: Ms) -> Vec<String> {
     s.next_actions(agent, now).into_iter().filter_map(|a| a.task).collect()
+}
+
+/// `head` with what to do next: for a sub-agent with a ticket, only to report back.
+fn next(hub: &Hub, c: &Caller<'_>, before: &[String], head: String) -> String {
+    if c.delegate { format!("{head}\n\n{DELEGATE_DONE}") } else { with_next(hub, c.agent, before, head) }
 }
 
 /// Appends the NEXT lines. A task already owed `before` the call is only pointed to (`wait`
@@ -492,7 +516,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                 findings,
             };
             let n = hub.write(|s, now| s.submit(agent, &r.review_id, sub, now))?;
-            Ok(with_next(hub, agent, &before, format!("Submitted {n} finding(s) for {}.", r.review_id)))
+            Ok(next(hub, c, &before, format!("Submitted {n} finding(s) for {}.", r.review_id)))
         }
         "vote" => {
             let r: VoteArgs = args(a)?;
@@ -512,12 +536,12 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
             if !v.ignored.is_empty() {
                 head.push_str(&format!(" Ignored your votes on {}: withdrawn by their authors.", v.ignored.join(", ")));
             }
-            Ok(with_next(hub, agent, &before, head))
+            Ok(next(hub, c, &before, head))
         }
         "say" => {
             let r: SayArgs = args(a)?;
             hub.write(|s, now| s.say(agent, &r.review_id, &r.text, now))?;
-            Ok(with_next(hub, agent, &before, format!("Posted to {}.", r.review_id)))
+            Ok(next(hub, c, &before, format!("Posted to {}.", r.review_id)))
         }
         "amend_finding" => {
             let r: AmendArgs = args(a)?;
@@ -534,12 +558,12 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
             {
                 head.push_str(&format!(" Your reason was not posted: {e:#}"));
             }
-            Ok(with_next(hub, agent, &before, head))
+            Ok(next(hub, c, &before, head))
         }
         "withdraw_finding" => {
             let r: AmendArgs = args(a)?;
             hub.write(|s, now| s.withdraw(agent, &r.review_id, &r.finding, &r.reason, now))?;
-            Ok(with_next(hub, agent, &before, format!("Withdrew {}.", r.finding)))
+            Ok(next(hub, c, &before, format!("Withdrew {}.", r.finding)))
         }
         "request_rereview" => {
             check_author(hub, c)?;
@@ -612,7 +636,10 @@ pub async fn handle(hub: &Hub, c: &Caller<'_>, msg: Value) -> Option<Value> {
     };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let touched = if method == "tools/call" && ACTIVE_TOOLS.contains(&tool) {
+    let touched = if c.delegate {
+        hub.write(|s, now| s.agents.seen(agent, now));
+        Ok(())
+    } else if method == "tools/call" && ACTIVE_TOOLS.contains(&tool) {
         hub.touch(agent, who, role)
     } else {
         hub.check_name(agent, who)
