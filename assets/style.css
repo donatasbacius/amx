@@ -83,7 +83,7 @@ details[open] > summary > .i { transform: rotate(90deg); }
 }
 .th time, .filters a, .side-d > summary, .more > summary, .key dd, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role, .pg { color: var(--muted); }
 .th, .me, .agents, .side-d, .filters, .vbox > summary, .aside, .badge, .st { font-size: var(--fs-1); line-height: var(--lh-1); }
-.rv-when, .vw, .h-when, .badge, .st, .log time, .me { white-space: nowrap; }
+.rv-when, .vw, .h-when, .badge, .st, .log time, .me, .took { white-space: nowrap; }
 .meta b, .facts b, .et b { color: var(--text); }
 
 .top {
@@ -140,8 +140,9 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .foot { margin: var(--sp-3) 0 0; }
 .pager { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-2); }
 .pager a { padding: 4px 0; }
+.reviews { display: grid; grid-template-columns: max-content minmax(0, 1fr) auto; column-gap: var(--sp-3); }
 .rv {
-  position: relative; display: grid; grid-template: "st t w" "st m m" / 12em minmax(0, 1fr) auto;
+  position: relative; display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; grid-template-areas: "st t w" "st m m";
   column-gap: var(--sp-3); align-items: baseline; padding: var(--sp-2) var(--row-x);
 }
 .rv > .st { grid-area: st; }
@@ -256,6 +257,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 @media (max-width: 600px) {
   :root { --row-y: 8px; --row-x: 12px; --sev-w: 60px; --fs-4: 20px; --lh-4: 26px; }
   .rv, .f > summary { min-height: 44px; }
+  .reviews { display: block; }
   .rv { grid-template: "st w" "t t" "m m" / minmax(0, 1fr) auto; }
   .rv-pr, .rv-meta { white-space: normal; }
   .rv-pr { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }

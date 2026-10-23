@@ -88,12 +88,13 @@ pub fn tools() -> Value {
         },
         {
             "name": "submit_findings",
-            "description": format!("Submit your review once, after reading the PR read-only (`gh pr view`, `gh pr diff`); others' findings stay hidden until all have submitted. Each finding: severity (blocking = must not merge: bugs, data loss, security; major = fix before merge; minor = worth fixing; nit = taste), url of the exact line (https://github.com/<owner>/<repo>/blob/<head_sha>/<path>#L<line>), title and text. Be terse: no preamble, don't restate the code or the title. Empty list if the PR is fine. {}", text::MARKDOWN),
+            "description": format!("Submit your review once, after reading the PR read-only (`gh pr view`, `gh pr diff`); others' findings stay hidden until all have submitted. Each finding: severity (blocking = must not merge: bugs, data loss, security; major = fix before merge; minor = small but real, must be fixed before merge; nit = style or taste, never blocks), url of the exact line (https://github.com/<owner>/<repo>/blob/<head_sha>/<path>#L<line>), title and text. Be terse: no preamble, don't restate the code or the title. Read the diff and the code it touches before you submit. Empty list if the PR is fine, with `checked` saying what you read. {}", text::MARKDOWN),
             "inputSchema": { "type": "object", "properties": {
                 "review_id": rid,
                 "head_sha": { "type": "string", "description": "The PR head commit you reviewed (headRefOid)." },
                 "verdict": { "type": "string", "enum": ["approve", "changes_requested"], "description": "Your suggestion; the consensus decides." },
                 "summary": { "type": "string", "description": "One or two sentences on the PR overall." },
+                "checked": { "type": "string", "description": "One line: the files or areas you read. Required with no findings." },
                 "findings": { "type": "array", "items": { "type": "object", "properties": {
                     "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"] },
                     "url": { "type": "string" },
@@ -235,6 +236,8 @@ struct SubmitArgs {
     #[serde(default)]
     summary: String,
     #[serde(default)]
+    checked: String,
+    #[serde(default)]
     findings: Vec<FindingArg>,
 }
 
@@ -343,7 +346,7 @@ fn with_next(hub: &Hub, agent: &str, before: &[String], head: String) -> String 
             .filter_map(|a| a.task)
             .filter(|t| !before.contains(t))
             .collect();
-        s.forget_tasks(agent, &new);
+        s.forget_tasks(agent, &new, now);
         next_after(s, agent, &[], before, now).0
     });
     format!("{head}\n\n{next}")
@@ -485,6 +488,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                 head_sha: r.head_sha,
                 verdict: r.verdict,
                 summary: r.summary,
+                checked: r.checked,
                 findings,
             };
             let n = hub.write(|s, now| s.submit(agent, &r.review_id, sub, now))?;

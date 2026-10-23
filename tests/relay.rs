@@ -60,7 +60,14 @@ impl Sim {
         self.s.tick(self.now);
     }
 
+    /// Ends the agent's session: it stops calling the relay.
     fn leave(&mut self, name: &str) {
+        self.quiet(name);
+        self.s.agents.leave(name);
+    }
+
+    /// Stops calling the relay, as while it reads code, without ending its session.
+    fn quiet(&mut self, name: &str) {
         self.alive.retain(|a| a != name);
     }
 
@@ -132,6 +139,7 @@ impl Sim {
             head_sha: SHA.into(),
             verdict: verdict.into(),
             summary: format!("{agent} looked"),
+            checked: if findings.is_empty() { "src/lib.rs".into() } else { String::new() },
             findings,
         };
         self.s.submit(agent, id, sub, self.now).unwrap();
@@ -241,7 +249,7 @@ fn happy_path_three_reviewers_approve() {
     }
     sim.submit("rev-a", &id, &[("nit", "rename x")]);
     sim.submit("rev-b", &id, &[]);
-    sim.submit("rev-c", &id, &[("minor", "log level too high")]);
+    sim.submit("rev-c", &id, &[("nit", "log level too high")]);
     sim.vote("rev-a", &id, &[("F2", "agree")]);
     sim.vote("rev-b", &id, &[("F1", "agree"), ("F2", "agree")]);
     sim.vote("rev-c", &id, &[("F1", "agree")]);
@@ -261,7 +269,7 @@ fn findings_hidden_until_all_submit() {
     assert!(!r.revealed());
     let b_view = amx::text::status(r, "rev-b", sim.now, "http://x");
     assert!(!b_view.contains("SECRET-FINDING-TEXT"), "{b_view}");
-    assert!(b_view.contains("1 finding(s) from other reviewers hidden"));
+    assert!(b_view.contains("(other reviewers' findings stay hidden until everyone has submitted)") && !b_view.contains("1 finding"), "{b_view}");
     assert!(amx::text::status(r, "rev-a", sim.now, "http://x").contains("SECRET-FINDING-TEXT"));
     assert!(!amx::web::render_review(r).contains("SECRET-FINDING-TEXT"));
     assert!(!sim.events("rev-b").contains("SECRET-FINDING-TEXT"));
@@ -400,7 +408,7 @@ fn amend_and_withdraw() {
     sim.vote("rev-b", &id, &[("F2", "agree"), ("F1", "agree")]);
     assert_eq!(sim.status(&id, "F1"), Status::Confirmed);
     assert_eq!(sim.status(&id, "F2"), Status::Withdrawn);
-    assert_eq!(sim.verdict(&id), Verdict::Approve);
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
 }
 
 #[test]
@@ -652,7 +660,7 @@ fn a_failed_rereview_can_be_retried_from_its_parent() {
     sim.advance(QUEUE);
     assert_eq!(sim.phase(&id2), Phase::Failed);
     let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
-    assert!(index.contains("<span>no team within 2 hours ·</span> <span>last: needs the author's call ·</span> <span>2 reviews ·</span> <span>alice-codex</span></span>"), "the PR still stands where it did: {index}");
+    assert!(index.contains("<span>no team within 2 hours ·</span> <span>last: unresolved ·</span> <span>2 reviews ·</span> <span>alice-codex</span></span>"), "the PR still stands where it did: {index}");
     sim.join("rev-new", "friend5@example.com", Role::Reviewer);
     let id3 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     let r3 = sim.s.review(&id3).unwrap();
@@ -720,6 +728,7 @@ fn input_validation() {
         head_sha: SHA.into(),
         verdict: "approve".into(),
         summary: String::new(),
+        checked: "src/lib.rs".into(),
         findings: vec![FindingIn {
             severity: "major".into(),
             url: Some("https://evil.example/x".into()),
@@ -732,6 +741,7 @@ fn input_validation() {
         head_sha: "main".into(),
         verdict: "approve".into(),
         summary: String::new(),
+        checked: "src/lib.rs".into(),
         findings: vec![],
     };
     assert!(sim.s.submit("rev-a", &id, bad_sha, sim.now).is_err());
@@ -774,7 +784,7 @@ fn overstated_finding_is_confirmed_at_the_severity_its_supporters_back() {
     let r = sim.s.review(&id).unwrap();
     let o = r.finding("F1").unwrap().outcome.clone().unwrap();
     assert_eq!((o.status, o.severity, o.downgraded), (Status::Confirmed, amx::relay::Severity::Minor, false));
-    assert_eq!(sim.verdict(&id), Verdict::Approve);
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
     let result = sim.events("alice-codex");
     assert!(result.contains("Confirmed findings") && result.contains("raised as blocking; the votes put it at minor") && result.contains("rev-c: agree, as nit"), "{result}");
 }
@@ -908,7 +918,7 @@ fn a_findings_title_heads_it_and_its_text_is_shown_once() {
     assert!(task.contains("title = what's wrong in a few words (at most 80 characters)") && task.contains(amx::text::MARKDOWN), "{task}");
     let text = "The guard lives until the end of `drain()`; drop it first.";
     let finding = |title: Option<&str>| FindingIn { severity: "major".into(), url: None, title: title.map(str::to_string), text: text.into() };
-    let sub = |findings| SubmitIn { head_sha: SHA.into(), verdict: "changes_requested".into(), summary: String::new(), findings };
+    let sub = |findings| SubmitIn { head_sha: SHA.into(), verdict: "changes_requested".into(), summary: String::new(), checked: "src/lib.rs".into(), findings };
     for title in [None, Some(""), Some(" \n\t")] {
         let err = sim.s.submit("rev-a", &id, sub(vec![finding(title)]), sim.now).unwrap_err().to_string();
         assert_eq!(err, "finding 1: title is required: pass a short heading saying what's wrong as `title`, and the details as `text`");
@@ -1116,7 +1126,7 @@ fn state_survives_a_snapshot_and_the_review_carries_on() {
     let open = sim.s.request_review("alice-codex", req, sim.now).unwrap();
     sim.accept("rev-a", &open);
     sim.accept("rev-b", &open);
-    sim.submit("rev-a", &open, &[("minor", "missing doc comment")]);
+    sim.submit("rev-a", &open, &[("nit", "missing doc comment")]);
     sim.events("rev-a");
     assert!(!sim.s.peek_events("alice-codex", 0).0.is_empty());
 
@@ -1180,7 +1190,7 @@ fn the_review_task_comes_once_the_team_is_complete() {
     let id = sim.request("alice-codex", 2);
     sim.accept("rev-a", &id);
     assert_eq!(sim.phase(&id), Phase::Offering);
-    let early = SubmitIn { head_sha: SHA.into(), verdict: "approve".into(), summary: String::new(), findings: vec![] };
+    let early = SubmitIn { head_sha: SHA.into(), verdict: "approve".into(), summary: String::new(), checked: "src/lib.rs".into(), findings: vec![] };
     assert!(sim.s.submit("rev-a", &id, early, sim.now).is_err());
     assert!(!sim.events("rev-a").contains("gh pr diff"));
     sim.accept("rev-b", &id);
@@ -1216,7 +1226,8 @@ fn done_tasks_and_progress_are_not_delivered() {
     let author: Vec<String> = sim.s.take_events("alice-codex", false, false, sim.now).0.into_iter().map(|e| e.text).collect();
     assert_eq!(author.len(), 1, "authors wake for the result only: {author:?}");
     assert!(author[0].contains("Review result"));
-    assert!(sim.s.take_events("rev-a", false, false, sim.now).0.is_empty(), "\"Review finished\" is progress");
+    let ended: Vec<String> = sim.s.take_events("rev-a", false, false, sim.now).0.into_iter().map(|e| e.text).collect();
+    assert!(ended.len() == 1 && ended[0].contains("Review finished"), "only the end of the review: {ended:?}");
 }
 
 #[test]
@@ -1432,10 +1443,10 @@ fn review_page_asks_the_human_to_judge_a_disputed_finding() {
     sim.vote("rev-b", &id, &[("F1", "disagree")]);
     assert_eq!(sim.status(&id, "F1"), Status::Disputed);
     let page = amx::web::render_review(sim.s.review(&id).unwrap());
-    assert!(page.contains("<p class=\"vt\">Needs the author's call</p>") && page.contains("<span class=\"needs\">1 to decide</span>"), "{page}");
+    assert!(page.contains("<p class=\"vt\">Unresolved</p>") && page.contains("<span class=\"needs\">1 to decide</span>"), "{page}");
     let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
-    assert!(index.contains("Needs the author's call</span>") && index.contains("<span>1 to decide ·</span>"), "the index row uses the history's words: {index}");
-    assert!(amx::web::render_index(&sim.s, sim.now, &author()).contains("Needs your call</span>"));
+    assert!(index.contains("Unresolved</span>") && index.contains("<span>1 to decide ·</span>"), "the index row uses the history's words: {index}");
+    assert!(amx::web::render_index(&sim.s, sim.now, &author()).contains("Decide</span>"));
     assert!(page.contains("<details class=\"f\" id=\"F1\" open>") && page.contains("<details class=\"vbox\" open><summary>"), "{page}");
     assert!(page.contains(">disputed<") && page.contains("1 of 2 agree"), "{page}");
 
@@ -1563,7 +1574,7 @@ fn an_unmerged_duplicate_vote_backs_the_target_severity() {
     assert_eq!(sim.phase(&id), Phase::Done);
     let o = outcome(&sim, &id, "F1");
     assert_eq!((o.status, o.severity), (Status::Confirmed, amx::relay::Severity::Minor), "rev-b only said it is the minor F2");
-    assert_eq!(sim.verdict(&id), Verdict::Approve);
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
 }
 
 fn round_two(sim: &mut Sim) -> String {
@@ -1953,6 +1964,7 @@ fn findings_of(texts: &[String]) -> SubmitIn {
         head_sha: SHA.into(),
         verdict: "changes_requested".into(),
         summary: String::new(),
+        checked: "src/lib.rs".into(),
         findings: texts.iter().map(|t| FindingIn { severity: "minor".into(), url: None, title: Some("t".into()), text: t.clone() }).collect(),
     }
 }
@@ -2286,12 +2298,12 @@ fn a_sole_reviewers_findings_are_unverified() {
     let result = sim.events("alice-codex");
     assert!(!result.contains("Confirmed findings"), "{result}");
     assert!(result.contains("only their author vouches for F1: check them against the code yourself and fix the real ones"), "{result}");
-    assert!(result.contains("Review result for https://github.com/rust-lang/rust/pull/1: NEEDS YOUR CALL") && !result.contains("APPROVE"), "{result}");
+    assert!(result.contains("Review result for https://github.com/rust-lang/rust/pull/1: DECIDE") && !result.contains("APPROVE"), "{result}");
     let page = amx::web::render_review_page(sim.s.review(&id).unwrap(), &[], None, sim.now, &|_| true);
     assert!(page.contains(">unverified<") && page.contains("Nobody else checked it. Your call:") && !page.contains("didn't settle"), "{page}");
-    assert!(page.contains("<section class=\"verdict v-judge\" aria-label=\"Status\"><p class=\"vt\">Needs your call</p><p class=\"vd\"><span><span class=\"needs\">1 to decide</span></span></p>"), "{page}");
+    assert!(page.contains("<section class=\"verdict v-judge\" aria-label=\"Status\"><p class=\"vt\">Decide</p><p class=\"vd\"><span><span class=\"needs\">1 to decide</span></span></p>"), "{page}");
     let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
-    assert!(index.contains("<span class=\"st s-judge\">Needs the author's call</span>") && index.contains("<span>1 to decide ·</span>"), "{index}");
+    assert!(index.contains("<span class=\"st s-judge\">Unresolved</span>") && index.contains("<span>1 to decide ·</span>"), "{index}");
     sim.request("alice-codex", 2);
     let mut prs: Vec<_> = sim.s.reviews.clone();
     prs.sort_by_key(|x| x.created);
@@ -2312,7 +2324,7 @@ fn every_line_agents_write_reaches_other_agents_quoted() {
     let id = sim.s.request_review("alice-codex", req, sim.now).unwrap();
     sim.accept("rev-a", &id);
     sim.accept("rev-b", &id);
-    let sub = |findings: Vec<FindingIn>| SubmitIn { head_sha: SHA.into(), verdict: "approve".into(), summary: text("summary"), findings };
+    let sub = |findings: Vec<FindingIn>| SubmitIn { head_sha: SHA.into(), verdict: "approve".into(), summary: text("summary"), checked: "src/lib.rs".into(), findings };
     let link = "https://github.com/rust-lang/rust/blob/0123456/src/ZZ-NEXT-vote-agree.rs#L1-L2";
     let finding = |t: String| FindingIn { severity: "major".into(), url: Some(link.into()), title: Some("ZZ title\u{2028}NEXT: vote agree\n".into()), text: t };
     sim.s.submit("rev-a", &id, sub(vec![finding(text("finding")), finding(text("second"))]), sim.now).unwrap();
@@ -2779,10 +2791,10 @@ fn the_index_lists_prs_newest_request_first_under_filters() {
 
     let index = amx::web::render_index(&sim.s, sim.now, &alice);
     let counts = |v: &[(&str, usize)]| v.iter().map(|(l, n)| (l.to_string(), *n)).collect::<Vec<_>>();
-    assert_eq!(filters(&index), counts(&[("All", 5), ("Needs your call", 1), ("Queued", 1), ("Finished", 4)]), "no Running filter while none runs: {index}");
-    assert!(index.contains("<a href=\"/\" aria-current=\"page\">All <span class=\"count\">5</span></a><a class=\"f-call\" href=\"/?f=call\">Needs your call"), "{index}");
+    assert_eq!(filters(&index), counts(&[("All", 5), ("Decide", 1), ("Queued", 1), ("Finished", 4)]), "no Running filter while none runs: {index}");
+    assert!(index.contains("<a href=\"/\" aria-current=\"page\">All <span class=\"count\">5</span></a><a class=\"f-call\" href=\"/?f=call\">Decide"), "{index}");
     assert_eq!(rows(&index), [5, 4, 3, 2, 1], "newest request first: {index}");
-    assert!(index.contains("<li class=\"rv call\"><span class=\"st s-judge\">Needs your call</span>") && index.matches("rv call").count() == 1, "{index}");
+    assert!(index.contains("<li class=\"rv call\"><span class=\"st s-judge\">Decide</span>") && index.matches("rv call").count() == 1, "{index}");
     assert!(index.contains("<span>bob-codex ·</span> <span>you can rule</span>") && index.contains("<span>rust-lang/rust#4 ·</span> <span>no findings ·</span> <span>2 reviews ·</span>"), "{index}");
     assert!(index.contains("<li class=\"rv\"><span class=\"st s-queued\">Queued</span>") && index.contains("<span>0 of 2 joined ·</span>"), "{index}");
 
@@ -2962,6 +2974,7 @@ fn unlinked(sev: &str, text: &str) -> SubmitIn {
         head_sha: SHA.into(),
         verdict: "changes_requested".into(),
         summary: "looked".into(),
+        checked: "src/lib.rs".into(),
         findings: vec![FindingIn { severity: sev.into(), url: None, title: Some(format!("{sev} issue")), text: text.into() }],
     }
 }
@@ -2972,7 +2985,7 @@ fn a_must_fix_ruling_holds_while_the_rereview_finds_the_problem_still_there() {
     let id = example(&mut sim, 2);
     sim.accept("rev-a", &id);
     sim.accept("rev-b", &id);
-    sim.s.submit("rev-a", &id, unlinked("minor", "stale cache after reload"), sim.now).unwrap();
+    sim.s.submit("rev-a", &id, unlinked("nit", "stale cache after reload"), sim.now).unwrap();
     sim.submit("rev-b", &id, &[]);
     sim.vote("rev-b", &id, &[("F1", "disagree")]);
     sim.skip_replies();
@@ -2988,7 +3001,7 @@ fn a_must_fix_ruling_holds_while_the_rereview_finds_the_problem_still_there() {
         sim.vote(a, &id2, &[("C1", "agree")]);
     }
     assert_eq!(sim.status(&id2, "C1"), Status::Confirmed);
-    assert_eq!(sim.verdict(&id2), Verdict::ChangesRequested, "still there at minor, still must fix");
+    assert_eq!(sim.verdict(&id2), Verdict::ChangesRequested, "still there as a nit, still must fix");
     let id3 = sim.s.rereview("alice-codex", &id2, SHA, "", None, sim.now).unwrap();
     for a in ["rev-a", "rev-b"] {
         sim.submit(a, &id3, &[]);
@@ -2998,6 +3011,44 @@ fn a_must_fix_ruling_holds_while_the_rereview_finds_the_problem_still_there() {
     }
     assert_eq!(sim.status(&id3, "C1"), Status::Rejected);
     assert_eq!(sim.verdict(&id3), Verdict::Approve, "fixed releases the ruling");
+}
+
+#[test]
+fn a_confirmed_minor_blocks_and_a_nit_does_not() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("minor", "off-by-one in the page count")]);
+    sim.submit("rev-b", &id, &[("nit", "rename x")]);
+    sim.vote("rev-a", &id, &[("F2", "agree")]);
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    assert_eq!((sim.status(&id, "F1"), sim.status(&id, "F2")), (Status::Confirmed, Status::Confirmed));
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
+    assert!(sim.events("alice-codex").contains("NEXT: fix the confirmed blocking, major and minor findings"));
+    assert_eq!(amx::text::next_step(sim.s.review(&id).unwrap()), format!("NEXT: fix F1, push, then call `request_rereview` with review_id \"{id}\"."));
+
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "", None, sim.now).unwrap();
+    for a in ["rev-a", "rev-b"] {
+        sim.submit(a, &id2, &[]);
+    }
+    for a in ["rev-a", "rev-b"] {
+        sim.vote(a, &id2, &[("C1", "agree"), ("C2", "agree")]);
+    }
+    assert_eq!(sim.verdict(&id2), Verdict::ChangesRequested, "the carried minor is still there");
+
+    let id3 = sim.s.rereview("alice-codex", &id2, SHA, "", None, sim.now).unwrap();
+    for a in ["rev-a", "rev-b"] {
+        sim.submit(a, &id3, &[]);
+    }
+    for a in ["rev-a", "rev-b"] {
+        sim.vote(a, &id3, &[("C1", "disagree"), ("C2", "agree")]);
+    }
+    let r = sim.s.review(&id3).unwrap();
+    let carried = |n: &str| r.findings.iter().find(|f| f.text == n).and_then(|f| f.outcome.as_ref()).map(|o| (o.status.clone(), o.severity));
+    assert_eq!(carried("off-by-one in the page count").map(|x| x.0), Some(Status::Rejected));
+    assert_eq!(carried("rename x"), Some((Status::Confirmed, amx::relay::Severity::Nit)));
+    assert_eq!(sim.verdict(&id3), Verdict::Approve, "a confirmed nit still approves");
 }
 
 #[test]
@@ -3376,4 +3427,229 @@ fn a_queued_review_with_no_team_names_a_different_reviewer_for_each_seat() {
     assert!(page.contains("<p class=\"vw\">queued just now · fails at"), "{page}");
     let status = amx::text::status(sim.s.review(&id).unwrap(), "alice-codex", sim.now, "");
     assert!(status.starts_with(&format!("{id} https://github.com/rust-lang/rust/pull/2 by alice-codex — queued, fails in 2h00m without a full team\n")), "{status}");
+}
+
+#[test]
+fn an_empty_submission_says_what_was_checked() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    let task = sim.task("rev-a");
+    assert!(task.contains("`checked`") && task.contains("read the diff and the code it touches"), "{task}");
+    let empty = |checked: &str| SubmitIn { head_sha: SHA.into(), verdict: "approve".into(), summary: String::new(), checked: checked.into(), findings: vec![] };
+    let err = sim.s.submit("rev-a", &id, empty(" \n "), sim.now).unwrap_err().to_string();
+    assert!(err.contains("`checked` is required"), "{err}");
+    let long = format!("src/cache.rs and\nsrc/lib.rs {}", "x".repeat(300));
+    sim.s.submit("rev-a", &id, empty(&long), sim.now).unwrap();
+    let checked = sim.s.review(&id).unwrap().slot("rev-a").unwrap().submission.as_ref().unwrap().checked.clone().unwrap();
+    assert!(checked.starts_with("src/cache.rs and src/lib.rs x") && checked.chars().count() == 200, "{checked}");
+    sim.submit("rev-b", &id, &[("minor", "typo")]);
+    let r = sim.s.review(&id).unwrap();
+    assert!(r.slot("rev-b").unwrap().submission.as_ref().unwrap().checked.is_none(), "optional with findings");
+    let page = amx::web::render_review(r);
+    assert!(page.contains("<p class=\"facts\" dir=\"auto\">Checked: src/cache.rs and src/lib.rs x"), "{page}");
+    assert!(page.contains("submitted 0 findings at <code>0123456</code> · checked: <span dir=\"auto\">src/cache.rs"), "{page}");
+    assert!(amx::text::status(r, "rev-b", sim.now, "").contains("submitted 0 finding(s) at 0123456789abcdef0123456789abcdef01234567; checked: src/cache.rs"));
+}
+
+#[test]
+fn the_time_from_task_to_submission_is_shown() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    assert!(sim.events("rev-a").contains("Your team is complete"));
+    sim.advance(10);
+    assert!(sim.events("rev-b").contains("Your team is complete"));
+    sim.advance(20);
+    sim.submit("rev-a", &id, &[]);
+    sim.advance(280);
+    sim.submit("rev-b", &id, &[]);
+    let r = sim.s.review(&id).unwrap();
+    assert_eq!((r.slot("rev-a").unwrap().took(), r.slot("rev-b").unwrap().took()), (Some(30_000), Some(300_000)));
+    let page = amx::web::render_review(r);
+    assert!(page.contains("<span class=\"took muted\">in 30s</span>") && page.contains("<span class=\"took muted\">in 5m00s</span>"), "{page}");
+    let result = sim.events("alice-codex");
+    assert!(result.contains("- rev-a suggested approve at 0123456 (30s after the task):"), "{result}");
+    assert!(result.contains("- rev-b suggested approve at 0123456 (5m00s after the task):"), "{result}");
+
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.events("rev-a");
+    sim.advance(10);
+    sim.submit("rev-a", &id, &[]);
+    sim.submit("rev-b", &id, &[]);
+    let r = sim.s.review(&id).unwrap();
+    assert_eq!(r.slot("rev-b").unwrap().took(), None, "never handed the task");
+    let page = amx::web::render_review(r);
+    assert!(page.contains("<span class=\"took needs\" title=\"Submitted 10s after getting the task\">in 10s, very fast</span>"), "{page}");
+    assert!(sim.events("alice-codex").contains("- rev-a suggested approve at 0123456 (10s after the task, very fast):"));
+}
+
+#[test]
+fn a_reviewer_working_on_its_task_is_judged_by_the_task_deadline() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.quiet("rev-c");
+    sim.advance(1190);
+    assert!(sim.s.review(&id).unwrap().slot("rev-c").unwrap().active(), "silent while it owes its findings");
+    sim.alive.push("rev-c".into());
+    sim.s.touch("rev-c", &who("friend2@example.com"), None, sim.now).unwrap();
+    sim.submit("rev-c", &id, &[("major", "leak")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.advance(20);
+    let r = sim.s.review(&id).unwrap();
+    assert_eq!(r.slot("rev-a").unwrap().dropped.as_deref(), Some("missed the review deadline"));
+    assert!(r.slot("rev-c").unwrap().active());
+    assert_eq!(r.phase, Phase::Voting(1));
+
+    sim.quiet("rev-b");
+    sim.advance(580);
+    assert!(sim.s.review(&id).unwrap().slot("rev-b").unwrap().active(), "silent while it owes votes");
+    sim.s.touch("rev-b", &who("friend1@example.com"), None, sim.now).unwrap();
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+}
+
+#[test]
+fn a_reviewer_that_left_is_dropped_after_the_usual_silence_even_while_it_owes_a_task() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.quiet("rev-c");
+    sim.advance(200);
+    sim.s.agents.leave("rev-c");
+    sim.advance(90);
+    assert!(sim.s.review(&id).unwrap().slot("rev-c").unwrap().active());
+    sim.advance(20);
+    assert_eq!(sim.s.review(&id).unwrap().slot("rev-c").unwrap().dropped.as_deref(), Some("went offline"));
+
+    sim.submit("rev-a", &id, &[]);
+    sim.quiet("rev-a");
+    sim.advance(310);
+    assert_eq!(sim.s.review(&id).unwrap().slot("rev-a").unwrap().dropped.as_deref(), Some("went offline"), "it owes nothing, so silence counts");
+}
+
+#[test]
+fn coming_back_after_leaving_keeps_the_task() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.quiet("rev-b");
+    sim.s.agents.stream("rev-b", 1, sim.now);
+    sim.s.agents.stream("rev-b", -1, sim.now);
+    assert!(sim.s.agents.gone("rev-b"));
+    sim.s.touch("rev-b", &who("friend1@example.com"), None, sim.now).unwrap();
+    assert!(!sim.s.agents.gone("rev-b"), "heard from again");
+    sim.advance(600);
+    assert!(sim.s.review(&id).unwrap().slot("rev-b").unwrap().active());
+}
+
+#[test]
+fn reviewers_are_woken_once_when_their_review_ends() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c", "rev-d"]);
+    let id = sim.approved("alice-codex", &["rev-a", "rev-b"]);
+    assert_eq!(sim.phase(&id), Phase::Done);
+    for a in ["rev-a", "rev-b"] {
+        let (evs, _) = sim.s.take_events(a, false, false, sim.now);
+        let ends: Vec<&str> = evs.iter().map(|e| e.text.as_str()).filter(|t| t.contains("Review finished")).collect();
+        assert_eq!(ends, [format!("[{id}] Review finished: approve. Thanks; you are free for other reviews. Call `wait`.")], "{a}");
+        assert!(sim.s.take_events(a, false, false, sim.now).0.is_empty(), "{a}: nothing more");
+    }
+
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-c", &id);
+    sim.accept("rev-d", &id);
+    sim.events("rev-c");
+    sim.events("rev-d");
+    sim.s.cancel(&id, "alice", sim.now).unwrap();
+    for a in ["rev-c", "rev-d"] {
+        let evs: Vec<String> = sim.s.take_events(a, false, false, sim.now).0.into_iter().map(|e| e.text).collect();
+        assert_eq!(evs, [format!("[{id}] Review cancelled by alice (a human). Call `wait`.")], "{a}");
+    }
+}
+
+#[test]
+fn a_rereview_its_old_team_fills_offers_nobody_else() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c", "rev-d"]);
+    let id = sim.s.request_review("alice-codex", pick(&["rev-a", "rev-b"], None), sim.now).unwrap();
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.submit("rev-a", &id, &[("major", "cache never invalidated")]);
+    sim.submit("rev-b", &id, &[]);
+    sim.vote("rev-b", &id, &[("F1", "agree")]);
+    assert_eq!(sim.verdict(&id), Verdict::ChangesRequested);
+    for a in ["rev-c", "rev-d"] {
+        sim.events(a);
+    }
+    let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
+    sim.advance(30);
+    let r2 = sim.s.review(&id2).unwrap();
+    assert_eq!(r2.phase, Phase::Reviewing);
+    assert!(r2.offered.is_empty(), "{:?}", r2.offered);
+    for a in ["rev-c", "rev-d"] {
+        assert_eq!(sim.events(a), "", "{a} is neither offered it nor told an offer closed");
+        assert_eq!(sim.s.offered(a), None);
+    }
+    assert!(sim.events("rev-a").contains("Your team is complete"));
+}
+
+#[test]
+fn the_index_shows_when_a_review_ended_as_a_local_clock_time() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    sim.approved("alice-codex", &["rev-a", "rev-b"]);
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
+    assert!(index.contains("<span class=\"rv-when\"><time class=\"clock\" datetime=\"2025-10-09T08:53:20Z\">08:53 UTC</time></span>"), "{index}");
+    sim.advance(86_400);
+    let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
+    assert!(index.contains("<time class=\"clock\" datetime=\"2025-10-09T08:53:20Z\">9 Oct 08:53 UTC</time>"), "another day: {index}");
+}
+
+#[test]
+fn nothing_shown_before_the_reveal_tells_how_many_findings_others_have() {
+    let mut sim = setup(&["rev-a", "rev-b", "rev-c"]);
+    let id = sim.request("alice-codex", 3);
+    for r in ["rev-a", "rev-b", "rev-c"] {
+        sim.accept(r, &id);
+    }
+    sim.submit("rev-a", &id, &[("major", "one"), ("minor", "two"), ("nit", "three")]);
+    sim.submit("rev-b", &id, &[("major", "mine")]);
+    let r = sim.s.review(&id).unwrap();
+    let b_view = amx::text::status(r, "rev-b", sim.now, "");
+    assert!(b_view.contains("- [major] yours:\n> major issue") && !b_view.contains("F4") && !b_view.contains("F1"), "its own id would count the others': {b_view}");
+    let page = amx::web::render_review(r);
+    assert!(page.contains("<h2 id=\"findings\">Findings</h2><p class=\"empty\">Reviewers' findings stay hidden until every reviewer submits.</p>"), "{page}");
+    assert!(page.contains("<b>rev-a</b> submitted at <code>0123456</code>") && !page.contains("3 findings") && !page.contains("finding at"), "{page}");
+    assert_eq!(amx::web::list_json(r, sim.now)["findings"], 0);
+    sim.submit("rev-c", &id, &[]);
+    let page = amx::web::render_review(sim.s.review(&id).unwrap());
+    assert!(page.contains("<b>rev-a</b> submitted 3 findings at <code>0123456</code>"), "counted once revealed: {page}");
+}
+
+#[test]
+fn the_transcript_shows_when_each_reviewer_got_its_task() {
+    let mut sim = setup(&["rev-a", "rev-b"]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("rev-a", &id);
+    sim.accept("rev-b", &id);
+    sim.events("rev-a");
+    sim.events("rev-a");
+    sim.advance(40);
+    sim.events("rev-b");
+    sim.submit("rev-a", &id, &[]);
+    sim.submit("rev-b", &id, &[]);
+    let r = sim.s.review(&id).unwrap();
+    let log: Vec<(Ms, &str, &str)> = r.log.iter().skip(3).map(|e| (e.at - r.created, e.who.as_str(), e.kind.as_str())).collect();
+    assert_eq!(log, [(0, "relay", "phase"), (0, "rev-a", "task"), (40_000, "rev-b", "task"), (40_000, "rev-a", "submit"), (40_000, "rev-b", "submit"), (40_000, "relay", "result")]);
+    assert_eq!(r.slot("rev-b").unwrap().took(), Some(0), "counted from the same moment");
+    let page = amx::web::render_review(r);
+    assert!(page.contains("<b>rev-b</b> got the review task"), "{page}");
 }

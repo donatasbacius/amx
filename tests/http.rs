@@ -225,7 +225,7 @@ async fn review_over_mcp_with_long_polls() {
     )
     .await;
     assert!(sub.contains("Submitted 1 finding"), "{sub}");
-    ok_tool(&author, "owner-rev", "submit_findings", json!({"review_id":"r1","head_sha":"0123456789abcdef","verdict":"approve","findings":[]})).await;
+    ok_tool(&author, "owner-rev", "submit_findings", json!({"review_id":"r1","head_sha":"0123456789abcdef","verdict":"approve","checked": "src/lib.rs", "findings":[]})).await;
     ok_tool(&author, "owner-rev", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree"}]})).await;
     let result = ok_tool(&author, "owner-codex", "wait", json!({"timeout_seconds": 5})).await;
     assert!(result.contains("CHANGES REQUESTED") && result.contains("Short title"), "{result}");
@@ -233,6 +233,9 @@ async fn review_over_mcp_with_long_polls() {
     let page = reqwest::get(format!("{author}/r/r1")).await.unwrap().text().await.unwrap();
     assert!(!page.contains("<script>alert"), "escaped");
     assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    let v: Value = reqwest::get(format!("{author}/api/reviews/r1")).await.unwrap().json().await.unwrap();
+    assert_eq!((v["slots"][0]["agent"].as_str(), v["slots"][0]["tasked"].is_u64()), (Some("owner-rev"), false), "it never fetched the task");
+    assert_eq!((v["slots"][1]["agent"].as_str(), v["slots"][1]["tasked"].is_u64()), (Some("friend-rev"), true), "handed in the accept's result");
     let status = ok_tool(&author, "owner-codex", "review_status", json!({"review_id":"r1"})).await;
     assert!(status.contains("Transcript"), "{status}");
     relay.running.stop().await;
@@ -263,11 +266,15 @@ async fn json_api_lists_reviews_and_hides_unrevealed_findings() {
     let page = get("/r/r1").await.unwrap().text().await.unwrap();
     assert!(page.contains(">submitted<") && !page.contains("requests changes"), "{page}");
     let v: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!((v["phase"].as_str(), v["revealed"].as_bool(), v["hidden_findings"].as_u64()), (Some("reviewing"), Some(false), Some(1)));
+    assert_eq!((v["phase"].as_str(), v["revealed"].as_bool(), v.get("hidden_findings")), (Some("reviewing"), Some(false), None));
+    assert!(!body.contains("1 finding") && body.contains("\"submitted at abc1234\""), "no count: {body}");
+    let list: Value = get("/api/reviews").await.unwrap().json().await.unwrap();
+    assert_eq!(list["reviews"][0]["findings"], 0, "no count in the list either");
+    assert!(page.contains("Reviewers' findings stay hidden until every reviewer submits.") && !page.contains("1 finding"), "{page}");
     assert_eq!(v["timeline"][1]["state"], "active");
     assert!(v["deadline_left_ms"].as_u64().unwrap() > 0);
 
-    ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+    ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","checked": "src/lib.rs", "findings":[]})).await;
     ok_tool(&base, "rev-b", "vote", json!({"review_id":"r1","votes":[{"finding":"F1","vote":"agree","severity":"major"}]})).await;
     let v: Value = get("/api/reviews/r1").await.unwrap().json().await.unwrap();
     assert_eq!(v["phase"], "done");
@@ -624,7 +631,7 @@ async fn a_new_review_and_a_result_a_wait_hands_out_are_saved_before_the_reply()
             ok_tool(&base, rev, "accept_review", json!({"review_id": id})).await;
         }
         for rev in ["rev", "rev-cx"] {
-            ok_tool(&base, rev, "submit_findings", json!({"review_id": id,"head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+            ok_tool(&base, rev, "submit_findings", json!({"review_id": id,"head_sha":"abc1234","verdict":"approve","checked": "src/lib.rs", "findings":[]})).await;
         }
         let result = if session {
             text_of(&session_rpc(&base, &sid, call(2, "wait", json!({})), false).await)
@@ -841,8 +848,8 @@ async fn after_a_restart_sessions_get_back_the_names_of_their_role() {
     assert!(text_of(&req).starts_with("You are `local-claude-2`."), "{req}");
     session_rpc(&base, &rev, call(2, "accept_review", json!({"review_id":"r1"})), false).await;
     ok_tool(&base, "rev-cx", "accept_review", json!({"review_id":"r1"})).await;
-    session_rpc(&base, &rev, call(3, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})), false).await;
-    ok_tool(&base, "rev-cx", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+    session_rpc(&base, &rev, call(3, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","checked": "src/lib.rs", "findings":[]})), false).await;
+    ok_tool(&base, "rev-cx", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","checked": "src/lib.rs", "findings":[]})).await;
     running.stop().await;
 
     let running = amx::start(cfg).await.unwrap();
@@ -924,13 +931,15 @@ async fn an_author_with_nothing_in_progress_is_answered_at_once() {
         ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
     }
     for rev in ["rev", "rev-cx"] {
-        ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+        ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","checked": "src/lib.rs", "findings":[]})).await;
     }
     let result = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 20})).await;
     assert!(result.contains("Review result"), "{result}");
     let idle = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 20})).await;
     assert!(idle.contains("to check fixes for r1, call `request_rereview`"), "{idle}");
     assert!(started.elapsed() < Duration::from_secs(5), "never long-polled");
+    let ended = ok_tool(&base, "rev", "wait", json!({"timeout_seconds": 2})).await;
+    assert!(ended.contains("[r1] Review finished: approve."), "{ended}");
     let started = std::time::Instant::now();
     ok_tool(&base, "rev", "wait", json!({"timeout_seconds": 2})).await;
     assert!(started.elapsed() >= Duration::from_secs(2), "reviewers wait for offers");
@@ -1210,7 +1219,7 @@ async fn a_repeated_rereview_says_who_asked_and_gets_the_result() {
         ok_tool(&base, rev, "accept_review", json!({"review_id":"r1"})).await;
     }
     for rev in ["rev", "rev-cx"] {
-        ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[]})).await;
+        ok_tool(&base, rev, "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","checked": "src/lib.rs", "findings":[]})).await;
     }
     let again = json!({"review_id": "r1", "new_head_sha": "def5678"});
     assert!(ok_tool(&base, "author", "request_rereview", again.clone()).await.starts_with("Re-review r2 queued"));

@@ -1,6 +1,6 @@
 use crate::hub::Hub;
-use crate::relay::{Choice, Finding, LogEntry, Model, Ms, OnlineAgent, Phase, Review, Role, Severity, State, Status, Verdict, rereview};
-use crate::text::{bidi, iso, phase_badge, short_sha, split_range, split_rates};
+use crate::relay::{Choice, FAST_MS, Finding, LogEntry, Model, Ms, OnlineAgent, Phase, Review, Role, Severity, Slot, State, Status, Verdict, rereview};
+use crate::text::{bidi, dur, iso, phase_badge, short_sha, split_range, split_rates};
 use axum::extract::{Form, Path, Query, State as AxState};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -145,8 +145,13 @@ fn when(r: &Review, now: Ms) -> String {
         Phase::Offering if r.deadline_left(now) <= SOON_MS => format!("<span class=\"needs\">fails in {}</span>", mins(r.deadline_left(now).div_ceil(60_000))),
         Phase::Offering => queued(r, now),
         p if p.active() => format!("<span data-deadline=\"{}\">until {}</span>", r.deadline, utc(r.deadline, now)),
-        _ => time_tag(r.ended.unwrap_or(r.created), now),
+        _ => clock_at(r.ended.unwrap_or(r.created), now),
     }
+}
+
+/// The viewer's local time, from the page script, as `utc` words it until then.
+fn clock_at(ms: Ms, now: Ms) -> String {
+    format!("<time class=\"clock\" datetime=\"{}\">{}</time>", iso(ms).replace(' ', "T"), utc(ms, now))
 }
 
 /// The review's state as a class and label. An approved review isn't "Approved" while it has
@@ -160,7 +165,7 @@ fn status(r: &Review, locked: bool, can: bool) -> (&'static str, String) {
         Phase::Voting(1) => ("voting", "Voting".into()),
         Phase::Voting(n) => ("voting", format!("Voting, round {n}")),
         Phase::Done if r.verdict() == Some(Verdict::Approve) && !locked && to_do(r).1 > 0 => {
-            ("judge", if can { "Needs your call" } else { "Needs the author's call" }.into())
+            ("judge", if can { "Decide" } else { "Unresolved" }.into())
         }
         Phase::Done if r.verdict() == Some(Verdict::Approve) => ("approved", "Approved".into()),
         Phase::Done => ("changes", "Changes requested".into()),
@@ -409,7 +414,7 @@ fn program(m: Option<Model>) -> String {
     m.map(|m| format!(" <span class=\"pg\">{}</span>", m.as_str())).unwrap_or_default()
 }
 
-/// Confirmed blocking and major findings, those the reviewers left undecided, and confirmed minors and nits.
+/// Confirmed blocking, major and minor findings, those the reviewers left undecided, and confirmed nits.
 fn to_do(r: &Review) -> (usize, usize, usize) {
     let (mut fix, mut decide, mut optional) = (0, 0, 0);
     for f in &r.findings {
@@ -417,7 +422,7 @@ fn to_do(r: &Review) -> (usize, usize, usize) {
         match (&o.status, o.severity) {
             _ if f.ruled().is_some_and(|x| x.must_fix) => fix += 1,
             _ if f.ruled().is_some() => {}
-            (Status::Confirmed, Severity::Blocking | Severity::Major) => fix += 1,
+            (Status::Confirmed, s) if s.blocks() => fix += 1,
             (Status::Confirmed, _) => optional += 1,
             (Status::Disputed | Status::Unverified, _) => decide += 1,
             _ => {}
@@ -635,7 +640,7 @@ impl Filter {
     fn parts(self) -> (&'static str, &'static str) {
         match self {
             Filter::All => ("", "All"),
-            Filter::Call => ("call", "Needs your call"),
+            Filter::Call => ("call", "Decide"),
             Filter::Running => ("running", "Running"),
             Filter::Queued => ("queued", "Queued"),
             Filter::Finished => ("finished", "Finished"),
@@ -689,7 +694,8 @@ fn pager(filter: Filter, page: usize, pages: usize) -> String {
 fn status_key() -> String {
     format!(
         "<details id=\"key\" class=\"side-d\"><summary>{CHEVRON}What the statuses mean</summary><dl class=\"key\">\
-         <dt><span class=\"st s-judge\">Needs your call</span></dt><dd>Reviewers split or one couldn't be checked: rule Must fix or Dismiss on the review page.</dd>\
+         <dt><span class=\"st s-judge\">Decide</span></dt><dd>Approved, but some findings are disputed or unverified and wait for your ruling: Must fix or Dismiss on the review page.</dd>\
+         <dt><span class=\"st s-judge\">Unresolved</span></dt><dd>Approved, but some findings are disputed or unverified and wait for the author's ruling.</dd>\
          <dt><span class=\"st s-changes\">Changes requested</span></dt><dd>The author's agent fixes and asks for a re-review.</dd>\
          <dt><span class=\"st s-failed\">Failed</span></dt><dd>No result; request it again.</dd>\
          <dt><span class=\"st s-queued\">Queued</span></dt><dd>Waiting for a full team of reviewers; it starts by itself.</dd>\
@@ -793,11 +799,11 @@ fn connect(url: &str, login: &str, open: bool) -> String {
 /// What a finding asks of the human, in page order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Rank {
-    /// Confirmed blocking or major, or still present.
+    /// Confirmed blocking, major or minor, or still present.
     Fix,
     /// Disputed, unverified or undecided, or still being voted on.
     Judge,
-    /// Confirmed minor or nit.
+    /// Confirmed nit.
     Optional,
     /// Carried over and voted down.
     Fixed,
@@ -810,7 +816,7 @@ fn rank(f: &Finding) -> Rank {
         return Rank::Closed;
     }
     match f.outcome.as_ref().map(|o| (&o.status, o.severity)) {
-        Some((Status::Confirmed, Severity::Blocking | Severity::Major)) => Rank::Fix,
+        Some((Status::Confirmed, s)) if s.blocks() => Rank::Fix,
         Some((Status::Confirmed, _)) => Rank::Optional,
         Some((Status::Disputed | Status::Unverified, _)) | None => Rank::Judge,
         Some((Status::Rejected, _)) if f.by.is_none() => Rank::Fixed,
@@ -890,7 +896,7 @@ fn render_finding(out: &mut String, r: &Review, f: &Finding, rule: bool) {
     let disputed = matches!(f.outcome.as_ref().map(|o| &o.status), Some(Status::Disputed | Status::Unverified));
     let open = match rank {
         Rank::Fix => true,
-        Rank::Judge => f.outcome.is_some() || !r.phase.active() || sev <= Severity::Major,
+        Rank::Judge => f.outcome.is_some() || !r.phase.active() || sev.blocks(),
         _ => false,
     };
     let mark = match outcome(f) {
@@ -1000,19 +1006,21 @@ fn since_link(r: &Review) -> Option<String> {
 }
 
 /// One list in page order: what to fix, what to judge, the optional, then the fixed and dismissed, dimmed.
+/// While reviewers work, how many findings they have is hidden too, so nothing here depends on it.
 fn render_findings(out: &mut String, r: &Review, rule: bool) {
-    if r.findings.is_empty() {
+    let hiding = !r.revealed() && r.phase == Phase::Reviewing;
+    let mut shown: Vec<(usize, &Finding)> = visible(r).enumerate().collect();
+    if shown.is_empty() && !hiding {
         return;
     }
-    let mut shown: Vec<(usize, &Finding)> = visible(r).enumerate().collect();
     shown.sort_by_key(|&(i, f)| (rank(f), severity(f), i));
-    let hidden = r.findings.len() - shown.len();
-    let n = shown.iter().filter(|(_, f)| rank(f) < Rank::Fixed).count() + hidden;
+    let n = shown.iter().filter(|(_, f)| rank(f) < Rank::Fixed).count();
     let count = if n > 0 { format!(" <span class=\"count\">{n}</span>") } else { String::new() };
     let since = since_link(r).map(|l| format!(" <span class=\"aside\">{l}</span>")).unwrap_or_default();
     let _ = write!(out, "<h2 id=\"findings\">Findings{count}{since}</h2>");
-    if hidden > 0 {
-        let _ = write!(out, "<p class=\"empty\">{hidden} hidden until every reviewer submits.</p>");
+    if hiding {
+        let what = if shown.is_empty() { "Reviewers' findings" } else { "New findings" };
+        let _ = write!(out, "<p class=\"empty\">{what} stay hidden until every reviewer submits.</p>");
     }
     if !shown.is_empty() {
         out.push_str("<div class=\"findings\">");
@@ -1172,20 +1180,32 @@ fn render_reviewers(out: &mut String, r: &Review) {
                 } else {
                     format!(" <span class=\"muted\">at</span> <code>{}</code>", esc(short_sha(&x.head_sha)))
                 };
-                format!("<span class=\"badge s-{cls}\">{label}</span>{sha}")
+                format!("<span class=\"badge s-{cls}\">{label}</span>{sha}{}", took(s))
             }
             (None, None) if r.phase == Phase::Failed => "<span class=\"badge s-closed\">stopped</span>".into(),
             (None, None) => "<span class=\"badge s-waiting\">reviewing</span>".into(),
         };
-        let summary = s
+        let mut summary = s
             .submission
             .as_ref()
             .filter(|x| !x.summary.is_empty() && r.revealed())
             .map(|x| format!("<div class=\"md\" dir=\"auto\">{}</div>", markdown(&x.summary)))
             .unwrap_or_default();
+        if let Some(c) = s.submission.as_ref().and_then(|x| x.checked.as_deref()).filter(|_| r.revealed()) {
+            let _ = write!(summary, "<p class=\"facts\" dir=\"auto\">Checked: {}</p>", esc(c));
+        }
         let _ = write!(out, "<li><div class=\"who\"><b>{}</b>{} {state}</div>{summary}</li>", esc(&s.agent), program(s.model));
     }
     out.push_str("</ul>");
+}
+
+/// " in 12s" after a reviewer's submission, from when it got the task; amber under `FAST_MS`.
+fn took(s: &Slot) -> String {
+    match s.took() {
+        Some(t) if t < FAST_MS => format!(" <span class=\"took needs\" title=\"Submitted {0} after getting the task\">in {0}, very fast</span>", dur(t)),
+        Some(t) => format!(" <span class=\"took muted\">in {}</span>", dur(t)),
+        None => String::new(),
+    }
 }
 
 /// Who decides the findings the reviewers left open: the viewer, if they may rule on the review,
@@ -1410,12 +1430,22 @@ fn relay_line(r: &Review, e: &LogEntry) -> Option<String> {
             n.parse::<u32>().ok()?;
             Some(format!("<b>{}</b> <div class=\"md\" dir=\"auto\">{}</div>", esc(&e.who), markdown(&format!("requested {}{rest}", plural(n, "reviewer")))))
         }
+        "task" => Some(format!("<b>{}</b> got the review task", esc(&e.who))),
+        "submit" if !r.revealed() => Some(format!("<b>{}</b> submitted at <code>{}</code>", esc(&e.who), esc(uncounted(t)?))),
         "submit" => {
-            let (n, sha) = t.strip_prefix("submitted ")?.split_once(" finding(s) at ")?;
-            Some(format!("<b>{}</b> submitted {} at <code>{}</code>", esc(&e.who), plural(n, "finding"), esc(short_sha(sha))))
+            let (n, rest) = t.strip_prefix("submitted ")?.split_once(" finding(s) at ")?;
+            let (sha, checked) = rest.split_once("; checked: ").unwrap_or((rest, ""));
+            let checked = if checked.is_empty() || !r.revealed() { String::new() } else { format!(" · checked: <span dir=\"auto\">{}</span>", esc(checked)) };
+            Some(format!("<b>{}</b> submitted {} at <code>{}</code>{checked}", esc(&e.who), plural(n, "finding"), esc(short_sha(sha))))
         }
         _ => None,
     }
+}
+
+/// The short head of "submitted 2 finding(s) at <sha>; checked: …", all that is shown of it before findings are revealed.
+fn uncounted(t: &str) -> Option<&str> {
+    let (_, rest) = t.strip_prefix("submitted ")?.split_once(" finding(s) at ")?;
+    Some(short_sha(rest.split_once("; ").map_or(rest, |(sha, _)| sha)))
 }
 
 fn plural(n: &str, noun: &str) -> String {
@@ -1437,7 +1467,8 @@ fn summary_json(r: &Review, f: &Finding) -> Value {
     })
 }
 
-fn list_json(r: &Review, now: Ms) -> Value {
+/// A review's row in `/api/reviews`.
+pub fn list_json(r: &Review, now: Ms) -> Value {
     json!({
         "id": r.id,
         "pr": r.pr.url(),
@@ -1456,7 +1487,7 @@ fn list_json(r: &Review, now: Ms) -> Value {
         "failure": r.failure,
         "parent": r.parent,
         "reviewers": r.slots.iter().map(|s| &s.agent).collect::<Vec<_>>(),
-        "findings": r.findings.len(),
+        "findings": visible(r).count(),
         "path": format!("/r/{}", r.id),
     })
 }
@@ -1477,7 +1508,13 @@ pub fn review_json(r: &Review, rereviews: &[String], now: Ms, web: &str) -> Valu
                 if let Some(sub) = s.get_mut("submission").and_then(Value::as_object_mut) {
                     sub.insert("summary".into(), Value::String(String::new()));
                     sub.insert("verdict".into(), Value::Null);
+                    sub.remove("checked");
                 }
+            }
+        }
+        for e in m.get_mut("log").and_then(Value::as_array_mut).into_iter().flatten().filter(|e| e["kind"] == "submit") {
+            if let Some(sha) = e["text"].as_str().and_then(uncounted).map(str::to_string) {
+                e["text"] = Value::String(format!("submitted at {sha}"));
             }
         }
     }
@@ -1495,7 +1532,6 @@ pub fn review_json(r: &Review, rereviews: &[String], now: Ms, web: &str) -> Valu
     }
     m.insert("pr".into(), json!({ "url": r.pr.url(), "repo": r.pr.short(), "number": r.pr.number }));
     m.insert("revealed".into(), json!(r.revealed()));
-    m.insert("hidden_findings".into(), json!(r.findings.len() - visible(r).count()));
     m.insert("summary".into(), visible(r).map(|f| summary_json(r, f)).collect());
     m.insert("timeline".into(), json!(timeline(r)));
     m.insert("rereviews".into(), json!(rereviews));
