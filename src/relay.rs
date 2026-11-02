@@ -45,6 +45,8 @@ const AMENDS_PER_FINDING: u32 = 3;
 const FAILED_KEPT: usize = 10;
 /// Re-reviews the hub queues by itself along one line of reviews that reviewers' drops failed.
 const MAX_RETRIES: u32 = 2;
+/// How long the hub may wait for reviewers to queue again a review that found no team in time.
+const REQUEUE_MS: Ms = 24 * 3600 * 1000;
 /// Unfinished reviews one Tailscale login may have requested at a time.
 const REVIEWS_PER_LOGIN: usize = 5;
 const AGENTS_PER_LOGIN: usize = 20;
@@ -582,6 +584,12 @@ pub struct Review {
     /// the hub; 0 for one an author asked for.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub retries: u32,
+    /// Set while the hub waits to queue it again, as it found no team in time: until when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requeue_until: Option<Ms>,
+    /// The review that found no team in time and that the hub queued again as this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requeued: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -1738,6 +1746,19 @@ impl State {
                 ));
             }
         }
+        for r in self.reviews.iter().filter(|r| r.author == name) {
+            if let Some(until) = r.requeue_until {
+                out.push(Action::info(
+                    &r.id,
+                    format!(
+                        "{}: your review of {} found no team in time; the hub queues it again once reviewers are free (within {}). Keep calling `wait`, or stop and call it later: the result waits for you.",
+                        r.id,
+                        r.pr.short(),
+                        text::dur(until.saturating_sub(now))
+                    ),
+                ));
+            }
+        }
         out.sort_by_key(|a| !a.urgent);
         out
     }
@@ -1848,6 +1869,8 @@ impl State {
             missing: None,
             blocks_from: None,
             retries: 0,
+            requeue_until: None,
+            requeued: None,
         };
         let from = if r.picked.is_empty() { String::new() } else { format!(" from {}", r.picked.join(", ")) };
         r.log(now, author, "request", format!("requested {reviewers} reviewer(s){from}. {}", r.note));
@@ -2332,11 +2355,12 @@ impl State {
         req.note = note.to_string();
         req.title = title.and_then(|t| one_line(t, MAX_TITLE));
         req.head_sha = Some(head_sha.to_string());
-        self.follow(author, prev, req, 0, now)
+        self.follow(author, prev, req, 0, None, now)
     }
 
-    /// Queues `req`, a re-review of `prev`: the `retries`th the hub made by itself.
-    fn follow(&mut self, author: &str, prev: Review, mut req: NewReview, retries: u32, now: Ms) -> Result<String> {
+    /// Queues `req`, a re-review of `prev`: the `retries`th the hub made by itself, or the one it
+    /// queued in place of the review `requeued`, which found no team in time.
+    fn follow(&mut self, author: &str, prev: Review, mut req: NewReview, retries: u32, requeued: Option<&str>, now: Ms) -> Result<String> {
         let failed = prev.broke_off();
         let reviewed = if failed {
             prev.since_sha.clone()
@@ -2355,30 +2379,13 @@ impl State {
         let mut r = self.new_review(author, req, now)?;
         r.params = ReviewParams { reviewers: r.params.reviewers, ..prev.params };
         r.deadline = now + r.params.queue_secs * 1000;
-        let busy: HashSet<String> = self
-            .reviews
-            .iter()
-            .filter(|r| r.phase.active())
-            .flat_map(|r| r.active_slots().map(|s| s.agent.clone()))
-            .collect();
-        let mut candidates: Vec<(String, String, Model)> = Vec::new();
-        for s in prev.slots.iter().filter(|s| {
-            s.active()
-                && self.agents.online(&s.agent, now)
-                && !busy.contains(&s.agent)
-                && self.agents.get(&s.agent).is_some_and(|a| a.role == Role::Reviewer && a.login.eq_ignore_ascii_case(&s.login))
-        }) {
-            let author = s.login.eq_ignore_ascii_case(&r.author_login);
-            let model = self.agents.get(&s.agent).and_then(|a| a.model);
-            if let Some(model) = model
-                && (author || !candidates.iter().any(|(_, l, _)| l.eq_ignore_ascii_case(&s.login)))
-            {
-                candidates.push((s.agent.clone(), s.login.clone(), model));
-            }
-        }
         r.parent = Some(prev.id.clone());
         r.iteration = prev.iteration + u32::from(retries == 0);
         r.retries = retries;
+        r.requeued = requeued.map(String::from);
+        if let Some(x) = requeued.and_then(|x| self.review(x)) {
+            hold_declines(&mut r, x, now);
+        }
         r.since_sha = reviewed;
         for f in prev.findings.iter() {
             let (severity, origin, ruling) = match &f.outcome {
@@ -2405,25 +2412,12 @@ impl State {
                 ruling,
             });
         }
-        for (agent, login, model) in candidates {
-            if r.slots.len() >= r.params.reviewers || !r.fits(Some(model)) {
-                continue;
-            }
-            r.slots.push(Slot {
-                agent: agent.clone(),
-                login,
-                model: Some(model),
-                joined: now,
-                dropped: None,
-                submission: None,
-                tasked: None,
-                tickets: BTreeMap::new(),
-            });
-            r.log(now, &agent, "accept", format!("assigned again (reviewed {})", prev.id));
-        }
+        self.seat_again(&mut r, &prev, now);
         let new_id = r.id.clone();
         self.reviews.push(r);
-        if retries > 0 {
+        if let Some(x) = requeued {
+            self.agents.notify(author, &new_id, requeued_notice(&new_id, x), now);
+        } else if retries > 0 {
             let lost = match prev.missing_model().filter(|_| prev.active_slots().next().is_some()) {
                 Some(m) if prev.slots.iter().filter(|s| s.model == Some(m)).count() > 1 => format!("its {} reviewers", m.as_str()),
                 Some(m) => format!("its {} reviewer", m.as_str()),
@@ -2445,6 +2439,49 @@ impl State {
             }
         }
         Ok(new_id)
+    }
+
+    /// Puts into re-review `r`'s team the reviewers who finished `prev` and are online, idle and
+    /// not declining it, one per login other than the author's, as far as both programs still fit.
+    fn seat_again(&self, r: &mut Review, prev: &Review, now: Ms) {
+        let busy: HashSet<String> = self
+            .reviews
+            .iter()
+            .filter(|r| r.phase.active())
+            .flat_map(|r| r.active_slots().map(|s| s.agent.clone()))
+            .collect();
+        let mut candidates: Vec<(String, String, Model)> = Vec::new();
+        for s in prev.slots.iter().filter(|s| {
+            s.active()
+                && !r.declined_until(&s.agent).is_some_and(|t| now < t)
+                && self.agents.online(&s.agent, now)
+                && !busy.contains(&s.agent)
+                && self.agents.get(&s.agent).is_some_and(|a| a.role == Role::Reviewer && a.login.eq_ignore_ascii_case(&s.login))
+        }) {
+            let author = s.login.eq_ignore_ascii_case(&r.author_login);
+            let model = self.agents.get(&s.agent).and_then(|a| a.model);
+            if let Some(model) = model
+                && (author || !candidates.iter().any(|(_, l, _)| l.eq_ignore_ascii_case(&s.login)))
+            {
+                candidates.push((s.agent.clone(), s.login.clone(), model));
+            }
+        }
+        for (agent, login, model) in candidates {
+            if r.slots.len() >= r.params.reviewers || !r.fits(Some(model)) {
+                continue;
+            }
+            r.slots.push(Slot {
+                agent: agent.clone(),
+                login,
+                model: Some(model),
+                joined: now,
+                dropped: None,
+                submission: None,
+                tasked: None,
+                tickets: BTreeMap::new(),
+            });
+            r.log(now, &agent, "accept", format!("assigned again (reviewed {})", prev.id));
+        }
     }
 
     /// A human stops an unfinished review; `by` is their name as shown.
@@ -2529,7 +2566,7 @@ impl State {
         let engaged: HashSet<String> = self
             .reviews
             .iter()
-            .filter(|r| r.phase.active())
+            .filter(|r| r.phase.active() || r.requeue_until.is_some())
             .flat_map(|r| std::iter::once(r.author.clone()).chain(r.slots.iter().map(|s| s.agent.clone())))
             .collect();
         let stale = |a: &Agent| now.saturating_sub(a.last_seen) >= FORGET_AGENT_MS;
@@ -2547,8 +2584,9 @@ impl State {
     /// none outlives the review that followed it.
     fn trim_history(&mut self) {
         let unattended = |r: &Review| r.phase == Phase::Failed && r.slots.is_empty();
+        let parents: HashSet<String> = self.reviews.iter().filter(|r| r.requeue_until.is_some()).filter_map(|r| r.parent.clone()).collect();
         for (kind, cap) in [(false, self.history), (true, FAILED_KEPT.min(self.history))] {
-            let of_kind = |r: &Review| !r.phase.active() && unattended(r) == kind;
+            let of_kind = |r: &Review| !r.phase.active() && r.requeue_until.is_none() && !parents.contains(&r.id) && unattended(r) == kind;
             loop {
                 let mut per_login: BTreeMap<String, usize> = BTreeMap::new();
                 for r in self.reviews.iter().filter(|r| of_kind(r)) {
@@ -2564,7 +2602,7 @@ impl State {
                     .position(|r| of_kind(r) && per_login[&r.author_login.to_ascii_lowercase()] == most);
                 let Some(i) = oldest else { break };
                 let gone = self.reviews.remove(i);
-                self.reviews.retain(|r| r.phase != Phase::Failed || r.pr != gone.pr || r.seq() > gone.seq());
+                self.reviews.retain(|r| r.phase != Phase::Failed || r.requeue_until.is_some() || parents.contains(&r.id) || r.pr != gone.pr || r.seq() > gone.seq());
             }
         }
     }
@@ -2597,7 +2635,8 @@ impl State {
                 self.retry(i, now);
             }
         }
-        self.queue(now) || changed
+        changed |= self.queue(now);
+        self.requeue(now) || changed
     }
 
     /// Re-queues review `i`, which reviewers' drops have just failed, as `request_rereview` from
@@ -2605,20 +2644,111 @@ impl State {
     /// asked for another review of the PR, or if none can be queued.
     fn retry(&mut self, i: usize, now: Ms) {
         let r = self.reviews[i].clone();
-        let other = self.reviews.iter().any(|o| {
-            o.id != r.id && o.pr == r.pr && o.author_login.eq_ignore_ascii_case(&r.author_login) && (o.phase.active() || o.seq() > r.seq())
-        });
+        let other = superseded(&self.reviews, &r);
         let (author, id, notice) = (r.author.clone(), r.id.clone(), failure_notice(&r));
         let queued = r.retries < MAX_RETRIES && !other && {
             let mut req = NewReview::new(&r.pr.url());
             req.note = r.note.clone();
             req.head_sha = r.head_sha.clone();
             let retries = r.retries + 1;
-            self.follow(&author, r, req, retries, now).is_ok()
+            self.follow(&author, r, req, retries, None, now).is_ok()
         };
         if !queued {
             self.agents.outcome(&author, &id, notice, now);
         }
+    }
+
+    /// Settles the reviews the hub waits to queue again: drops those the author's login has
+    /// since asked for another review of the PR, tells the author of those that waited too long,
+    /// or can't be queued, to request them again, and queues again the oldest one a team could
+    /// now start, from reviewers that have called `wait` since any restart or lapsed offer.
+    /// Returns whether anything changed.
+    fn requeue(&mut self, now: Ms) -> bool {
+        if self.reviews.iter().all(|r| r.requeue_until.is_none()) {
+            return false;
+        }
+        let offered = self.allocate(now);
+        let lapsed = |a: &Agent| self.reviews.iter().any(|r| r.lapsed.contains(&a.name));
+        let free: Vec<&Agent> = self.free_reviewers(now).into_iter().filter(|a| !offered.contains_key(&a.name) && !self.agents.gone(&a.name) && !lapsed(a)).collect();
+        let mut ready = Vec::new();
+        let mut over = Vec::new();
+        for (i, r) in self.reviews.iter().enumerate() {
+            let Some(until) = r.requeue_until else { continue };
+            if superseded(&self.reviews, r) {
+                over.push((i, None));
+            } else if now >= until {
+                over.push((i, Some(format!("The hub couldn't queue it again within {}", text::dur(REQUEUE_MS)))));
+            } else if self.startable(r, &free, now) {
+                ready.push(i);
+            }
+        }
+        let changed = !over.is_empty() || !ready.is_empty();
+        for (i, why) in over {
+            self.unpark(i, why, now);
+        }
+        for i in ready {
+            self.reviews[i].requeue_until = None;
+            match self.queue_again(i, now) {
+                Ok(_) => break,
+                Err(e) => self.unpark(i, Some(format!("The hub couldn't queue it again: {e:#}")), now),
+            }
+        }
+        changed
+    }
+
+    /// Stops waiting to queue review `i` again, telling its author `why` and how to try again,
+    /// unless it was superseded (`why` is `None`).
+    fn unpark(&mut self, i: usize, why: Option<String>, now: Ms) {
+        let r = &mut self.reviews[i];
+        r.requeue_until = None;
+        if let Some(why) = why {
+            let text = format!("[{}] {why}.\nNEXT: {}", r.id, next_try(r));
+            r.log(now, "relay", "requeue", why);
+            let (author, id) = (r.author.clone(), r.id.clone());
+            self.agents.outcome(&author, &id, text, now);
+        }
+    }
+
+    /// Whether review `r`, queued again, would get a team it can start with: its parent's
+    /// reviewers back in it and the rest from `free`, the free reviewers no older review is offered.
+    fn startable(&self, r: &Review, free: &[&Agent], now: Ms) -> bool {
+        let open = self.reviews.iter().filter(|o| o.phase.active() && o.author_login.eq_ignore_ascii_case(&r.author_login)).count();
+        if open >= REVIEWS_PER_LOGIN || (r.parent.is_none() && self.check_picked(&r.author, &r.picked, now).is_err()) {
+            return false;
+        }
+        let mut y = r.clone();
+        y.phase = Phase::Offering;
+        y.slots.clear();
+        y.declined.retain(|a| r.declined_until(a).is_some_and(|t| now < t));
+        if let Some(p) = r.parent.as_deref().and_then(|p| self.review(p)) {
+            self.seat_again(&mut y, p, now);
+        }
+        let seated_free = y.active_slots().all(|s| free.iter().any(|a| a.name == s.agent));
+        seated_free && (y.active_slots().count() >= y.params.reviewers || y.can_start_short() || free.iter().any(|a| y.can_join(a) && y.fillable(a, free)))
+    }
+
+    /// Queues review `i`, which found no team in time, again at its head, as its author was told
+    /// to: from its parent as `request_rereview` would, else as `request_review` would.
+    fn queue_again(&mut self, i: usize, now: Ms) -> Result<String> {
+        let x = self.reviews[i].clone();
+        let mut req = NewReview::new(&x.pr.url());
+        req.note = x.note.clone();
+        req.title = x.title.clone();
+        req.head_sha = x.head_sha.clone();
+        if let Some(p) = &x.parent {
+            let p = self.review(p).cloned().ok_or_else(|| anyhow!("{p}, which it re-reviews, is no longer in the hub's history"))?;
+            return self.follow(&x.author, p, req, x.retries, Some(&x.id), now);
+        }
+        req.reviewers = Some(x.params.reviewers);
+        req.picked = x.picked.clone();
+        let mut r = self.new_review(&x.author, req, now)?;
+        r.requeued = Some(x.id.clone());
+        hold_declines(&mut r, &x, now);
+        let id = r.id.clone();
+        self.reviews.push(r);
+        self.agents.notify(&x.author, &id, requeued_notice(&id, &x.id), now);
+        self.advance(now);
+        Ok(id)
     }
 
     /// Reviewers free to join a team: online, with a program, and in no unfinished review.
@@ -2682,7 +2812,9 @@ impl State {
         let mut changed = false;
         for i in 0..self.reviews.len() {
             let State { agents, reviews, .. } = self;
-            let short = (reviews[i].phase == Phase::Offering && now >= reviews[i].deadline).then(|| short_of(&reviews[i], reviews, agents, now));
+            let due = reviews[i].phase == Phase::Offering && now >= reviews[i].deadline;
+            let short = due.then(|| short_of(&reviews[i], reviews, agents, now));
+            let park = due && !requeued_line(reviews, &reviews[i]) && !superseded(reviews, &reviews[i]);
             let r = &mut reviews[i];
             if r.phase != Phase::Offering {
                 continue;
@@ -2714,6 +2846,9 @@ impl State {
                     text::dur(r.params.queue_secs * 1000),
                     short.unwrap_or_default()
                 );
+                if park {
+                    r.requeue_until = Some(now + REQUEUE_MS);
+                }
                 fail(r, agents, &why, now);
                 changed = true;
             } else if late {
@@ -3075,14 +3210,56 @@ fn failure_notice(r: &Review) -> String {
     if let Some(by) = &r.cancelled_by {
         return format!("[{}] {by} (a human) cancelled the review of {}.\nNEXT: don't request it again unless your human asks.", r.id, r.pr.url());
     }
-    let retry = match &r.parent {
+    let next = match r.requeue_until {
+        Some(_) => format!("nothing to do; the hub queues it again once reviewers are free (within {}), and its result waits for you in `wait`.", text::dur(REQUEUE_MS)),
+        None => next_try(r),
+    };
+    format!("[{}] Review of {} failed: {}.\nNEXT: {next}", r.id, r.pr.url(), r.failure.as_deref().unwrap_or(""))
+}
+
+/// How the author of failed review `r` can try again.
+fn next_try(r: &Review) -> String {
+    match &r.parent {
         _ if r.broke_off() => format!("call `request_rereview` with review_id \"{}\" and new_head_sha (the same commit if nothing changed).", r.id),
         Some(p) => format!(
             "to try again later, call `request_rereview` with review_id \"{p}\" and new_head_sha (the same commit if nothing changed), which carries its findings over; `request_review` would start afresh without them."
         ),
         None => "you can try `request_review` again later.".to_string(),
-    };
-    format!("[{}] Review of {} failed: {}.\nNEXT: {retry}", r.id, r.pr.url(), r.failure.as_deref().unwrap_or(""))
+    }
+}
+
+/// Carries over to `r` the declines of `from` that still hold, so they hold there too, logged
+/// before its request.
+fn hold_declines(r: &mut Review, from: &Review, now: Ms) {
+    let mut held: Vec<LogEntry> = Vec::new();
+    for a in from.declined.iter().filter(|a| from.declined_until(a).is_some_and(|t| now < t)) {
+        r.declined.insert(a.clone());
+        held.extend(from.log.iter().rev().find(|e| e.kind == "decline" && e.who == *a).cloned());
+    }
+    held.sort_by_key(|e| e.at);
+    r.log.splice(0..0, held);
+}
+
+/// What the author is told when the hub queues `id` in place of `failed`.
+fn requeued_notice(id: &str, failed: &str) -> String {
+    format!("[{id}] Reviewers are free now, so the hub queued {id} in place of {failed}, which found no team in time.\nNEXT: nothing to do; keep calling `wait`.")
+}
+
+/// Whether `r`'s author login has asked for another review of its PR: one unfinished or newer.
+fn superseded(reviews: &[Review], r: &Review) -> bool {
+    reviews.iter().any(|o| o.id != r.id && o.pr == r.pr && o.author_login.eq_ignore_ascii_case(&r.author_login) && (o.phase.active() || o.seq() > r.seq()))
+}
+
+/// Whether the hub has queued `r`'s line again after a queue timeout: `r`, or a review it retries.
+fn requeued_line(reviews: &[Review], r: &Review) -> bool {
+    let mut at = Some(r);
+    while let Some(x) = at {
+        if x.requeued.is_some() {
+            return true;
+        }
+        at = x.parent.as_deref().filter(|_| x.retries > 0).and_then(|p| reviews.iter().find(|o| o.id == p));
+    }
+    false
 }
 
 /// Why no full team took queued review `r`, as things stand: no reviewer of a program that may
