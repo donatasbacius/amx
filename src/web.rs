@@ -1068,7 +1068,9 @@ fn render_verdict(out: &mut String, r: &Review, prs: &[Review], q: Option<&Queue
         }
         Phase::Failed => {
             let again = match (&r.parent, retried(r, prs)) {
+                (_, Some(c)) if c.requeued.as_deref() == Some(&r.id) => format!("The hub queued it again as {}.", c.id),
                 (_, Some(c)) => format!("The hub retried it as {}.", c.id),
+                _ if r.requeue_until.is_some() => "The hub queues it again once reviewers are free.".into(),
                 _ if r.broke_off() => "The author can request a re-review.".into(),
                 (Some(p), _) => format!("The author can re-review it from {p}."),
                 (None, _) => "The author can request it again.".into(),
@@ -1245,6 +1247,7 @@ fn gist(r: &Review, can: bool, locked: bool) -> String {
         }
         Phase::Failed => match &r.cancelled_by {
             Some(by) => format!("by {by}"),
+            None if r.requeue_until.is_some() => format!("{}, to be queued again", failure(r).0),
             None => failure(r).0,
         },
         Phase::Done => {
@@ -1262,9 +1265,9 @@ fn gist(r: &Review, can: bool, locked: bool) -> String {
     }
 }
 
-/// The review the hub queued to finish `r`, of `prs`.
+/// The review the hub queued to finish `r`, or in its place, of `prs`.
 fn retried<'a>(r: &Review, prs: &'a [Review]) -> Option<&'a Review> {
-    prs.iter().find(|x| x.retries > 0 && x.parent.as_deref() == Some(&r.id))
+    prs.iter().find(|x| (x.retries > 0 && x.parent.as_deref() == Some(&r.id)) || x.requeued.as_deref() == Some(&r.id))
 }
 
 /// On an old review, one line naming the PR's latest review and, if that one hasn't finished, the last result.
@@ -1338,11 +1341,15 @@ pub fn render_review_page(r: &Review, prs: &[Review], q: Option<&Queue>, now: Ms
         meta.push(format!("<code>{}</code>", esc(short_sha(h))));
     }
     meta.push(format!("requested {}", time_tag(r.created, now)));
+    if let Some(x) = r.requeued.as_deref() {
+        meta.push(format!("queued again for <a href=\"/r/{0}\">{0}</a>", esc(x)));
+    }
     if let Some(p) = r.parent.as_deref().filter(|_| r.retries > 0) {
         meta.push(format!("retry of <a href=\"/r/{0}\">{0}</a>", esc(p)));
     }
     if let Some(c) = retried(r, prs) {
-        meta.push(format!("retried as <a href=\"/r/{0}\">{0}</a>", esc(&c.id)));
+        let how = if c.requeued.as_deref() == Some(&r.id) { "queued again as" } else { "retried as" };
+        meta.push(format!("{how} <a href=\"/r/{0}\">{0}</a>", esc(&c.id)));
     }
     let mut out = String::new();
     render_newer(&mut out, r, prs, may);
@@ -1515,6 +1522,12 @@ pub fn list_json(r: &Review, now: Ms) -> Value {
     });
     if r.retries > 0 {
         v["retries"] = json!(r.retries);
+    }
+    if let Some(t) = r.requeue_until {
+        v["requeue_until"] = json!(t);
+    }
+    if let Some(x) = &r.requeued {
+        v["requeued"] = json!(x);
     }
     v
 }

@@ -131,6 +131,11 @@ impl World {
                 self.s = fresh;
                 "restart".into()
             }
+            _ if self.rng.chance(2) && self.s.reviews.iter().all(|r| !r.phase.active()) => {
+                self.now += 25 * 3600 * 1000;
+                self.touch_alive();
+                "a day passes".into()
+            }
             _ => {
                 let secs = if self.rng.chance(10) { 600 } else { 1 + self.rng.below(120) as u64 };
                 return self.advance(secs);
@@ -283,6 +288,12 @@ fn random_actors_never_break_the_queue_rules() {
             if r.retries > 0 {
                 *seen.entry(if r.phase == Phase::Done { "retry done" } else { "retried" }).or_default() += 1;
             }
+            if r.requeued.is_some() {
+                *seen.entry(if r.phase == Phase::Done { "queued again, done" } else { "queued again" }).or_default() += 1;
+            }
+            if r.log.iter().any(|e| e.kind == "requeue") {
+                *seen.entry("not queued again in time").or_default() += 1;
+            }
             if r.retries == 2 && r.broke_off() {
                 *seen.entry("retry cap").or_default() += 1;
             }
@@ -305,7 +316,7 @@ fn random_actors_never_break_the_queue_rules() {
             }
         }
     }
-    for kind in ["done", "cancelled", "queue timeout", "dropped out", "re-review", "retried", "retry done", "retry cap", "started with fewer", "released", "released for an older review", "lapsed", "asked again after declining", "ruled"] {
+    for kind in ["done", "cancelled", "queue timeout", "dropped out", "re-review", "retried", "retry done", "retry cap", "queued again", "queued again, done", "not queued again in time", "started with fewer", "released", "released for an older review", "lapsed", "asked again after declining", "ruled"] {
         assert!(seen.get(kind).is_some_and(|n| *n > 0), "no run reached {kind}: {seen:?}");
     }
 }

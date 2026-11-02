@@ -33,6 +33,8 @@ struct Bounds {
     rereviews: usize,
     /// Retries the hub queues, in all; a state with more is checked but not explored further.
     retries: usize,
+    /// Reviews the hub queues again after they found no team in time, likewise.
+    requeues: usize,
     cancels: usize,
     /// Times reviewers go offline, in all.
     absences: usize,
@@ -50,6 +52,7 @@ const BASE: Bounds = Bounds {
     requests: 1,
     rereviews: 0,
     retries: 0,
+    requeues: 0,
     cancels: 1,
     absences: 0,
     counts: &[2],
@@ -58,14 +61,15 @@ const BASE: Bounds = Bounds {
     strays: false,
 };
 
-const SMALL: [Bounds; 4] = [
+const SMALL: [Bounds; 5] = [
     Bounds { name: "two requests queue for three reviewers", requests: 2, ..BASE },
     Bounds { name: "a review and its re-review", reviewers: 2, rereviews: 1, cancels: 0, submissions: &[&["major"]], ..BASE },
     Bounds { name: "a reviewer goes offline", absences: 1, ..BASE },
     Bounds { name: "a review that loses its reviewers is retried", reviewers: 2, retries: 1, cancels: 0, ..BASE },
+    Bounds { name: "a review no team takes in time is queued again", reviewers: 2, absences: 1, requeues: 1, cancels: 0, ..BASE },
 ];
 
-const LARGE: [Bounds; 4] = [
+const LARGE: [Bounds; 5] = [
     Bounds { name: "two requests queue for three reviewers", requests: 2, absences: 1, counts: &[2, 3], strays: true, ..BASE },
     Bounds { name: "two authors and four reviewers", authors: 2, reviewers: 4, requests: 2, ..BASE },
     Bounds {
@@ -77,6 +81,7 @@ const LARGE: [Bounds; 4] = [
         ..BASE
     },
     Bounds { name: "a review retried up to the cap", retries: 2, absences: 1, submissions: &[&[], &["major"]], ..BASE },
+    Bounds { name: "a review no team takes in time is queued again", absences: 1, requeues: 1, cancels: 0, submissions: &[&["major"]], ..BASE },
 ];
 
 /// States one search may keep before it gives up, a few kilobytes each.
@@ -136,6 +141,7 @@ fn deadlines(s: &State) -> Vec<Ms> {
             v.push(a.last_seen + t.drop_after_secs * 1000);
         }
     }
+    v.extend(s.reviews.iter().filter_map(|r| r.requeue_until));
     for r in s.reviews.iter().filter(|r| r.phase.active()) {
         v.push(r.deadline);
         if r.phase == Phase::Offering {
@@ -148,7 +154,7 @@ fn deadlines(s: &State) -> Vec<Ms> {
 
 fn actions(s: &State, now: Ms, absences: usize, b: &Bounds) -> Vec<Act> {
     let mut v = Vec::new();
-    if s.reviews.iter().filter(|r| r.retries > 0).count() > b.retries {
+    if s.reviews.iter().filter(|r| r.retries > 0 && r.requeued.is_none()).count() > b.retries || s.reviews.iter().filter(|r| r.requeued.is_some()).count() > b.requeues {
         return v;
     }
     let requested = s.reviews.iter().filter(|r| r.parent.is_none()).count();
@@ -307,7 +313,8 @@ fn key(s: &State, now: Ms) -> String {
     let mut k = String::new();
     for r in &s.reviews {
         let parent = r.parent.as_deref().map(pos);
-        write!(k, "\n{} {} {:?} {} {parent:?} {} {:?}", r.author, r.pr.number, r.head_sha, r.params.reviewers, r.retries, r.phase).unwrap();
+        let requeue = (r.requeue_until.map(left), r.requeued.as_deref().map(pos));
+        write!(k, "\n{} {} {:?} {} {parent:?} {} {:?} {requeue:?}", r.author, r.pr.number, r.head_sha, r.params.reviewers, r.retries, r.phase).unwrap();
         if r.phase == Phase::Done && rereview(&s.reviews, &r.id).is_none() {
             for x in r.active_slots() {
                 write!(k, " {}", x.agent).unwrap();
@@ -348,6 +355,7 @@ fn reached(pre: &State, s: &State, seen: &mut BTreeMap<&'static str, usize>) {
         let was = prev.map(|p| p.phase);
         if was.is_some_and(|p| p.active()) && !r.phase.active() {
             hit(match r.phase {
+                Phase::Done if r.requeued.is_some() => "queued again, done",
                 Phase::Done if r.retries > 0 => "retry done",
                 Phase::Done if r.parent.is_some() => "re-review done",
                 Phase::Done => "done",
@@ -358,6 +366,12 @@ fn reached(pre: &State, s: &State, seen: &mut BTreeMap<&'static str, usize>) {
         }
         if prev.is_none() && r.retries > 0 {
             hit("retried");
+        }
+        if prev.is_none() && r.requeued.is_some() {
+            hit("queued again");
+        }
+        if prev.is_some_and(|p| p.requeue_until.is_some()) && r.log.iter().any(|e| e.kind == "requeue") {
+            hit("not queued again in time");
         }
         if was == Some(Phase::Offering) && matches!(r.phase, Phase::Reviewing) {
             hit("started");
@@ -437,6 +451,9 @@ fn every_interleaving_keeps_the_queue_rules() {
         "dropped out",
         "retried",
         "retry done",
+        "queued again",
+        "queued again, done",
+        "not queued again in time",
         "started",
         "second round",
         "released",

@@ -84,6 +84,16 @@ impl Sim {
         }
     }
 
+    /// A day passes in one step, so a review the hub waits to queue again no longer will.
+    fn day_passes(&mut self) {
+        self.now += 24 * 3600 * 1000;
+        for a in self.alive.clone() {
+            let login = self.s.agents.get(&a).unwrap().login.clone();
+            self.s.touch(&a, &who(&login), None, self.now).unwrap();
+        }
+        self.s.tick(self.now);
+    }
+
     fn events(&mut self, name: &str) -> String {
         self.s
             .take_events(name, true, false, self.now).0
@@ -503,7 +513,12 @@ fn no_reviewers_fails_back_to_author() {
     sim.advance(10);
     assert_eq!(sim.phase(&id), Phase::Failed);
     let failed = sim.events("alice-codex");
-    assert!(failed.contains("failed: no full team of 2 reviewer(s), claude and codex, accepted it within 2h00m: no claude reviewer was online.\nNEXT: you can try `request_review` again later."), "{failed}");
+    assert!(failed.contains("failed: no full team of 2 reviewer(s), claude and codex, accepted it within 2h00m: no claude reviewer was online.\nNEXT: nothing to do; the hub queues it again once reviewers are free (within 24h00m), and its result waits for you in `wait`."), "{failed}");
+    assert!(sim.task("alice-codex").contains(&format!("{id}: your review of rust-lang/rust#1 found no team in time; the hub queues it again once reviewers are free (within 24h00m).")), "{}", sim.task("alice-codex"));
+    sim.day_passes();
+    let expired = sim.events("alice-codex");
+    assert_eq!(expired, format!("[{id}] The hub couldn't queue it again within 24h00m.\nNEXT: you can try `request_review` again later."));
+    assert!(sim.s.next_actions("alice-codex", sim.now).is_empty());
 }
 
 #[test]
@@ -664,7 +679,7 @@ fn a_failed_rereview_can_be_retried_from_its_parent() {
     sim.advance(QUEUE);
     assert_eq!(sim.phase(&id2), Phase::Failed);
     let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
-    assert!(index.contains("<span>no team within 2 hours ·</span> <span>last: unresolved ·</span> <span>2 reviews ·</span> <span>alice-codex</span></span>"), "the PR still stands where it did: {index}");
+    assert!(index.contains("<span>no team within 2 hours, to be queued again ·</span> <span>last: unresolved ·</span> <span>2 reviews ·</span> <span>alice-codex</span></span>"), "the PR still stands where it did: {index}");
     sim.join("rev-new", "friend5@example.com", Role::Reviewer);
     let id3 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     let r3 = sim.s.review(&id3).unwrap();
@@ -1886,6 +1901,9 @@ fn failed_requests_do_not_push_finished_reviews_out_of_history() {
         sim.s.request_review("bob-codex", pr(n), sim.now).unwrap();
         sim.advance(QUEUE);
     }
+    let failed = || sim.s.reviews.iter().filter(|r| r.phase == Phase::Failed).count();
+    assert_eq!(failed(), 6, "kept while the hub waits to queue them again");
+    sim.day_passes();
     let failed = sim.s.reviews.iter().filter(|r| r.phase == Phase::Failed).count();
     assert_eq!(failed, 3);
     assert!(sim.s.review(&done).is_some(), "unanswered requests don't count against real reviews");
@@ -1922,6 +1940,7 @@ fn a_failed_review_goes_with_the_later_review_of_its_pr() {
     let other = sim.s.request_review("alice-codex", app(2), sim.now).unwrap();
     sim.advance(QUEUE);
     assert_eq!((sim.phase(&failed), sim.phase(&other)), (Phase::Failed, Phase::Failed));
+    sim.day_passes();
     sim.join_as("rev-a", "alice@example.com", Model::Claude);
     sim.join_as("rev-b", "friend1@example.com", Model::Codex);
     let later = approve(&mut sim, 1);
@@ -1952,6 +1971,9 @@ fn a_failed_rereview_points_back_to_the_review_it_follows() {
     let id2 = sim.s.rereview("alice-codex", &id, SHA2, "fixed", None, sim.now).unwrap();
     sim.advance(QUEUE);
     assert_eq!(sim.phase(&id2), Phase::Failed);
+    let page = amx::web::render_review(sim.s.review(&id2).unwrap());
+    assert!(page.contains("no claude reviewer was online. The hub queues it again once reviewers are free.</p>"), "{page}");
+    sim.day_passes();
     let ev = sim.events("alice-codex");
     assert!(ev.contains(&format!("call `request_rereview` with review_id \"{id}\"")), "{ev}");
     let page = amx::web::render_review(sim.s.review(&id2).unwrap());
@@ -2746,6 +2768,240 @@ fn no_retry_of_a_review_a_human_cancelled_after_a_drop() {
 }
 
 #[test]
+fn a_review_no_team_took_is_queued_again_once_one_is_free() {
+    let mut sim = mixed(&[("cl-a", Model::Claude)]);
+    let pr = "https://github.com/example-org/app/pull/9";
+    let mut req = titled(pr);
+    req.head_sha = Some(SHA.into());
+    req.note = "Adds a cache".into();
+    let id = sim.s.request_review("alice-codex", req, sim.now).unwrap();
+    sim.advance(QUEUE);
+    assert_eq!(sim.phase(&id), Phase::Failed);
+    assert!(sim.events("alice-codex").contains("NEXT: nothing to do; the hub queues it again once reviewers are free"));
+    sim.advance(3600);
+    assert_eq!(sim.s.reviews.len(), 1, "not while no team could start it");
+    let status = amx::text::status(sim.s.review(&id).unwrap(), "alice-codex", sim.now, "");
+    assert!(status.contains("no codex reviewer was online. The hub queues it again once reviewers are free.\n"), "{status}");
+    sim.s = reload(&sim.s, sim.now, sim.now);
+    sim.join_as("cx-a", "friend9@example.com", Model::Codex);
+    assert_eq!(sim.s.reviews.len(), 1, "not with cl-a, which hasn't called since the restart");
+    sim.advance(10);
+    let y = sim.s.reviews.last().unwrap().clone();
+    assert_eq!((y.requeued.as_deref(), y.parent.as_deref(), y.head_sha.as_deref(), y.note.as_str(), y.phase), (Some(id.as_str()), None, Some(SHA), "Adds a cache", Phase::Offering));
+    assert_eq!(sim.s.review(&id).unwrap().requeue_until, None);
+    assert_eq!(sim.events("alice-codex"), format!("[{0}] Reviewers are free now, so the hub queued {0} in place of {id}, which found no team in time.\nNEXT: nothing to do; keep calling `wait`.", y.id));
+    let prs: Vec<_> = sim.s.reviews.clone();
+    let page = amx::web::render_review_page(&prs[0], &prs, None, sim.now, &|_| false);
+    assert!(page.contains(&format!("The hub queued it again as {}.", y.id)) && page.contains("queued again as <a"), "{page}");
+    let page = amx::web::render_review_page(&prs[1], &prs, None, sim.now, &|_| false);
+    assert!(page.contains(&format!("queued again for <a href=\"/r/{id}\">")), "{page}");
+
+    sim.leave("cx-a");
+    sim.advance(QUEUE);
+    assert_eq!(sim.phase(&y.id), Phase::Failed);
+    assert_eq!(sim.s.review(&y.id).unwrap().requeue_until, None, "once per line");
+    assert!(sim.events("alice-codex").contains("NEXT: you can try `request_review` again later."));
+}
+
+#[test]
+fn a_review_no_team_took_is_not_queued_again_after_another_request() {
+    let mut sim = mixed(&[("cl-a", Model::Claude)]);
+    sim.join("alice-claude", "alice@example.com", Role::Author);
+    let pr = "https://github.com/example-org/app/pull/9";
+    let id = sim.s.request_review("alice-codex", titled(pr), sim.now).unwrap();
+    sim.advance(QUEUE);
+    assert!(sim.s.review(&id).unwrap().requeue_until.is_some());
+    let mut req = titled(pr);
+    req.head_sha = Some(SHA2.into());
+    let newer = sim.s.request_review("alice-claude", req, sim.now).unwrap();
+    assert_eq!(sim.s.review(&id).unwrap().requeue_until, None, "another agent of the login asked again");
+    sim.s.cancel(&newer, "a human", sim.now).unwrap();
+    sim.join_as("cx-a", "friend9@example.com", Model::Codex);
+    assert_eq!(sim.s.reviews.len(), 2);
+    assert!(!sim.events("alice-codex").contains("hub queued"));
+}
+
+fn at_head(pr: &str, picked: &[&str]) -> NewReview {
+    let mut req = titled(pr);
+    req.head_sha = Some(SHA.into());
+    req.picked = picked.iter().map(|s| s.to_string()).collect();
+    req
+}
+
+#[test]
+fn a_review_that_cant_be_queued_again_does_not_hold_up_younger_ones() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex), ("cx-b", Model::Codex)]);
+    sim.join("bob-codex", "bob@example.com", Role::Author);
+    let mut req = at_head("https://github.com/example-org/app/pull/1", &["cl-a", "cx-a", "cx-b"]);
+    req.reviewers = Some(2);
+    let x = sim.s.request_review("alice-codex", req, sim.now).unwrap();
+    sim.leave("cx-a");
+    sim.leave("cx-b");
+    sim.advance(600);
+    let z = sim.s.request_review("bob-codex", at_head("https://github.com/example-org/app/pull/2", &[]), sim.now).unwrap();
+    sim.advance(QUEUE);
+    assert!(sim.s.review(&x).unwrap().requeue_until.is_some() && sim.s.review(&z).unwrap().requeue_until.is_some());
+    assert!(amx::web::list_json(sim.s.review(&x).unwrap(), sim.now)["requeue_until"].is_u64());
+    sim.events("alice-codex");
+    sim.join_as("cx-a", "friend1@example.com", Model::Codex);
+    let y = sim.s.reviews.last().unwrap().clone();
+    assert_eq!(y.requeued.as_deref(), Some(z.as_str()), "{x} names cx-b, which is offline, so {z} goes");
+    assert_eq!(amx::web::list_json(&y, sim.now)["requeued"], z.as_str());
+    assert!(sim.s.review(&x).unwrap().requeue_until.is_some());
+    sim.day_passes();
+    assert_eq!(sim.events("alice-codex"), format!("[{x}] The hub couldn't queue it again within 24h00m.\nNEXT: you can try `request_review` again later."));
+}
+
+#[test]
+fn a_review_its_authors_login_cant_add_to_does_not_hold_up_younger_ones() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex), ("cl-b", Model::Claude), ("cx-b", Model::Codex)]);
+    sim.join("bob-codex", "bob@example.com", Role::Author);
+    sim.leave("cx-b");
+    let pair = ["cl-a", "cx-a"];
+    let x = sim.s.request_review("alice-codex", at_head("https://github.com/example-org/app/pull/1", &pair), sim.now).unwrap();
+    let z = sim.s.request_review("bob-codex", at_head("https://github.com/example-org/app/pull/2", &pair), sim.now).unwrap();
+    sim.leave("cx-a");
+    sim.advance(QUEUE);
+    assert!(sim.s.review(&x).unwrap().requeue_until.is_some() && sim.s.review(&z).unwrap().requeue_until.is_some());
+    sim.join_as("cx-b", "friend3@example.com", Model::Codex);
+    let ids: Vec<String> = (10..15).map(|n| sim.s.request_review("alice-codex", at_head(&format!("https://github.com/example-org/app/pull/{n}"), &["cl-b", "cx-b"]), sim.now).unwrap()).collect();
+    sim.accept("cl-b", &ids[0]);
+    sim.accept("cx-b", &ids[0]);
+    sim.join_as("cx-a", "friend1@example.com", Model::Codex);
+    let y = sim.s.reviews.iter().find(|r| r.requeued.is_some()).unwrap();
+    assert_eq!(y.requeued.as_deref(), Some(z.as_str()), "alice has 5 unfinished reviews, so {z} goes before {x}");
+    assert!(sim.s.review(&x).unwrap().requeue_until.is_some());
+}
+
+#[test]
+fn a_rereview_waiting_to_be_queued_again_keeps_its_parent() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    sim.join("bob-codex", "bob@example.com", Role::Author);
+    sim.s.history = 1;
+    let p = sim.s.request_review("alice-codex", at_head(PR, &[]), sim.now).unwrap();
+    sim.accept("cl-a", &p);
+    sim.accept("cx-a", &p);
+    sim.submit("cl-a", &p, &[("major", "bad")]);
+    sim.submit("cx-a", &p, &[]);
+    sim.vote("cx-a", &p, &[("F1", "agree")]);
+    sim.advance(10);
+    assert_eq!(sim.phase(&p), Phase::Done);
+    sim.leave("cl-a");
+    sim.leave("cx-a");
+    sim.advance(600);
+    let x = sim.s.rereview("alice-codex", &p, SHA2, "fixed", None, sim.now).unwrap();
+    sim.advance(QUEUE);
+    sim.join_as("cl-b", "bob@example.com", Model::Claude);
+    sim.join_as("cx-b", "bob@example.com", Model::Codex);
+    let d = sim.s.request_review("bob-codex", at_head("https://github.com/rust-lang/rust/pull/7", &[]), sim.now).unwrap();
+    sim.accept("cl-b", &d);
+    sim.accept("cx-b", &d);
+    sim.submit("cl-b", &d, &[]);
+    sim.submit("cx-b", &d, &[]);
+    sim.advance(10);
+    assert!(sim.s.review(&p).is_some(), "history keeps the parent of a review the hub waits to queue again");
+    sim.join_as("cl-a", "friend0@example.com", Model::Claude);
+    sim.join_as("cx-a", "friend1@example.com", Model::Codex);
+    let y = sim.s.reviews.last().unwrap().clone();
+    assert_eq!((y.requeued.as_deref(), y.parent.as_deref(), y.iteration, y.findings.len()), (Some(x.as_str()), Some(p.as_str()), 2, 1));
+    let status = amx::text::status(&y, "alice-codex", sim.now, "");
+    assert!(status.contains(&format!(", queued again for {x}, re-review of {p}\n")), "{status}");
+}
+
+#[test]
+fn a_rereview_of_three_is_queued_again_with_two_of_its_reviewers() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex), ("cl-b", Model::Claude)]);
+    let mut req = at_head(PR, &[]);
+    req.reviewers = Some(3);
+    let p = sim.s.request_review("alice-codex", req, sim.now).unwrap();
+    for a in ["cl-a", "cx-a", "cl-b"] {
+        sim.accept(a, &p);
+    }
+    for a in ["cl-a", "cx-a", "cl-b"] {
+        sim.submit(a, &p, &[]);
+    }
+    for a in ["cl-a", "cx-a", "cl-b"] {
+        sim.leave(a);
+    }
+    sim.advance(600);
+    let x = sim.s.rereview("alice-codex", &p, SHA2, "fixed", None, sim.now).unwrap();
+    sim.advance(QUEUE);
+    sim.join_as("cl-a", "friend0@example.com", Model::Claude);
+    sim.join_as("cx-a", "friend1@example.com", Model::Codex);
+    let y = sim.s.reviews.last().unwrap().id.clone();
+    assert_eq!(sim.s.review(&y).unwrap().requeued.as_deref(), Some(x.as_str()));
+    sim.advance(Timing::default().offer_secs);
+    assert_eq!(sim.phase(&y), Phase::Reviewing, "it starts with the two it has, as a re-review asked for now would");
+}
+
+#[test]
+fn a_reviewer_that_let_another_offer_lapse_does_not_count_until_it_waits() {
+    let mut sim = mixed(&[("cl-a", Model::Claude)]);
+    sim.join("bob-codex", "bob@example.com", Role::Author);
+    let x = sim.s.request_review("alice-codex", at_head("https://github.com/example-org/app/pull/1", &[]), sim.now).unwrap();
+    sim.advance(QUEUE);
+    sim.leave("cl-a");
+    sim.advance(3600);
+    let o = sim.s.request_review("bob-codex", at_head("https://github.com/example-org/app/pull/2", &[]), sim.now).unwrap();
+    sim.join_as("cx-a", "friend9@example.com", Model::Codex);
+    sim.join_as("cl-a", "friend0@example.com", Model::Claude);
+    sim.accept("cl-a", &o);
+    sim.advance(200);
+    assert!(sim.s.review(&o).unwrap().lapsed.contains("cx-a"));
+    assert!(sim.s.reviews.iter().all(|r| r.requeued.is_none()), "cx-a hasn't called `wait` since its offer lapsed");
+    sim.s.set_waiting("cx-a", 1, sim.now);
+    assert_eq!(sim.s.offered("cx-a"), Some(o.as_str()), "once it waits, the review it let lapse comes first");
+    assert!(sim.s.review(&x).unwrap().requeue_until.is_some());
+}
+
+#[test]
+fn a_decline_that_still_holds_carries_over_when_the_hub_queues_a_review_again() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    let x = sim.s.request_review("alice-codex", at_head("https://github.com/example-org/app/pull/1", &[]), sim.now).unwrap();
+    sim.advance(QUEUE - 300);
+    sim.s.set_waiting("cl-a", 1, sim.now);
+    sim.s.decline("cx-a", &x, "no access", sim.now).unwrap();
+    sim.advance(300);
+    assert!(sim.s.review(&x).unwrap().requeue_until.is_some());
+    sim.join_as("cx-b", "friend7@example.com", Model::Codex);
+    let y = sim.s.reviews.last().unwrap();
+    assert_eq!(y.requeued.as_deref(), Some(x.as_str()));
+    assert!(y.declined.contains("cx-a") && y.declined_until("cx-a").is_some_and(|t| t > sim.now), "{:?}", y.declined);
+}
+
+#[test]
+fn a_reviewer_declining_a_rereview_is_not_put_back_in_its_team_when_it_is_queued_again() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    let p = sim.approved("alice-codex", &["cl-a", "cx-a"]);
+    sim.leave("cx-a");
+    sim.advance(Timing::default().online_secs);
+    let x = sim.s.rereview("alice-codex", &p, SHA2, "fixed", None, sim.now).unwrap();
+    sim.advance(QUEUE - 300);
+    sim.s.decline("cl-a", &x, "busy", sim.now).unwrap();
+    sim.advance(300);
+    assert!(sim.s.review(&x).unwrap().requeue_until.is_some());
+    sim.join_as("cx-a", "friend1@example.com", Model::Codex);
+    sim.join_as("cl-b", "friend2@example.com", Model::Claude);
+    let y = sim.s.reviews.last().unwrap();
+    assert_eq!(y.requeued.as_deref(), Some(x.as_str()));
+    assert!(y.slot("cl-a").is_none() && y.declined.contains("cl-a"), "{:?}", y.slots);
+    let kinds: Vec<&str> = y.log.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(&kinds[..2], ["decline", "request"], "{kinds:?}");
+}
+
+#[test]
+fn running_out_of_time_to_queue_again_is_a_change() {
+    let mut sim = mixed(&[("cl-a", Model::Claude)]);
+    let x = sim.s.request_review("alice-codex", at_head("https://github.com/example-org/app/pull/1", &[]), sim.now).unwrap();
+    sim.advance(QUEUE);
+    let until = sim.s.review(&x).unwrap().requeue_until.unwrap();
+    sim.advance((until - sim.now) / 1000 - 1);
+    assert!(sim.s.review(&x).unwrap().requeue_until.is_some());
+    assert!(sim.s.tick(until), "so waiters wake and the state is saved");
+    assert_eq!(sim.s.review(&x).unwrap().requeue_until, None);
+}
+
+#[test]
 fn a_review_that_lost_reviewers_before_an_upgrade_is_not_retried() {
     let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
     let id = sim.request("alice-codex", 2);
@@ -3081,9 +3337,9 @@ fn a_queued_review_near_its_cap_says_when_it_fails() {
     sim.advance(6 * 60);
     assert_eq!(sim.phase(&id), Phase::Failed);
     let page = amx::web::render_review(sim.s.review(&id).unwrap());
-    assert!(page.contains("No team of 2 reviewers, claude and codex, joined within 2 hours: no codex reviewer was online. The author can request it again."), "{page}");
+    assert!(page.contains("No team of 2 reviewers, claude and codex, joined within 2 hours: no codex reviewer was online. The hub queues it again once reviewers are free."), "{page}");
     let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
-    assert!(index.contains("<span>no team within 2 hours ·</span>"), "{index}");
+    assert!(index.contains("<span>no team within 2 hours, to be queued again ·</span>"), "{index}");
 }
 
 #[test]
@@ -3652,6 +3908,8 @@ fn a_rereview_that_found_no_team_points_back_to_the_review_it_follows() {
     sim.events("alice-codex");
     sim.advance(QUEUE);
     assert_eq!(sim.phase(&id2), Phase::Failed);
+    assert!(sim.events("alice-codex").contains("NEXT: nothing to do; the hub queues it again"));
+    sim.day_passes();
     let failed = sim.events("alice-codex");
     assert!(failed.contains(&format!("NEXT: to try again later, call `request_rereview` with review_id \"{id}\"")) && !failed.contains("You can try `request_review`"), "{failed}");
     let err = sim.s.rereview("alice-codex", &id2, SHA2, "", None, sim.now).unwrap_err().to_string();

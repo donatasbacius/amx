@@ -605,6 +605,9 @@ pub fn status(r: &Review, viewer: &str, now: Ms, web: &str) -> String {
     } else if r.phase.active() {
         let _ = write!(s, ", phase ends in {}", dur(r.deadline_left(now)));
     }
+    if let Some(p) = &r.requeued {
+        let _ = write!(s, ", queued again for {p}");
+    }
     if let Some(p) = &r.parent {
         let _ = write!(s, ", {} of {p}", if r.retries > 0 { "retry" } else { "re-review" });
     }
@@ -638,7 +641,8 @@ pub fn status(r: &Review, viewer: &str, now: Ms, web: &str) -> String {
         let _ = write!(s, "\n{}\n", res.text);
     }
     if let Some(f) = &r.failure {
-        let _ = writeln!(s, "Failed: {f}");
+        let again = if r.requeue_until.is_some() { ". The hub queues it again once reviewers are free." } else { "" };
+        let _ = writeln!(s, "Failed: {f}{again}");
     }
     if !r.log.is_empty() && r.revealed() {
         s.push_str("\nTranscript:\n");

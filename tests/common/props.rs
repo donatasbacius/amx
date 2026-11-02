@@ -92,11 +92,12 @@ pub fn check(pre: &State, s: &State, now: Ms) -> Result<(), String> {
         let results = s.peek_events(&r.author, 0).0.into_iter().filter(|e| e.result && e.review.as_deref() == Some(&r.id)).count();
         let rulings = r.log.iter().filter(|e| e.kind == "ruling").count();
         let retried = s.reviews.iter().any(|c| c.retries > 0 && c.parent.as_deref() == Some(&r.id));
-        if results != usize::from(!r.phase.active() && !retried) + rulings {
+        let expired = r.log.iter().filter(|e| e.kind == "requeue").count();
+        if results != usize::from(!r.phase.active() && !retried) + rulings + expired {
             return fail("S7", format!("{} ({:?}) has {results} result notices after {rulings} rulings", r.id, r.phase));
         }
     }
-    if let Some(why) = retry_check(pre, s) {
+    if let Some(why) = retry_check(pre, s).or_else(|| requeue_check(pre, s, now)) {
         return Err(why);
     }
     let live: Vec<&Review> = s.reviews.iter().filter(|r| r.phase.active()).collect();
@@ -145,7 +146,7 @@ fn retry_check(pre: &State, s: &State) -> Option<String> {
         if r.retries > 2 || r.retries != p.retries + 1 || !p.broke_off() {
             return Some(format!("R1: {} is retry {} of {} ({:?}, retry {})", r.id, r.retries, p.id, p.failure, p.retries));
         }
-        if s.reviews.iter().filter(|c| c.retries > 0 && c.parent == r.parent).count() > 1 {
+        if s.reviews.iter().filter(|c| c.retries > 0 && c.requeued.is_none() && c.parent == r.parent).count() > 1 {
             return Some(format!("R1: {} was retried more than once", p.id));
         }
         if p.head_sha != r.head_sha {
@@ -154,6 +155,85 @@ fn retry_check(pre: &State, s: &State) -> Option<String> {
         let rival = s.reviews.iter().find(|o| o.id != r.id && o.phase.active() && o.pr == r.pr && o.author_login.eq_ignore_ascii_case(&r.author_login));
         if let Some(o) = rival.filter(|_| pre.review(&r.id).is_none()) {
             return Some(format!("R2: {} started beside {}, of the same PR and login", r.id, o.id));
+        }
+    }
+    None
+}
+
+fn timed_out(r: &Review) -> bool {
+    r.phase == Phase::Failed && r.cancelled_by.is_none() && r.failure.as_deref().is_some_and(|f| f.starts_with("no full team"))
+}
+
+/// Q1: the hub waits to queue again only a review that found no team in time, for at most a day,
+/// and not once the author's login has asked for another review of the PR. Q2: it queues one
+/// again at most once per line (the reviews it retries back to one the author asked for), at
+/// the same PR, head and author, never beside another unfinished review of the PR by that
+/// login, and only when a team it can start with is free. Q3: once a step is over, no review
+/// that follows no earlier review still waits while it could be queued again and a team could
+/// start it.
+fn requeue_check(pre: &State, s: &State, now: Ms) -> Option<String> {
+    let lapsed = |a: &Agent| s.reviews.iter().any(|o| o.lapsed.contains(&a.name));
+    let pool: Vec<&Agent> = free(s, now).into_iter().filter(|a| offered(s, &a.name, now).is_empty() && !s.agents.gone(&a.name) && !lapsed(a)).collect();
+    for r in s.reviews.iter().filter(|r| r.requeue_until.is_some() && r.parent.is_none()) {
+        let open = s.reviews.iter().filter(|o| o.phase.active() && o.author_login.eq_ignore_ascii_case(&r.author_login)).count();
+        let picked_online = r.picked.iter().all(|p| s.agents.get(p).is_some_and(|a| a.role == Role::Reviewer && a.model.is_some() && s.agents.online(p, now)));
+        if open >= 5 || !picked_online {
+            continue;
+        }
+        let mut y = r.clone();
+        y.phase = Phase::Offering;
+        y.slots.clear();
+        y.declined.retain(|a| r.declined_until(a).is_some_and(|t| now < t));
+        let team: Vec<&Agent> = pool.iter().copied().filter(|a| can_join(&y, a)).collect();
+        if any_team(&y, &team, &[]) {
+            return Some(format!("Q3: {} waits to be queued again though {:?} are free", r.id, team.iter().map(|a| &a.name).collect::<Vec<_>>()));
+        }
+    }
+    let find = |id: &str| s.reviews.iter().find(|r| r.id == id);
+    let newer = |r: &Review| s.reviews.iter().any(|o| o.id != r.id && o.pr == r.pr && o.author_login.eq_ignore_ascii_case(&r.author_login) && (o.phase.active() || o.seq() > r.seq()));
+    for r in &s.reviews {
+        if let Some(until) = r.requeue_until {
+            if !timed_out(r) || r.ended.is_none_or(|e| until > e + 24 * 3600 * 1000) || now >= until {
+                return Some(format!("Q1: {} waits to be queued again ({:?}, until {until})", r.id, r.failure));
+            }
+            if newer(r) {
+                return Some(format!("Q1: {} waits to be queued again after a newer review of its PR", r.id));
+            }
+            if s.reviews.iter().any(|y| y.requeued.as_deref() == Some(&r.id)) {
+                return Some(format!("Q1: {} waits to be queued again but already was", r.id));
+            }
+        }
+        let Some(x) = r.requeued.as_deref() else { continue };
+        if s.reviews.iter().filter(|y| y.requeued.as_deref() == Some(x)).count() > 1 {
+            return Some(format!("Q2: {x} was queued again more than once"));
+        }
+        let mut line = find(x);
+        while let Some(l) = line {
+            if l.requeued.is_some() {
+                return Some(format!("Q2: {} queued again {x}, in a line already queued again at {}", r.id, l.id));
+            }
+            line = l.parent.as_deref().filter(|_| l.retries > 0).and_then(find);
+        }
+        if pre.review(&r.id).is_some() {
+            continue;
+        }
+        let Some(x) = find(x).or_else(|| pre.review(x)) else { return Some(format!("Q2: {} queued again a review that is gone", r.id)) };
+        if !timed_out(x) || (x.pr.clone(), &x.head_sha, &x.author) != (r.pr.clone(), &r.head_sha, &r.author) {
+            return Some(format!("Q2: {} queued again {} ({:?}) with another PR, head or author", r.id, x.id, x.failure));
+        }
+        if let Some(o) = s.reviews.iter().find(|o| o.id != r.id && o.phase.active() && o.pr == r.pr && o.author_login.eq_ignore_ascii_case(&r.author_login)) {
+            return Some(format!("Q2: {} queued beside {}, of the same PR and login", r.id, o.id));
+        }
+        let pool: Vec<&Agent> = s
+            .agents
+            .all()
+            .filter(|a| {
+                r.slot(&a.name).is_some_and(|x| x.active())
+                    || (a.role == Role::Reviewer && a.model.is_some() && s.agents.online(&a.name, now) && s.busy_with(&a.name).is_none() && a.name != r.author && (r.picked.is_empty() || r.picked.contains(&a.name)))
+            })
+            .collect();
+        if !any_team(r, &pool, &[]) {
+            return Some(format!("Q2: {} was queued again with no team free to start it", r.id));
         }
     }
     None
