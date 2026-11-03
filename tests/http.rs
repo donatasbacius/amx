@@ -502,7 +502,7 @@ async fn owed_tasks_are_given_in_full_once_per_result() {
     let findings = json!([{"severity":"major","title":"Short title","text":"cache never invalidated"},{"severity":"minor","title":"Short title","text":"typo in docs"}]);
     ok_tool(&base, "rev-a", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"changes_requested","findings":findings})).await;
     let idle = ok_tool(&base, "rev-a", "wait", json!({"timeout_seconds": 1})).await;
-    assert!(idle.starts_with("No new events."), "no second copy of the task: {idle}");
+    assert_eq!(idle, amx::text::QUIET, "no second copy of the task, nor a recap");
     let last = ok_tool(&base, "rev-b", "submit_findings", json!({"review_id":"r1","head_sha":"abc1234","verdict":"approve","findings":[{"severity":"nit","title":"Short title","text":"rename x"}]})).await;
     assert!(last.contains("You must vote on: F1, F2.") && last.matches("cache never invalidated").count() == 1, "{last}");
     assert!(!last.contains("finding: \"F3\""), "the example never names your own finding: {last}");
@@ -529,7 +529,7 @@ async fn owed_tasks_are_given_in_full_once_per_result() {
     assert!(voted.contains("Recorded 1 vote(s) on r1. Ignored your votes on F2: withdrawn by their authors."), "{voted}");
 
     let quiet = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 1})).await;
-    assert!(quiet.starts_with("No new events.") && quiet.lines().count() == 3, "progress doesn't wake the author: {quiet}");
+    assert_eq!(quiet, amx::text::QUIET, "progress doesn't wake the author");
     ok_tool(&base, "rev-a", "vote", json!({"review_id":"r1","votes":[{"finding":"F3","vote":"agree","reason":"checked"}]})).await;
     let result = ok_tool(&base, "author", "wait", json!({"timeout_seconds": 5})).await;
     assert!(result.starts_with("[r1] Review result") && !result.contains("===") && !result.contains("nothing pending"), "{result}");
@@ -1286,5 +1286,62 @@ async fn a_sub_agent_in_its_own_session_acts_for_its_reviewer_with_the_tasks_tic
     assert_eq!(relay.running.hub.read(|s, _| s.review("r1").unwrap().verdict()), Some(amx::relay::Verdict::ChangesRequested));
     let json = reqwest::get(format!("{local}/api/reviews/r1")).await.unwrap().text().await.unwrap();
     assert!(!json.contains(&review) && !json.contains(&vote) && !json.contains("tickets"), "tickets are never shown");
+    relay.running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_claude_code_gets_the_long_streamed_wait() {
+    let cfg = Config {
+        port: free_port(),
+        tailnet: false,
+        wait_stream: amx::server::WaitStream { claude: 4, other: 1 },
+        ..Config::default()
+    };
+    let running = amx::start(cfg).await.unwrap();
+    let base = format!("http://{}", running.local_addr);
+    let held = |ua: &'static str, agent: &'static str, model: &'static str| {
+        let base = base.clone();
+        async move {
+            let client = reqwest::Client::new();
+            let post = |sid: Option<&str>, body: Value| {
+                let r = client.post(format!("{base}/mcp?agent={agent}&role=reviewer")).header("User-Agent", ua).header("Accept", "application/json, text/event-stream");
+                if let Some(sid) = sid { r.header("Mcp-Session-Id", sid) } else { r }.json(&body).send()
+            };
+            let init = post(None, json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})).await.unwrap();
+            let sid = init.headers()["mcp-session-id"].to_str().unwrap().to_string();
+            post(Some(&sid), call(1, "hello", json!({"role":"reviewer","model":model}))).await.unwrap().text().await.unwrap();
+            let started = std::time::Instant::now();
+            let body = post(Some(&sid), call(2, "wait", json!({}))).await.unwrap().text().await.unwrap();
+            assert!(body.contains("No new events."), "{body}");
+            started.elapsed()
+        }
+    };
+    let (claude, codex) = tokio::join!(held("claude-code/2.1.317 (sdk-cli)", "rev", "claude"), held("codex-mcp-client/0.163.0", "rev-cx", "codex"));
+    assert!(claude >= Duration::from_secs(4), "{claude:?}");
+    assert!(codex >= Duration::from_secs(1) && codex < Duration::from_secs(3), "{codex:?}");
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_held_in_a_wait_outlasts_the_login_cap() {
+    let relay = start(None, vec![]).await;
+    let base = relay.local.clone();
+    let (held, _) = initialize(&base, "agent=rev&role=reviewer").await;
+    session_rpc(&base, &held, call(0, "hello", json!({"role":"reviewer","model":"claude"})), false).await;
+    let waiting = {
+        let (base, held) = (base.clone(), held.clone());
+        tokio::spawn(async move { session_rpc(&base, &held, call(1, "wait", json!({})), true).await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut others = Vec::new();
+    for _ in 0..63 {
+        others.push(initialize(&base, "").await.0);
+    }
+    tokio::time::sleep(Duration::from_secs(21)).await;
+    initialize(&base, "").await;
+    let alive = |sid: &str| relay.running.hub.sessions.lock().unwrap().keys().any(|k| k.ends_with(&format!("\0{sid}")));
+    assert!(alive(&held), "the waiting session isn't the least recently used");
+    assert!(!alive(&others[0]), "the oldest idle one ends instead");
+    waiting.abort();
     relay.running.stop().await;
 }

@@ -24,6 +24,10 @@ pub struct Config {
     #[doc(hidden)]
     #[serde(skip)]
     pub conn_limits: crate::server::ConnLimits,
+    /// Tests only; not read from the config file.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub wait_stream: crate::server::WaitStream,
     /// Finished reviews kept in memory for the web page and `review_status`, plus up to 10 that
     /// failed before anyone took them.
     pub history: usize,
@@ -101,6 +105,7 @@ impl Default for Config {
             timing: Timing::default(),
             consensus: Consensus::default(),
             conn_limits: crate::server::ConnLimits::default(),
+            wait_stream: crate::server::WaitStream::default(),
             history: 200,
             state: None,
         }

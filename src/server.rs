@@ -48,6 +48,19 @@ impl Default for ConnLimits {
     }
 }
 
+/// How long a streamed `wait` blocks, for Claude Code and for other clients.
+#[derive(Debug, Clone, Copy)]
+pub struct WaitStream {
+    pub claude: u64,
+    pub other: u64,
+}
+
+impl Default for WaitStream {
+    fn default() -> Self {
+        WaitStream { claude: crate::mcp::WAIT_STREAM_CLAUDE, other: crate::mcp::WAIT_STREAM }
+    }
+}
+
 /// Open connections per peer address, shared by all listeners.
 #[derive(Default)]
 pub struct Conns {
@@ -374,8 +387,18 @@ fn chosen(q: &AgentQuery, headers: &HeaderMap) -> Result<(Option<String>, Option
     }
 }
 
+fn user_agent(headers: &HeaderMap) -> &str {
+    headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("")
+}
+
 fn default_for(headers: &HeaderMap, who: &Identity) -> String {
-    default_agent(&who.login, headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or(""))
+    default_agent(&who.login, user_agent(headers))
+}
+
+/// How long a streamed `wait` may block for this client. Only Claude Code's own product token
+/// counts, as a long wait times out in any other client; default names match more loosely.
+fn stream_secs(w: &WaitStream, headers: &HeaderMap) -> u64 {
+    if user_agent(headers).to_ascii_lowercase().starts_with("claude-code/") { w.claude } else { w.other }
 }
 
 /// An MCP session: its agent name and role, and its waits by request id: running, or answered
@@ -684,15 +707,17 @@ async fn mcp(
     let stream = key.is_some() && value["method"] == "tools/call" && value["params"]["name"] == "wait" && wants_stream(&headers);
     let seq_of = |resp: &Value| resp["result"]["_meta"]["amx/seq"].as_u64();
     if stream {
+        let secs = stream_secs(&hub.cfg.wait_stream, &headers);
         let token = value["params"]["_meta"]["progressToken"].clone();
         let (tx, rx) = mpsc::channel(4);
         let key = key.unwrap_or_default();
+        let held = key.clone();
         let done = {
             let (hub, id) = (hub.clone(), id.clone());
             move |n| answered(&hub, &key, &id, n)
         };
         tokio::spawn(async move {
-            let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: true, stream: true, note: &note, delegate: false };
+            let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: true, stream: Some(secs), note: &note, delegate: false };
             let call = crate::mcp::handle(&hub, &c, value);
             tokio::pin!(call);
             let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
@@ -703,6 +728,10 @@ async fn mcp(
                     _ = tx.closed() => return,
                     _ = beat.tick() => {
                         n += 1;
+                        // In use while it waits, so it isn't the session the login's cap ends.
+                        if let Some(s) = hub.sessions.lock().unwrap().get_mut(&held) {
+                            s.used = Instant::now();
+                        }
                         let note = if token.is_null() {
                             ": waiting\n\n".to_string()
                         } else {
@@ -722,7 +751,7 @@ async fn mcp(
         });
         return sse(rx, done);
     }
-    let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: key.is_some(), stream: false, note: &note, delegate: ticket.is_some() };
+    let c = crate::mcp::Caller { agent: &agent, who: &who, role, session: key.is_some(), stream: None, note: &note, delegate: ticket.is_some() };
     let asks = requests(&value);
     match crate::mcp::handle(&hub, &c, value).await {
         Some(resp) => {
@@ -891,5 +920,15 @@ mod tests {
         assert_eq!(default_agent("alice@example.com", "claude-code/2.1"), "alice-claude");
         assert_eq!(default_agent("bob.smith@github", "codex_cli_rs/0.160"), "bob-smith-codex");
         assert_eq!(default_agent("", "curl/8"), "agent");
+    }
+
+    #[test]
+    fn only_claude_code_waits_long() {
+        let ua = |v: &str| HeaderMap::from_iter([(header::USER_AGENT, v.parse().unwrap())]);
+        let w = WaitStream::default();
+        assert_eq!(stream_secs(&w, &ua("claude-code/2.1.317 (sdk-cli)")), crate::mcp::WAIT_STREAM_CLAUDE);
+        for other in ["codex-mcp-client/0.163.0", "my-claude-wrapper/1", ""] {
+            assert_eq!(stream_secs(&w, &ua(other)), crate::mcp::WAIT_STREAM, "{other}");
+        }
     }
 }
