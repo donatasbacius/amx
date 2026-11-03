@@ -715,6 +715,10 @@ pub fn nothing_pending(finished: &[&str]) -> String {
     format!("Nothing in progress. NEXT: {next}.")
 }
 
+/// A `wait` with nothing new and nothing owed.
+pub const QUIET: &str = "No new events.\nNEXT: call `wait` again.";
+pub const QUIET_PARKED: &str = "No new events.\nNEXT: call `wait` again, or stop and call it later: the result waits for you.";
+
 /// How to connect each client, for `/setup` and the web page. Codex gets its whole table, so
 /// pasting it again replaces it: tools run without asking, and `wait` may block 10 minutes.
 pub fn claude_add(url: &str) -> String {

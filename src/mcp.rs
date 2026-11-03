@@ -10,12 +10,14 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-/// Claude Code gives up on a plain JSON reply after 60s, as does Codex on any tool call unless its
-/// `tool_timeout_sec` is raised. A session that takes the reply as an event stream waits
-/// `WAIT_STREAM`, kept alive by progress notifications.
+/// Claude Code gives up on a plain JSON reply after 60s. A session that takes the reply as an
+/// event stream waits `WAIT_STREAM`, kept alive by progress notifications; Codex gives up after its
+/// `tool_timeout_sec` whatever they say, so the setup it is given sets that to `WAIT_STREAM` + 60.
+/// Claude Code keeps a streamed call open for a day, so it waits `WAIT_STREAM_CLAUDE`.
 pub const WAIT_DEFAULT: u64 = 45;
 pub const WAIT_MAX: u64 = 50;
 pub const WAIT_STREAM: u64 = 600;
+pub const WAIT_STREAM_CLAUDE: u64 = 3600;
 
 /// Tools that count as taking part, so they register the agent and keep it online.
 /// The rest (`online`, `review_status`) only read.
@@ -186,8 +188,8 @@ pub struct Caller<'a> {
     pub role: Option<Role>,
     /// In an MCP session, whose next request acknowledges what `wait` hands out.
     pub session: bool,
-    /// The reply is an event stream, so `wait` may block for `WAIT_STREAM`.
-    pub stream: bool,
+    /// The reply is an event stream its client keeps open this many seconds, so `wait` may block that long.
+    pub stream: Option<u64>,
     /// About the name it was given: added to the instructions at `initialize`, or to the result
     /// of the call that names it.
     pub note: &'a str,
@@ -349,6 +351,24 @@ fn next_after(s: &State, agent: &str, events: &[AgentEvent], known: &[String], n
     (next_text(&actions, role, events, known, &fixes), actions.iter().any(|a| a.urgent))
 }
 
+/// The reply to a `wait` that found nothing new, unless something is owed: no recap, as the call
+/// that set it going said it all, except to an author with nothing in progress.
+pub fn quiet(s: &State, agent: &str, now: Ms) -> Option<String> {
+    let actions = s.next_actions(agent, now);
+    if actions.iter().any(|a| a.urgent || a.task.is_some()) {
+        return None;
+    }
+    let author = s.agents.get(agent).is_some_and(|a| a.role == Role::Author);
+    Some(if author && actions.is_empty() {
+        let done = s.reviews.iter().rev().filter(|r| r.author == agent && r.phase == Phase::Done);
+        text::nothing_pending(&done.map(|r| r.id.as_str()).take(2).collect::<Vec<_>>())
+    } else if s.reviews.iter().any(|r| r.author == agent && r.requeue_until.is_some()) {
+        text::QUIET_PARKED.to_string()
+    } else {
+        text::QUIET.to_string()
+    })
+}
+
 fn owed_tasks(s: &State, agent: &str, now: Ms) -> Vec<String> {
     s.next_actions(agent, now).into_iter().filter_map(|a| a.task).collect()
 }
@@ -406,7 +426,7 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
         "online" => Ok(hub.read(|s, now| text::online(&s.online(now), agent))),
         "wait" => {
             let w: WaitArgs = args(a)?;
-            let secs = if c.stream { WAIT_STREAM } else { w.timeout_seconds.unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX) };
+            let secs = c.stream.unwrap_or_else(|| w.timeout_seconds.unwrap_or(WAIT_DEFAULT).clamp(1, WAIT_MAX));
             let (events, reached) = hub.wait(agent, Duration::from_secs(secs), w.progress, c.session).await;
             if c.session {
                 *seq = Some(reached);
@@ -417,17 +437,12 @@ async fn call_tool(hub: &Hub, c: &Caller<'_>, name: &str, a: Value, seq: &mut Op
                 // Saved before replying, so a crash can neither repeat nor take back what was handed out.
                 tracing::error!("{e:#}");
             }
-            let (next, urgent, idle) = hub.read(|s, now| {
+            let (next, urgent, quiet) = hub.read(|s, now| {
                 let (next, urgent) = next_after(s, agent, &events, &[], now);
-                let author = s.agents.get(agent).is_some_and(|a| a.role == Role::Author);
-                let idle = (events.is_empty() && author && s.next_actions(agent, now).is_empty()).then(|| {
-                    let done = s.reviews.iter().rev().filter(|r| r.author == agent && r.phase == Phase::Done);
-                    text::nothing_pending(&done.map(|r| r.id.as_str()).take(2).collect::<Vec<_>>())
-                });
-                (next, urgent, idle)
+                (next, urgent, if events.is_empty() { quiet(s, agent, now) } else { None })
             });
-            if let Some(idle) = idle {
-                return Ok(idle);
+            if let Some(quiet) = quiet {
+                return Ok(quiet);
             }
             Ok(match (events.is_empty(), next.is_empty()) {
                 (true, _) if urgent => next,

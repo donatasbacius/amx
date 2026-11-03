@@ -510,15 +510,18 @@ fn no_reviewers_fails_back_to_author() {
     sim.advance(QUEUE - 10);
     assert_eq!(sim.phase(&id), Phase::Offering, "it waits for reviewers");
     assert!(sim.task("alice-codex").contains("queued: it starts once a full team of reviewers has accepted it (0 of 2 so far; older requests go first)"), "{}", sim.task("alice-codex"));
+    assert_eq!(amx::mcp::quiet(&sim.s, "alice-codex", sim.now).as_deref(), Some(amx::text::QUIET), "a quiet wait recaps nothing");
     sim.advance(10);
     assert_eq!(sim.phase(&id), Phase::Failed);
     let failed = sim.events("alice-codex");
     assert!(failed.contains("failed: no full team of 2 reviewer(s), claude and codex, accepted it within 2h00m: no claude reviewer was online.\nNEXT: nothing to do; the hub queues it again once reviewers are free (within 24h00m), and its result waits for you in `wait`."), "{failed}");
     assert!(sim.task("alice-codex").contains(&format!("{id}: your review of rust-lang/rust#1 found no team in time; the hub queues it again once reviewers are free (within 24h00m).")), "{}", sim.task("alice-codex"));
+    assert_eq!(amx::mcp::quiet(&sim.s, "alice-codex", sim.now).as_deref(), Some(amx::text::QUIET_PARKED));
     sim.day_passes();
     let expired = sim.events("alice-codex");
     assert_eq!(expired, format!("[{id}] The hub couldn't queue it again within 24h00m.\nNEXT: you can try `request_review` again later."));
     assert!(sim.s.next_actions("alice-codex", sim.now).is_empty());
+    assert!(amx::mcp::quiet(&sim.s, "alice-codex", sim.now).is_some_and(|q| q.starts_with("Nothing in progress.")));
 }
 
 #[test]
@@ -1268,6 +1271,8 @@ fn finding_authors_reply_before_round_two_votes() {
     let a = sim.events("rev-a");
     assert!(a.contains("your findings F1 drew objections") && a.contains("rev-b thinks F1 is wrong") && !a.contains("leaks a file handle"), "{a}");
     assert!(sim.events("rev-c").is_empty(), "voters wait for the reply");
+    assert!(amx::mcp::quiet(&sim.s, "rev-a", sim.now).is_none(), "a quiet wait still points to the reply owed");
+    assert_eq!(amx::mcp::quiet(&sim.s, "rev-c", sim.now).as_deref(), Some(amx::text::QUIET));
     let err = sim.s.vote("rev-c", &id, vec![VoteIn { finding: "F1".into(), vote: "agree".into(), severity: None, reason: None, duplicate_of: None }], sim.now).unwrap_err();
     assert!(err.to_string().contains("once the authors of contested findings have replied"), "{err}");
     sim.advance(30);
