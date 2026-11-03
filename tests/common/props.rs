@@ -7,9 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The first property the step breaks, as "S1: why".
 pub fn check(pre: &State, s: &State, now: Ms) -> Result<(), String> {
     let fail = |prop: &str, why: String| Err(format!("{prop}: {why}"));
+    let pre_held: BTreeMap<String, String> = pre.agents.all().filter_map(|a| Some((a.name.clone(), offered(pre, &a.name, now).into_iter().next()?))).collect();
+    let (_, _, pre_kept) = wanted(pre, free(pre, now), &pre_held, now);
     let free: Vec<&Agent> = free(s, now);
     let members = s.reviews.iter().filter(|r| r.phase == Phase::Offering).flat_map(|r| r.active_slots().filter_map(|x| s.agents.get(&x.agent)));
-    let freed = wanted(&s.reviews.iter().collect::<Vec<_>>(), free.iter().copied().chain(members).collect());
+    let held: BTreeMap<String, String> = s.agents.all().filter_map(|a| Some((a.name.clone(), offered(s, &a.name, now).into_iter().next()?))).collect();
+    let (freed, ..) = wanted(s, free.iter().copied().chain(members).collect(), &held, now);
     for a in s.agents.all() {
         let k = s.reviews.iter().filter(|r| r.phase.active() && r.slot(&a.name).is_some_and(|x| x.active())).count();
         if k > 1 {
@@ -19,6 +22,12 @@ pub fn check(pre: &State, s: &State, now: Ms) -> Result<(), String> {
     for r in &s.reviews {
         let prev = pre.review(&r.id);
         let was = prev.map(|p| p.phase);
+        let logged = prev.map_or(0, |p| p.log.len());
+        for e in r.log.iter().skip(logged).filter(|e| e.kind == "accept" && !e.text.starts_with("assigned again")) {
+            if let Some(o) = pre_kept.get(e.who.as_str()).filter(|o| pre.review(o).is_some_and(|o| o.seq() < r.seq())) {
+                return fail("R7", format!("{} joined {} while the older {o} could still take it in its turns", e.who, r.id));
+            }
+        }
         if was == Some(Phase::Offering) && r.phase != Phase::Offering && r.phase.active() {
             let team: Vec<&str> = r.active_slots().map(|x| x.agent.as_str()).collect();
             if !valid_team(s, r, &team) {
@@ -97,7 +106,7 @@ pub fn check(pre: &State, s: &State, now: Ms) -> Result<(), String> {
             return fail("S7", format!("{} ({:?}) has {results} result notices after {rulings} rulings", r.id, r.phase));
         }
     }
-    if let Some(why) = retry_check(pre, s).or_else(|| requeue_check(pre, s, now)) {
+    if let Some(why) = retry_check(pre, s).or_else(|| requeue_check(pre, s, now)).or_else(|| rotation_check(pre, s, now, &free, &held, &|a| s.agents.turn(a), "R5")) {
         return Err(why);
     }
     let live: Vec<&Review> = s.reviews.iter().filter(|r| r.phase.active()).collect();
@@ -126,7 +135,7 @@ pub fn check(pre: &State, s: &State, now: Ms) -> Result<(), String> {
             return fail("O1", format!("{} is offered {id}, whose team needs a reviewer offered an older review", a.name));
         }
     }
-    let want = wanted(&s.reviews.iter().collect::<Vec<_>>(), free.clone());
+    let (want, ..) = wanted(s, free.clone(), &held, now);
     for a in &free {
         let shown = &offers[a.name.as_str()];
         let want = want.get(a.name.as_str());
@@ -170,10 +179,12 @@ fn timed_out(r: &Review) -> bool {
 /// the same PR, head and author, never beside another unfinished review of the PR by that
 /// login, and only when a team it can start with is free. Q3: once a step is over, no review
 /// that follows no earlier review still waits while it could be queued again and a team could
-/// start it.
+/// start it (counting offers that lapsed on reviews the step trimmed from history).
 fn requeue_check(pre: &State, s: &State, now: Ms) -> Option<String> {
-    let lapsed = |a: &Agent| s.reviews.iter().any(|o| o.lapsed.contains(&a.name));
-    let pool: Vec<&Agent> = free(s, now).into_iter().filter(|a| offered(s, &a.name, now).is_empty() && !s.agents.gone(&a.name) && !lapsed(a)).collect();
+    let lapsed = |a: &Agent| s.reviews.iter().chain(pre.reviews.iter().filter(|o| s.review(&o.id).is_none())).any(|o| o.lapsed.contains(&a.name));
+    let held: BTreeMap<String, String> = s.agents.all().filter_map(|a| Some((a.name.clone(), offered(s, &a.name, now).into_iter().next()?))).collect();
+    let (_, spare, _) = wanted(s, free(s, now), &held, now);
+    let pool: Vec<&Agent> = spare.into_iter().filter(|a| !s.agents.gone(&a.name) && !lapsed(a)).collect();
     for r in s.reviews.iter().filter(|r| r.requeue_until.is_some() && r.parent.is_none()) {
         let open = s.reviews.iter().filter(|o| o.phase.active() && o.author_login.eq_ignore_ascii_case(&r.author_login)).count();
         let picked_online = r.picked.iter().all(|p| s.agents.get(p).is_some_and(|a| a.role == Role::Reviewer && a.model.is_some() && s.agents.online(p, now)));
@@ -239,17 +250,74 @@ fn requeue_check(pre: &State, s: &State, now: Ms) -> Option<String> {
     None
 }
 
+/// Whether queued review `r` is still in its first 30s of offers, when its seats go by turn.
+fn rotating(s: &State, r: &Review, now: Ms) -> bool {
+    s.offered_since(&r.id).is_none_or(|t| now < t + 30_000)
+}
+
 /// The review each of `pool` should be offered: the oldest a team can form for from the
-/// reviewers older ones leave. A review's own forming members in `pool` count only for older ones.
-fn wanted<'a>(reviews: &[&Review], mut pool: Vec<&'a Agent>) -> BTreeMap<&'a str, String> {
+/// reviewers older ones leave, or, for a review still rotating, those it is offered (`held`),
+/// which `rotation_check` judges; a rotating review leaves younger ones none it could take. A
+/// review's own forming members in `pool` count only for older ones. Also returns those of `pool`
+/// no review takes or keeps, and those a rotating review keeps without offering it.
+fn wanted<'a>(s: &State, mut pool: Vec<&'a Agent>, held: &BTreeMap<String, String>, now: Ms) -> (BTreeMap<&'a str, String>, Vec<&'a Agent>, BTreeMap<&'a str, String>) {
     let mut want = BTreeMap::new();
-    for r in reviews {
+    let mut kept = BTreeMap::new();
+    for r in &s.reviews {
         pool.retain(|a| r.phase != Phase::Offering || r.slot(&a.name).is_none_or(|x| !x.active()));
-        let takers: Vec<&Agent> = pool.iter().copied().filter(|a| can_join(r, a) && fillable(r, a, &pool)).collect();
-        pool.retain(|a| !takers.iter().any(|t| t.name == a.name));
+        let usable: Vec<&Agent> = pool.iter().copied().filter(|a| can_join(r, a) && fillable(r, a, &pool)).collect();
+        let takers: Vec<&Agent> = if r.phase == Phase::Offering && rotating(s, r, now) {
+            pool.iter().copied().filter(|a| held.get(&a.name) == Some(&r.id)).collect()
+        } else {
+            usable.clone()
+        };
+        pool.retain(|a| !takers.iter().chain(&usable).any(|t| t.name == a.name));
         want.extend(takers.iter().map(|a| (a.name.as_str(), r.id.clone())));
+        kept.extend(usable.iter().filter(|a| !want.contains_key(a.name.as_str())).map(|a| (a.name.as_str(), r.id.clone())));
     }
-    want
+    (want, pool, kept)
+}
+
+/// R5: a review in its first 30s of offers is offered to no more reviewers than it has open
+/// seats, enough with its members for a team it can start with, and a reviewer newly offered it
+/// comes no later in turn (those that let an offer lapse last, whether or not lapses on reviews
+/// the step trimmed count) than any free reviewer of its program that could take that seat and
+/// isn't offered an older review.
+fn rotation_check(pre: &State, s: &State, now: Ms, free: &[&Agent], held: &BTreeMap<String, String>, turn: &dyn Fn(&Agent) -> (u64, u64), tag: &str) -> Option<String> {
+    let seq = |id: &str| s.review(id).map_or(u64::MAX, Review::seq);
+    let lapsed = |a: &Agent| s.reviews.iter().any(|o| o.lapsed.contains(&a.name));
+    let trimmed = |a: &Agent| lapsed(a) || pre.reviews.iter().any(|o| s.review(&o.id).is_none() && o.lapsed.contains(&a.name));
+    let t = turn;
+    let ahead = |f: &Agent, a: &Agent| (lapsed(f), t(f)) < (lapsed(a), t(a)) && (trimmed(f), t(f)) < (trimmed(a), t(a));
+    for r in s.reviews.iter().filter(|r| r.phase == Phase::Offering && rotating(s, r, now)) {
+        let to: Vec<&Agent> = free.iter().copied().filter(|a| held.get(&a.name) == Some(&r.id)).collect();
+        let open = r.params.reviewers.saturating_sub(r.active_slots().count());
+        if to.len() > open {
+            return Some(format!("{tag}: {} has {open} open seat(s) but is offered to {}", r.id, to.len()));
+        }
+        let members: Vec<&Agent> = r.active_slots().filter_map(|x| s.agents.get(&x.agent)).collect();
+        if !to.is_empty() && !any_team(r, &members.iter().copied().chain(to.iter().copied()).collect::<Vec<_>>(), &[]) {
+            return Some(format!("{tag}: {} is offered to {:?}, who can't make a team it can start with", r.id, to.iter().map(|a| &a.name).collect::<Vec<_>>()));
+        }
+        let logins: Vec<String> = members.iter().chain(to.iter()).map(|a| a.login.to_ascii_lowercase()).filter(|l| !own(r, l)).collect();
+        let older = |f: &Agent| s.reviews.iter().any(|o| o.phase == Phase::Offering && o.seq() < r.seq() && can_join(o, f) && fillable(o, f, free));
+        let open_to = |f: &Agent| held.get(&f.name).is_none_or(|o| seq(o) > r.seq()) && !older(f);
+        for a in to.iter().filter(|a| pre.offered(&a.name) != Some(r.id.as_str())) {
+            let ahead = free.iter().find(|f| {
+                f.model == a.model
+                    && held.get(&f.name) != Some(&r.id)
+                    && open_to(f)
+                    && can_join(r, f)
+                    && fillable(r, f, free)
+                    && (own(r, &f.login) || !logins.contains(&f.login.to_ascii_lowercase()))
+                    && ahead(f, a)
+            });
+            if let Some(f) = ahead {
+                return Some(format!("{tag}: {} is offered {} ahead of {}, whose turn came earlier", a.name, r.id, f.name));
+            }
+        }
+    }
+    None
 }
 
 /// H1: no findings count or content is visible to other reviewers before every reviewer has
@@ -344,6 +412,94 @@ impl Churn {
     }
 }
 
+/// R6's memory along one run: the order people (by login and program) and their agents last had
+/// their turn in, as the steps show it (not the relay's own count), and how many reviews in a row
+/// each reviewer was passed over for.
+#[derive(Clone, Default)]
+pub struct Passed {
+    people: BTreeMap<(String, Option<Model>), u64>,
+    turns: BTreeMap<String, u64>,
+    next: u64,
+    times: BTreeMap<String, usize>,
+}
+
+impl Passed {
+    /// R6: a free reviewer that hasn't let an offer lapse is passed over, never offered a review
+    /// that starts with a reviewer of its program who accepted it and had its turn later, at most
+    /// `MAX_PASSED` times in a row. Turns go by person first, then by agent. A reviewer and its
+    /// person have their turn when it starts a review, declines an offer it has or lets one lapse,
+    /// and it starts counting over; a new agent, and a new person, start at the back; turns taken
+    /// in one step tie. R8: R5's turn order holds by these turns too, so the relay's own count
+    /// can't hide a missed turn.
+    pub fn check(&mut self, pre: &State, s: &State, now: Ms) -> Result<(), String> {
+        const MAX_PASSED: usize = 2;
+        let person = |a: &Agent| (a.login.to_ascii_lowercase(), a.model);
+        self.next += 1;
+        for a in s.agents.all() {
+            if !self.people.contains_key(&person(a)) {
+                self.people.insert(person(a), self.next);
+            }
+            if pre.agents.get(&a.name).is_none() || !self.turns.contains_key(&a.name) {
+                self.turns.insert(a.name.clone(), self.next);
+            }
+        }
+        let mut took: Vec<String> = Vec::new();
+        let lapsed = |a: &Agent| s.reviews.iter().chain(&pre.reviews).any(|o| o.lapsed.contains(&a.name));
+        let pre_free = free(pre, now);
+        for r in &s.reviews {
+            let p = pre.review(&r.id);
+            for e in r.log.iter().skip(p.map_or(0, |p| p.log.len())) {
+                if e.kind == "lapse" || (e.kind == "decline" && pre.offered(&e.who) == Some(r.id.as_str())) {
+                    took.push(e.who.clone());
+                }
+                if e.kind == "phase" && e.text.starts_with("independent review started with ") {
+                    took.extend(e.text["independent review started with ".len()..].split(", ").map(String::from));
+                }
+            }
+            if p.is_none_or(|p| p.phase != Phase::Offering || r.phase != Phase::Reviewing) {
+                continue;
+            }
+            let turn = |a: &Agent| (self.people.get(&person(a)).copied().unwrap_or(u64::MAX), self.turns.get(&a.name).copied().unwrap_or(u64::MAX));
+            let accepted: Vec<&Agent> = r
+                .active_slots()
+                .filter(|x| r.log.iter().any(|e| e.kind == "accept" && e.who == x.agent && !e.text.starts_with("assigned again")))
+                .filter_map(|x| pre.agents.get(&x.agent))
+                .collect();
+            let logins: Vec<String> = r.active_slots().map(|x| x.login.to_ascii_lowercase()).filter(|l| !own(r, l)).collect();
+            for f in pre_free.iter().filter(|f| s.busy_with(&f.name).is_none() && s.agents.online(&f.name, now) && !lapsed(f)) {
+                let older = offered(pre, &f.name, now).first().and_then(|o| pre.review(o)).is_some_and(|o| o.seq() < r.seq())
+                    || pre.reviews.iter().any(|o| o.phase == Phase::Offering && o.seq() < r.seq() && can_join(o, f) && fillable(o, f, &pre_free));
+                let allowed = f.name != r.author
+                    && (r.picked.is_empty() || r.picked.contains(&f.name))
+                    && !r.declined.contains(&f.name)
+                    && !r.offered.contains(&f.name)
+                    && (own(r, &f.login) || !logins.contains(&f.login.to_ascii_lowercase()));
+                if !older && allowed && accepted.iter().any(|a| a.model == f.model && turn(a) > turn(f)) {
+                    let n = self.times.entry(f.name.clone()).or_default();
+                    *n += 1;
+                    if *n > MAX_PASSED {
+                        return Err(format!("R6: {} was passed over {n} times in a row, last for {}", f.name, r.id));
+                    }
+                }
+            }
+        }
+        self.next += 1;
+        for name in took {
+            if let Some(a) = s.agents.get(&name) {
+                self.people.insert(person(a), self.next);
+            }
+            self.turns.insert(name.clone(), self.next);
+            self.times.remove(&name);
+        }
+        let held: BTreeMap<String, String> = s.agents.all().filter_map(|a| Some((a.name.clone(), offered(s, &a.name, now).into_iter().next()?))).collect();
+        let turn = |a: &Agent| (self.people.get(&person(a)).copied().unwrap_or(u64::MAX), self.turns.get(&a.name).copied().unwrap_or(u64::MAX));
+        match rotation_check(pre, s, now, &free(s, now), &held, &turn, "R8") {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
+    }
+}
+
 fn offered(s: &State, name: &str, now: Ms) -> Vec<String> {
     s.next_actions(name, now).into_iter().filter(|x| x.task.as_deref().is_some_and(|t| t.ends_with(":offer"))).map(|x| x.review).collect()
 }
@@ -420,8 +576,9 @@ fn valid_team(s: &State, r: &Review, team: &[&str]) -> bool {
 
 /// L6, as the model words it: an older waiting review could have completed its forming team
 /// with these members plus the reviewers free for it, and can't without them. A reviewer is
-/// free for a review when online, allowed, on no running review, and not spoken for by an even
-/// older review that can start. (The model lets the older review swap out its own forming
+/// free for a review when online, allowed, on no running review, and not spoken for (offered or
+/// kept in its turns) by an even older review that can start. An older review still in its first
+/// 30s of offers needs only those it offers, which F3 covers. (The model lets the older review swap out its own forming
 /// members too; the relay never does, which matters only when one other person runs both
 /// programs.)
 fn needed_by_older(pre: &State, started: &Review, team: &[&str], now: Ms) -> Option<String> {
@@ -432,14 +589,14 @@ fn needed_by_older(pre: &State, started: &Review, team: &[&str], now: Ms) -> Opt
         let pool: Vec<&Agent> = reviewers.iter().copied().filter(|a| (r.slot(&a.name).is_some_and(|x| x.active())) || (pre.agents.online(&a.name, now) && !running(a) && allowed(r, a))).collect();
         any_team(r, &pool, &[])
     };
+    let held: BTreeMap<String, String> = pre.agents.all().filter_map(|a| Some((a.name.clone(), offered(pre, &a.name, now).into_iter().next()?))).collect();
+    let (_, _, kept) = wanted(pre, free(pre, now), &held, now);
     let target = |a: &Agent| -> Option<String> {
         let forming = pre.reviews.iter().find(|r| r.phase == Phase::Offering && r.slot(&a.name).is_some_and(|x| x.active()));
-        forming.map(|r| r.id.clone()).or_else(|| {
-            pre.next_actions(&a.name, now).into_iter().find(|x| x.task.as_deref().is_some_and(|t| t.ends_with(":offer"))).map(|x| x.review)
-        })
+        forming.map(|r| r.id.clone()).or_else(|| held.get(&a.name).cloned()).or_else(|| kept.get(a.name.as_str()).cloned())
     };
     let seq = |id: &str| pre.review(id).map_or(u64::MAX, Review::seq);
-    for older in pre.reviews.iter().filter(|o| o.phase == Phase::Offering && o.seq() < started.seq()) {
+    for older in pre.reviews.iter().filter(|o| o.phase == Phase::Offering && o.seq() < started.seq() && !rotating(pre, o, now)) {
         let free_for: Vec<&Agent> = reviewers
             .iter()
             .copied()

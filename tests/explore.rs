@@ -1,7 +1,7 @@
 //! Every interleaving of the actors' actions and the deadlines they race, within small bounds:
 //! a breadth-first search over the relay's real state, checking the state machine model's
-//! safety properties across every step. `EXPLORE=large` raises the bounds (about twelve minutes and
-//! 4 GB with `--release`).
+//! safety properties across every step. `EXPLORE=large` raises the bounds (about half an hour and
+//! 8 GB with `--release`).
 
 #[path = "common/props.rs"]
 mod props;
@@ -85,7 +85,7 @@ const LARGE: [Bounds; 5] = [
 ];
 
 /// States one search may keep before it gives up, a few kilobytes each.
-const MAX_STATES: usize = 1_500_000;
+const MAX_STATES: usize = 2_600_000;
 
 #[derive(Debug)]
 enum Act {
@@ -306,9 +306,10 @@ fn key(s: &State, now: Ms) -> String {
     let forming = s.reviews.iter().any(|r| r.phase == Phase::Offering);
     let mut agents = Vec::new();
     for a in s.agents.all() {
+        let rank = s.agents.all().filter(|b| b.model == a.model && s.agents.turn(b) < s.agents.turn(a)).count();
         let offer = forming.then(|| s.next_actions(&a.name, now)).into_iter().flatten().find(|x| x.task.as_deref().is_some_and(|t| t.ends_with(":offer"))).map(|x| (pos(&x.review), s.offer_lapses(&a.name).map(left)));
         let quiet = (a.waiting == 0).then(|| (left(a.last_seen + t.online_secs * 1000), s.busy_with(&a.name).map(|_| left(a.last_seen + t.drop_after_secs * 1000))));
-        agents.push(format!("{} {:?} {:?} {quiet:?} {offer:?}", a.name, a.role, a.model));
+        agents.push(format!("{} {:?} {:?} {quiet:?} {offer:?} {rank:?}", a.name, a.role, a.model));
     }
     let mut k = String::new();
     for r in &s.reviews {
@@ -335,15 +336,20 @@ fn key(s: &State, now: Ms) -> String {
         }
         let team_due = r.active_slots().map(|x| x.joined + r.params.offer_secs * 1000).min().filter(|_| r.phase == Phase::Offering).map(left);
         let declined: Vec<_> = r.declined.iter().map(|a| (a, r.declined_until(a).filter(|t| *t < r.deadline).map(left))).collect();
-        write!(k, " {} {:?} {declined:?} {:?} {:?} {team_due:?}", r.replying, r.replied, r.lapsed, left(r.deadline)).unwrap();
+        let rotating = s.offered_since(&r.id).is_none_or(|t| now < t + 30_000);
+        write!(k, " {} {:?} {declined:?} {:?} {:?} {team_due:?} {rotating:?}", r.replying, r.replied, r.lapsed, left(r.deadline)).unwrap();
     }
     let [x, y] = TWINS;
+    let tied = s.agents.get(x).zip(s.agents.get(y)).is_some_and(|(a, b)| s.agents.turn(a) == s.agents.turn(b));
     let named = |swap: bool| {
         let name = |s: &str| if swap { s.replace(x, "\0").replace(y, x).replace('\0', y) } else { s.to_string() };
         let mut agents: Vec<String> = agents.iter().map(|a| name(a)).collect();
         agents.sort();
         agents.join("|") + &name(&k)
     };
+    if tied {
+        return named(false);
+    }
     named(false).min(named(true))
 }
 
@@ -411,14 +417,14 @@ fn explore(b: &Bounds, seen: &mut BTreeMap<&'static str, usize>) {
     let (s, now) = fresh(b);
     let mut index: HashMap<String, usize> = HashMap::from([(format!("0{}", key(&s, now)), 0)]);
     let mut trail: Vec<(usize, String)> = vec![(0, String::new())];
-    let mut todo = VecDeque::from([(s, now, 0, 0, props::Churn::default())]);
+    let mut todo = VecDeque::from([(s, now, 0, 0, (props::Churn::default(), props::Passed::default()))]);
     let mut steps = 0;
     while let Some((s, now, absences, at, churn)) = todo.pop_front() {
         for act in actions(&s, now, absences, b) {
-            let (mut next, mut then, mut churn) = (s.clone(), now, churn.clone());
+            let (mut next, mut then, (mut churn, mut passed)) = (s.clone(), now, churn.clone());
             apply(&mut next, &mut then, &act);
             steps += 1;
-            if let Err(why) = props::check(&s, &next, then).and_then(|_| churn.check(&s, &next, then)) {
+            if let Err(why) = props::check(&s, &next, then).and_then(|_| churn.check(&s, &next, then)).and_then(|_| passed.check(&s, &next, then)) {
                 panic!("{}: {why}\nshortest trace:\n{}", b.name, trace(&trail, at, &act));
             }
             reached(&s, &next, seen);
@@ -428,7 +434,7 @@ fn explore(b: &Bounds, seen: &mut BTreeMap<&'static str, usize>) {
                 assert!(index.len() < MAX_STATES, "{}: more than {MAX_STATES} states; lower the bounds", b.name);
                 index.insert(k, trail.len());
                 trail.push((at, format!("{act:?}")));
-                todo.push_back((next, then, absences, trail.len() - 1, churn));
+                todo.push_back((next, then, absences, trail.len() - 1, (churn, passed)));
             }
         }
     }

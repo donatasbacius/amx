@@ -61,6 +61,7 @@ struct World {
     alive: BTreeSet<&'static str>,
     log: Vec<String>,
     churn: props::Churn,
+    passed: props::Passed,
 }
 
 impl World {
@@ -74,6 +75,7 @@ impl World {
             alive: BTreeSet::new(),
             log: Vec::new(),
             churn: props::Churn::default(),
+            passed: props::Passed::default(),
         };
         for (name, login) in AUTHORS {
             w.s.touch(name, &who(login), Some(Role::Author), w.now).unwrap();
@@ -256,7 +258,7 @@ impl World {
     }
 
     fn check(&mut self, pre: &State) {
-        if let Err(why) = props::check(pre, &self.s, self.now).and_then(|_| self.churn.check(pre, &self.s, self.now)) {
+        if let Err(why) = props::check(pre, &self.s, self.now).and_then(|_| self.churn.check(pre, &self.s, self.now)).and_then(|_| self.passed.check(pre, &self.s, self.now)) {
             let tail: Vec<&String> = self.log.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
             panic!("{why} (seed {})\nlast steps:\n{}", self.seed, tail.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"));
         }
@@ -266,7 +268,7 @@ impl World {
 /// Seeded, so a failure names a run that replays exactly; `QUEUE_SEEDS=5000` runs longer.
 #[test]
 fn random_actors_never_break_the_queue_rules() {
-    let seeds: u64 = std::env::var("QUEUE_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let seeds: u64 = std::env::var("QUEUE_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     for seed in 1..=seeds {
         let mut w = World::new(seed);
