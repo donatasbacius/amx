@@ -47,6 +47,9 @@ const FAILED_KEPT: usize = 10;
 const MAX_RETRIES: u32 = 2;
 /// How long the hub may wait for reviewers to queue again a review that found no team in time.
 const REQUEUE_MS: Ms = 24 * 3600 * 1000;
+/// How long after a review's offers begin its open seats go only to the reviewers whose turn
+/// came longest ago, before every free reviewer that fits is offered them.
+const ROTATION_MS: Ms = 30_000;
 /// Unfinished reviews one Tailscale login may have requested at a time.
 const REVIEWS_PER_LOGIN: usize = 5;
 const AGENTS_PER_LOGIN: usize = 20;
@@ -217,6 +220,11 @@ pub struct Agent {
     pub model: Option<Model>,
     pub first_seen: Ms,
     pub last_seen: Ms,
+    /// Its place among its login's agents of its program in the rotation (see `Agents::people`):
+    /// it is moved to the back when it starts a review, declines an offer or lets one lapse, and
+    /// starts there (0, the front, if loaded from before 0.15.5).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub turn: u64,
     /// Requests blocked in `wait` for this agent.
     #[serde(skip)]
     pub waiting: u32,
@@ -234,6 +242,11 @@ pub struct Agents {
     /// Names whose session or last event stream ended, or that the relay lost in a restart,
     /// and that haven't been heard from since.
     gone: BTreeSet<String>,
+    /// Each person's place in the rotation of each program they review with, by Tailscale login
+    /// (lowercased): a review's seats go first to the people nearest the front, and to each
+    /// person's agent nearest the front. Moved with the agent's `turn`; a new person starts at the
+    /// back.
+    people: BTreeMap<(String, Model), u64>,
     timing: Timing,
 }
 
@@ -271,6 +284,38 @@ impl Agents {
         }
         if let Some(a) = self.map.get_mut(name) {
             a.last_seen = now;
+        }
+    }
+
+    /// `name` has had its turn: it and its person go behind the reviewers that haven't since.
+    fn take_turn(&mut self, name: &str) {
+        let back = self.back();
+        if let Some(a) = self.map.get_mut(name) {
+            a.turn = back;
+            if let Some(m) = a.model {
+                self.people.insert((a.login.to_ascii_lowercase(), m), back);
+            }
+        }
+    }
+
+    /// The place behind every agent's and person's in the rotation.
+    fn back(&self) -> u64 {
+        self.map.values().map(|a| a.turn).chain(self.people.values().copied()).max().unwrap_or(0) + 1
+    }
+
+    /// Where `a` stands in the rotation: its person's place, then its own.
+    pub fn turn(&self, a: &Agent) -> (u64, u64) {
+        let person = a.model.and_then(|m| self.people.get(&(a.login.to_ascii_lowercase(), m)));
+        (person.copied().unwrap_or(0), a.turn)
+    }
+
+    /// Gives `a`'s person a place for `a`'s program, at the back, if it has none.
+    fn place(&mut self, name: &str) {
+        let back = self.back();
+        if let Some(a) = self.map.get(name)
+            && let Some(m) = a.model
+        {
+            self.people.entry((a.login.to_ascii_lowercase(), m)).or_insert(back);
         }
     }
 
@@ -593,6 +638,10 @@ pub struct Review {
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -1087,6 +1136,9 @@ pub struct Snapshot {
     pub saved_at: Ms,
     next_review: u64,
     agents: Vec<Agent>,
+    /// `Agents::people`, as (login, program, place).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    people: Vec<(String, Model, u64)>,
     pub reviews: Vec<Review>,
 }
 
@@ -1226,6 +1278,7 @@ impl State {
                 map: BTreeMap::new(),
                 streams: BTreeMap::new(),
                 gone: BTreeSet::new(),
+                people: BTreeMap::new(),
                 timing,
             },
             reviews: Vec::new(),
@@ -1255,6 +1308,7 @@ impl State {
             saved_at: now,
             next_review: self.next_review,
             agents,
+            people: self.agents.people.iter().map(|((l, m), t)| (l.clone(), *m, *t)).collect(),
             reviews: self.reviews.clone(),
         }
     }
@@ -1277,6 +1331,12 @@ impl State {
             })
             .collect();
         self.agents.gone = self.agents.map.keys().cloned().collect();
+        self.agents.people = snap.people.into_iter().map(|(l, m, t)| ((l, m), t)).collect();
+        for a in self.agents.map.values() {
+            if let Some(m) = a.model {
+                self.agents.people.entry((a.login.to_ascii_lowercase(), m)).or_insert(a.turn);
+            }
+        }
         self.reviews = snap.reviews;
         let queue_secs = self.consensus.queue_secs.clamp(60, 24 * 3600);
         for r in &mut self.reviews {
@@ -1370,6 +1430,7 @@ impl State {
         if self.agents.get(name).is_none() {
             self.make_room(&who.login, now)?;
         }
+        let back = self.agents.back();
         let a = self.agents.map.entry(name.to_string()).or_insert_with(|| Agent {
             name: name.to_string(),
             login: who.login.clone(),
@@ -1379,6 +1440,7 @@ impl State {
             model: None,
             first_seen: now,
             last_seen: now,
+            turn: back,
             waiting: 0,
             events: VecDeque::new(),
             next_seq: 0,
@@ -1409,6 +1471,12 @@ impl State {
         }
         for l in logins.into_iter().filter(|l| l.eq_ignore_ascii_case(from)) {
             l.clone_from(&to.login);
+        }
+        let (from, to) = (from.to_ascii_lowercase(), to.login.to_ascii_lowercase());
+        let moved: Vec<((String, Model), u64)> = self.agents.people.iter().filter(|((l, _), _)| *l == from).map(|(k, t)| (k.clone(), *t)).collect();
+        for ((_, m), t) in moved {
+            self.agents.people.remove(&(from.clone(), m));
+            self.agents.people.entry((to.clone(), m)).or_insert(t);
         }
     }
 
@@ -1457,6 +1525,7 @@ impl State {
         if let Some(a) = self.agents.map.get_mut(name) {
             a.model = Some(model);
         }
+        self.agents.place(name);
     }
 
     fn login_of(&self, name: &str) -> String {
@@ -1490,6 +1559,11 @@ impl State {
     /// The review free reviewer `name` is offered now.
     pub fn offered(&self, name: &str) -> Option<&str> {
         self.offers.get(name).map(|(id, _)| id.as_str())
+    }
+
+    /// When the offers review `id` has now began, if it has any (see `ROTATION_MS`).
+    pub fn offered_since(&self, id: &str) -> Option<Ms> {
+        self.offers.values().filter(|(r, _)| r == id).map(|(_, at)| *at).min()
     }
 
     /// When the offer `name` has now lapses unanswered.
@@ -1981,6 +2055,9 @@ impl State {
         }
         r.lapsed.remove(agent);
         r.log(now, agent, "decline", if reason.is_empty() { "declined".to_string() } else { format!("declined: {reason}") });
+        if self.offered(agent) == Some(id.trim()) {
+            self.agents.take_turn(agent);
+        }
         self.advance(now);
         Ok(())
     }
@@ -2667,9 +2744,9 @@ impl State {
         if self.reviews.iter().all(|r| r.requeue_until.is_none()) {
             return false;
         }
-        let offered = self.allocate(now);
+        let spare = assign(&self.reviews, self.free_reviewers(now), &self.agents, &self.offers, now).spare;
         let lapsed = |a: &Agent| self.reviews.iter().any(|r| r.lapsed.contains(&a.name));
-        let free: Vec<&Agent> = self.free_reviewers(now).into_iter().filter(|a| !offered.contains_key(&a.name) && !self.agents.gone(&a.name) && !lapsed(a)).collect();
+        let free: Vec<&Agent> = spare.into_iter().filter(|a| !self.agents.gone(&a.name) && !lapsed(a)).collect();
         let mut ready = Vec::new();
         let mut over = Vec::new();
         for (i, r) in self.reviews.iter().enumerate() {
@@ -2761,7 +2838,7 @@ impl State {
 
     /// The review each free reviewer is offered.
     fn allocate(&self, now: Ms) -> BTreeMap<String, usize> {
-        assign(&self.reviews, self.free_reviewers(now))
+        assign(&self.reviews, self.free_reviewers(now), &self.agents, &self.offers, now).offers
     }
 
     /// Free reviewers that left the offer they have unanswered for `offer_secs` aren't offered it
@@ -2779,6 +2856,7 @@ impl State {
             let within = text::dur(r.params.offer_secs * 1000);
             r.lapsed.insert(a.clone());
             r.log(now, a, "lapse", format!("didn't answer the offer within {within}"));
+            self.agents.take_turn(a);
             self.agents.progress(a, id, format!("[{id}] The offer lapsed: you didn't answer it within {within}. It is made again when you next call `wait`, if it still needs you."), now);
         }
         !lapsed.is_empty()
@@ -2792,7 +2870,7 @@ impl State {
         let forming = || self.reviews.iter().enumerate().filter(|(_, r)| r.phase == Phase::Offering);
         let team = |r: &Review| -> Vec<&Agent> { r.active_slots().filter(|s| !s.kept()).filter_map(|s| self.agents.get(&s.agent)).collect() };
         let members = forming().flat_map(|(_, r)| team(r));
-        let wanted = assign(&self.reviews, free.iter().copied().chain(members).collect());
+        let wanted = assign(&self.reviews, free.iter().copied().chain(members).collect(), &self.agents, &self.offers, now).offers;
         for (i, r) in forming() {
             for a in team(r) {
                 if !r.fillable(a, &free) {
@@ -2970,17 +3048,55 @@ impl State {
 }
 
 /// The review of `reviews` each of `pool` is offered: oldest first, each review takes the
-/// reviewers it can form a team with, and younger ones count only those left. A review's own
-/// team members in `pool` are only for older reviews.
-fn assign(reviews: &[Review], mut pool: Vec<&Agent>) -> BTreeMap<String, usize> {
-    let mut offers = BTreeMap::new();
-    for (i, r) in reviews.iter().enumerate() {
-        pool.retain(|a| r.phase != Phase::Offering || !r.active_slots().any(|s| s.agent == a.name));
-        let takers: Vec<String> = pool.iter().filter(|a| r.can_join(a) && r.fillable(a, &pool)).map(|a| a.name.clone()).collect();
-        pool.retain(|a| !takers.contains(&a.name));
-        offers.extend(takers.into_iter().map(|a| (a, i)));
+/// reviewers it can form a team with, and younger ones count only those left. For `ROTATION_MS`
+/// after its offers (`offers`) begin, a review is offered to only as many as it has open seats:
+/// those it is offered now first, then by turn (`Agents::turn`), any that let an offer lapse last; it still keeps
+/// from younger reviews the others it could take once its offers open to all. A review's own team
+/// members in `pool` are only for older reviews.
+struct Assigned<'a> {
+    /// The review each reviewer is offered.
+    offers: BTreeMap<String, usize>,
+    /// Those no review is offered or keeps.
+    spare: Vec<&'a Agent>,
+}
+
+fn assign<'a>(reviews: &[Review], mut pool: Vec<&'a Agent>, agents: &Agents, offers: &BTreeMap<String, (String, Ms)>, now: Ms) -> Assigned<'a> {
+    pool.sort_by_key(|a| agents.turn(a));
+    let lapsed = |a: &Agent| reviews.iter().any(|r| r.lapsed.contains(&a.name));
+    let mut out = BTreeMap::new();
+    for (i, r) in reviews.iter().enumerate().filter(|(_, r)| r.phase == Phase::Offering) {
+        pool.retain(|a| !r.active_slots().any(|s| s.agent == a.name));
+        let held = |a: &Agent| offers.get(&a.name).is_some_and(|(id, _)| *id == r.id);
+        let usable: Vec<String> = pool.iter().filter(|a| r.can_join(a) && r.fillable(a, &pool)).map(|a| a.name.clone()).collect();
+        let since = pool.iter().filter(|a| held(a) && usable.contains(&a.name)).filter_map(|a| offers.get(&a.name)).map(|(_, at)| *at).min();
+        let takers = if since.is_none_or(|t| now < t + ROTATION_MS) {
+            let mut order = pool.clone();
+            order.sort_by_key(|a| (!held(a), lapsed(a)));
+            let mut team = r.clone();
+            let mut takers = Vec::new();
+            for a in order {
+                if team.active_slots().count() < team.params.reviewers && team.can_join(a) && team.fillable(a, &pool) {
+                    team.slots.push(Slot {
+                        agent: a.name.clone(),
+                        login: a.login.clone(),
+                        model: a.model,
+                        joined: now,
+                        dropped: None,
+                        submission: None,
+                        tasked: None,
+                        tickets: BTreeMap::new(),
+                    });
+                    takers.push(a.name.clone());
+                }
+            }
+            takers
+        } else {
+            usable.clone()
+        };
+        pool.retain(|a| !usable.contains(&a.name) && !takers.contains(&a.name));
+        out.extend(takers.into_iter().map(|a| (a, i)));
     }
-    offers
+    Assigned { offers: out, spare: pool }
 }
 
 /// Drops reviewers silent for `drop_ms`; one that owes a task is given until its deadline,
@@ -3044,6 +3160,9 @@ fn start_reviewing(r: &mut Review, agents: &mut Agents, now: Ms) {
     r.deadline = now + r.params.review_secs * 1000;
     r.grant_tickets();
     let names: Vec<String> = r.active_slots().map(|s| s.agent.clone()).collect();
+    for a in &names {
+        agents.take_turn(a);
+    }
     r.log(now, "relay", "phase", format!("independent review started with {}", names.join(", ")));
     let team = match names.len() {
         n if n < r.params.reviewers => format!("Starting with {n} of {} reviewers ({})", r.params.reviewers, names.join(", ")),

@@ -591,7 +591,7 @@ fn picked_reviewers_must_be_online_reviewers() {
     assert!(sim.s.reviews.is_empty());
 
     let id = sim.s.request_review("alice-codex", pick(&["rev-a", "rev-b", "rev-c"], Some(2)), sim.now).unwrap();
-    sim.accept("rev-c", &id);
+    sim.accept("rev-b", &id);
     sim.accept("rev-a", &id);
     assert_eq!(sim.phase(&id), Phase::Reviewing, "the first of the named to accept");
 }
@@ -3095,8 +3095,178 @@ fn a_rereview_reuses_reviewers_only_as_far_as_the_mix_allows() {
     sim.join_as("cx-b", "friend7@example.com", Model::Codex);
     assert!(sim.events("cx-b").contains("re-review"));
     sim.accept("cx-b", &id2);
-    sim.accept("cl-a", &id2);
-    assert_eq!(sim.phase(&id2), Phase::Reviewing);
+    sim.accept("cl-b", &id2);
+    assert_eq!(sim.phase(&id2), Phase::Reviewing, "cl-b, which hasn't reviewed yet, has its turn before cl-a");
+}
+
+#[test]
+fn reviews_go_round_the_reviewers_of_each_program() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cl-b", Model::Claude), ("cl-c", Model::Claude), ("cx-a", Model::Codex), ("cx-b", Model::Codex)]);
+    let mut took = Vec::new();
+    for n in 1..=6 {
+        let id = request_pr(&mut sim, "alice-codex", n, 2);
+        let offered: Vec<String> = ["cl-a", "cl-b", "cl-c", "cx-a", "cx-b"].into_iter().filter(|a| sim.s.offered(a) == Some(id.as_str())).map(String::from).collect();
+        assert_eq!(offered.len(), 2, "{id} is offered to its two open seats only: {offered:?}");
+        for a in &offered {
+            sim.accept(a, &id);
+        }
+        for a in &offered {
+            sim.submit(a, &id, &[]);
+        }
+        assert_eq!(sim.phase(&id), Phase::Done);
+        took.push(offered.join(" "));
+    }
+    assert_eq!(took, ["cl-a cx-a", "cl-b cx-b", "cl-c cx-a", "cl-a cx-b", "cl-b cx-a", "cl-c cx-b"]);
+}
+
+#[test]
+fn reviewers_an_older_review_cant_take_are_offered_the_next_one_at_once() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex), ("cl-b", Model::Claude), ("cx-b", Model::Codex)]);
+    let one = sim.s.request_review("alice-codex", pick(&["cl-a", "cx-a"], None), sim.now).unwrap();
+    let two = request_pr(&mut sim, "alice-codex", 2, 2);
+    let offers: Vec<Option<&str>> = ["cl-a", "cx-a", "cl-b", "cx-b"].into_iter().map(|a| sim.s.offered(a)).collect();
+    assert_eq!(offers, [Some(one.as_str()), Some(one.as_str()), Some(two.as_str()), Some(two.as_str())]);
+}
+
+#[test]
+fn an_older_review_keeps_the_reviewers_it_could_take_while_its_turns_run() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex), ("cl-b", Model::Claude), ("cx-b", Model::Codex)]);
+    let x = request_pr(&mut sim, "alice-codex", 1, 2);
+    sim.quiet("cl-a");
+    sim.accept("cx-a", &x);
+    sim.advance(2);
+    let y = request_pr(&mut sim, "alice-codex", 2, 2);
+    assert_eq!((sim.s.offered("cl-b"), sim.s.offered("cx-b")), (None, None), "{x} could still take cl-b, and {y} can't start without a claude reviewer");
+    sim.advance(30);
+    assert_eq!(sim.s.offered("cl-b"), Some(x.as_str()));
+    sim.accept("cl-b", &x);
+    assert_eq!(sim.phase(&x), Phase::Reviewing);
+}
+
+#[test]
+fn a_younger_team_keeps_a_member_an_older_review_keeps_but_does_not_offer() {
+    let mut sim = mixed(&[("cl-c", Model::Claude), ("cl-a", Model::Claude), ("cl-b", Model::Claude), ("cx-a", Model::Codex)]);
+    let x = request_pr(&mut sim, "alice-codex", 1, 2);
+    sim.s.decline("cx-a", &x, "busy", sim.now).unwrap();
+    sim.advance(560);
+    let y = request_pr(&mut sim, "alice-codex", 2, 3);
+    assert_eq!(sim.s.offered("cl-a"), Some(y.as_str()));
+    sim.accept("cl-a", &y);
+    sim.advance(40);
+    let r = sim.s.review(&y).unwrap();
+    assert!(r.slot("cl-a").is_some() && !r.log.iter().any(|e| e.kind == "release"), "{x} only keeps cl-a, so it isn't told {x} needs it: {:?}", r.log);
+    assert_eq!(sim.s.offered("cx-a"), Some(x.as_str()));
+}
+
+#[test]
+fn a_persons_place_follows_a_renamed_login() {
+    let mut sim = setup(&[]);
+    sim.join_as("a1", "ann@example.com", Model::Claude);
+    sim.join_as("b1", "ben@example.com", Model::Claude);
+    sim.join_as("cx", "cyd@example.com", Model::Codex);
+    let id = request_pr(&mut sim, "alice-codex", 1, 2);
+    sim.accept("a1", &id);
+    sim.accept("cx", &id);
+    sim.submit("a1", &id, &[]);
+    sim.submit("cx", &id, &[]);
+    sim.s.rename_login("ann@example.com", &who("ann.new@example.com"));
+    let id = request_pr(&mut sim, "alice-codex", 2, 2);
+    assert_eq!((sim.s.offered("b1"), sim.s.offered("a1")), (Some(id.as_str()), None), "ann had her turn under her old login name");
+}
+
+#[test]
+fn a_new_agent_starts_at_the_back_and_a_held_offer_stays_put() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cx-a", Model::Codex)]);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("cl-a", &id);
+    sim.accept("cx-a", &id);
+    sim.submit("cl-a", &id, &[]);
+    sim.submit("cx-a", &id, &[]);
+    sim.join_as("cl-z", "friend5@example.com", Model::Claude);
+    let id2 = request_pr(&mut sim, "alice-codex", 2, 2);
+    assert_eq!((sim.s.offered("cl-a"), sim.s.offered("cl-z")), (Some(id2.as_str()), None), "cl-a reviewed before cl-z was there");
+    sim.s.cancel(&id2, "a human", sim.now).unwrap();
+    sim.leave("cl-a");
+    sim.advance(Timing::default().online_secs);
+    let id3 = request_pr(&mut sim, "alice-codex", 3, 2);
+    assert_eq!(sim.s.offered("cl-z"), Some(id3.as_str()));
+    sim.join_as("cl-a", "friend0@example.com", Model::Claude);
+    assert_eq!((sim.s.offered("cl-z"), sim.s.offered("cl-a")), (Some(id3.as_str()), None), "cl-z keeps the offer it has, though cl-a's turn is earlier");
+}
+
+#[test]
+fn turns_go_by_person_so_more_agents_get_no_more_seats() {
+    let mut sim = setup(&[]);
+    for a in ["a1", "a2", "a3"] {
+        sim.join_as(a, "ann@example.com", Model::Claude);
+    }
+    sim.join_as("b1", "ben@example.com", Model::Claude);
+    sim.join_as("cx", "cyd@example.com", Model::Codex);
+    let mut seats: std::collections::BTreeMap<&str, usize> = Default::default();
+    for n in 1..=8 {
+        let id = request_pr(&mut sim, "alice-codex", n, 2);
+        let claude = ["a1", "a2", "a3", "b1"].into_iter().find(|a| sim.s.offered(a) == Some(id.as_str())).unwrap();
+        for a in [claude, "cx"] {
+            sim.accept(a, &id);
+        }
+        for a in [claude, "cx"] {
+            sim.submit(a, &id, &[]);
+        }
+        *seats.entry(claude).or_default() += 1;
+    }
+    assert_eq!(seats.get("b1"), Some(&4), "{seats:?}");
+    assert!(["a1", "a2", "a3"].iter().all(|a| seats.contains_key(a)), "ann's agents take her turns in turn: {seats:?}");
+}
+
+#[test]
+fn a_new_name_under_a_login_does_not_jump_the_rotation() {
+    let mut sim = setup(&[]);
+    sim.join_as("a1", "ann@example.com", Model::Claude);
+    sim.join_as("b1", "ben@example.com", Model::Claude);
+    sim.join_as("cx", "cyd@example.com", Model::Codex);
+    let id = request_pr(&mut sim, "alice-codex", 1, 2);
+    assert_eq!(sim.s.offered("a1"), Some(id.as_str()));
+    sim.accept("a1", &id);
+    sim.accept("cx", &id);
+    sim.submit("a1", &id, &[]);
+    sim.submit("cx", &id, &[]);
+    sim.join_as("a2", "ann@example.com", Model::Claude);
+    let id = request_pr(&mut sim, "alice-codex", 2, 2);
+    assert_eq!((sim.s.offered("b1"), sim.s.offered("a2")), (Some(id.as_str()), None), "ann just had her turn, under whatever name");
+    sim.accept("b1", &id);
+    sim.accept("cx", &id);
+    sim.submit("b1", &id, &[]);
+    sim.submit("cx", &id, &[]);
+    let id = request_pr(&mut sim, "alice-codex", 3, 2);
+    assert_eq!((sim.s.offered("a1"), sim.s.offered("a2")), (Some(id.as_str()), None), "ann's turn, and a2 joined her agents at the back");
+}
+
+#[test]
+fn a_reviewer_that_declines_or_lets_an_offer_lapse_goes_to_the_back() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cl-b", Model::Claude), ("cl-c", Model::Claude), ("cx-a", Model::Codex)]);
+    let id = request_pr(&mut sim, "alice-codex", 1, 2);
+    assert_eq!(sim.s.offered("cl-a"), Some(id.as_str()));
+    sim.s.decline("cl-a", &id, "busy", sim.now).unwrap();
+    assert_eq!(sim.s.offered("cl-b"), Some(id.as_str()), "the next in turn");
+    sim.advance(Timing::default().offer_secs);
+    let r = sim.s.review(&id).unwrap();
+    assert!(r.lapsed.contains("cl-b"));
+    sim.s = reload(&sim.s, sim.now, sim.now);
+    let order: Vec<(u64, u64)> = ["cl-c", "cl-a", "cl-b"].iter().map(|a| sim.s.agents.turn(sim.s.agents.get(a).unwrap())).collect();
+    assert!(order.is_sorted(), "cl-c first, then cl-a, which declined, then cl-b, which let its offer lapse, across a restart: {order:?}");
+}
+
+#[test]
+fn a_seat_its_reviewers_in_turn_leave_open_is_offered_to_all_after_30s() {
+    let mut sim = mixed(&[("cl-a", Model::Claude), ("cl-b", Model::Claude), ("cx-a", Model::Codex)]);
+    let id = sim.request("alice-codex", 2);
+    sim.quiet("cl-a");
+    assert_eq!(sim.s.offered("cl-b"), None, "cl-a has its turn first");
+    sim.advance(30);
+    assert_eq!(sim.s.offered("cl-b"), Some(id.as_str()), "cl-a hasn't answered in 30s, so anyone that fits may take the seat");
+    sim.accept("cl-b", &id);
+    sim.accept("cx-a", &id);
+    assert_eq!(sim.phase(&id), Phase::Reviewing);
 }
 
 #[test]
