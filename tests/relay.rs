@@ -2353,25 +2353,17 @@ fn css_and_js_stay_under_24kb() {
 }
 
 #[test]
-fn another_person_takes_one_slot_while_the_authors_own_agents_take_any() {
-    let mut sim = setup(&["rev-a", "rev-b"]);
-    sim.join("rev-b2", "FRIEND1@example.com", Role::Reviewer);
-    sim.join("alice-rev", "Alice@Example.com", Role::Reviewer);
-    let id = sim.request("alice-codex", 3);
-    sim.accept("rev-b", &id);
-    let err = sim.s.accept("rev-b2", &id, sim.now).unwrap_err().to_string();
-    assert!(err.contains("another agent of your Tailscale login already reviews"), "{err}");
-    sim.accept("rev-a", &id);
-    sim.accept("alice-rev", &id);
-    assert_eq!(sim.phase(&id), Phase::Reviewing, "rev-a and alice-rev are both the author's own");
-    let pick = |names: &[&str]| {
-        let mut req = titled("https://github.com/rust-lang/rust/pull/2");
-        req.picked = names.iter().map(|n| n.to_string()).collect();
-        req
-    };
-    let err = sim.s.request_review("alice-codex", pick(&["rev-b", "rev-b2"]), sim.now).unwrap_err().to_string();
-    assert!(err.contains("rev-b2 (another picked reviewer's Tailscale login)"), "{err}");
-    sim.s.request_review("alice-codex", pick(&["rev-a", "alice-rev"]), sim.now).unwrap();
+fn one_other_persons_claude_and_codex_reviewers_can_review_a_pr_together() {
+    let mut sim = setup(&[]);
+    sim.join_as("bob-claude", "bob@example.com", Model::Claude);
+    sim.join_as("bob-codex", "Bob@Example.com", Model::Codex);
+    let id = sim.request("alice-codex", 2);
+    sim.accept("bob-claude", &id);
+    sim.accept("bob-codex", &id);
+    assert_eq!(sim.phase(&id), Phase::Reviewing, "seats aren't limited per person");
+    let mut req = titled("https://github.com/rust-lang/rust/pull/2");
+    req.picked = vec!["bob-claude".into(), "bob-codex".into()];
+    sim.s.request_review("alice-codex", req, sim.now).unwrap();
 }
 
 #[test]
@@ -2891,15 +2883,19 @@ fn a_rereview_waiting_to_be_queued_again_keeps_its_parent() {
     sim.advance(600);
     let x = sim.s.rereview("alice-codex", &p, SHA2, "fixed", None, sim.now).unwrap();
     sim.advance(QUEUE);
+    let d = sim.s.request_review("bob-codex", at_head("https://github.com/rust-lang/rust/pull/7", &[]), sim.now).unwrap();
     sim.join_as("cl-b", "bob@example.com", Model::Claude);
     sim.join_as("cx-b", "bob@example.com", Model::Codex);
-    let d = sim.s.request_review("bob-codex", at_head("https://github.com/rust-lang/rust/pull/7", &[]), sim.now).unwrap();
     sim.accept("cl-b", &d);
     sim.accept("cx-b", &d);
+    let e = sim.s.request_review("bob-codex", at_head("https://github.com/rust-lang/rust/pull/8", &[]), sim.now).unwrap();
     sim.submit("cl-b", &d, &[]);
     sim.submit("cx-b", &d, &[]);
     sim.advance(10);
+    assert!(sim.s.review(&x).unwrap().requeue_until.is_some(), "cl-b and cx-b are offered {e}");
     assert!(sim.s.review(&p).is_some(), "history keeps the parent of a review the hub waits to queue again");
+    sim.accept("cl-b", &e);
+    sim.accept("cx-b", &e);
     sim.join_as("cl-a", "friend0@example.com", Model::Claude);
     sim.join_as("cx-a", "friend1@example.com", Model::Codex);
     let y = sim.s.reviews.last().unwrap().clone();
@@ -3216,6 +3212,35 @@ fn turns_go_by_person_so_more_agents_get_no_more_seats() {
     }
     assert_eq!(seats.get("b1"), Some(&4), "{seats:?}");
     assert!(["a1", "a2", "a3"].iter().all(|a| seats.contains_key(a)), "ann's agents take her turns in turn: {seats:?}");
+}
+
+#[test]
+fn a_person_takes_a_second_seat_only_when_nobody_else_of_that_program_is_free() {
+    let mut sim = setup(&[]);
+    for (n, m) in [("p-cl1", Model::Claude), ("p-cl2", Model::Claude), ("p-cl3", Model::Claude), ("p-cx1", Model::Codex), ("p-cx2", Model::Codex)] {
+        sim.join_as(n, "pat@example.com", m);
+    }
+    sim.join_as("q-cl", "quinn@example.com", Model::Claude);
+    sim.join_as("q-cx", "quinn@example.com", Model::Codex);
+    let names = ["p-cl1", "p-cl2", "p-cl3", "p-cx1", "p-cx2", "q-cl", "q-cx"];
+    for (n, count) in [(1, 2), (2, 2), (3, 3), (4, 3), (5, 4), (6, 4)] {
+        let id = request_pr(&mut sim, "alice-codex", n, count);
+        let team: Vec<&str> = names.into_iter().filter(|a| sim.s.offered(a) == Some(id.as_str())).collect();
+        assert_eq!(team.len(), count, "{id}: {team:?}");
+        if count == 3 {
+            assert!(team.iter().filter(|a| a.starts_with("q-")).count() == 1, "quinn takes one of three seats: {team:?}");
+        }
+        if count == 4 {
+            assert!(team.contains(&"q-cl") && team.contains(&"q-cx"), "quinn's claude and codex both take seats before pat's second of each: {team:?}");
+        }
+        for a in &team {
+            sim.accept(a, &id);
+        }
+        for a in &team {
+            sim.submit(a, &id, &[]);
+        }
+        assert_eq!(sim.phase(&id), Phase::Done);
+    }
 }
 
 #[test]

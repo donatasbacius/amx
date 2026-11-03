@@ -280,15 +280,14 @@ fn wanted<'a>(s: &State, mut pool: Vec<&'a Agent>, held: &BTreeMap<String, Strin
 
 /// R5: a review in its first 30s of offers is offered to no more reviewers than it has open
 /// seats, enough with its members for a team it can start with, and a reviewer newly offered it
-/// comes no later in turn (those that let an offer lapse last, whether or not lapses on reviews
-/// the step trimmed count) than any free reviewer of its program that could take that seat and
-/// isn't offered an older review.
+/// comes no later than any free reviewer of its program that could take that seat and isn't
+/// offered an older review: those that let an offer lapse last (whether or not lapses on reviews
+/// the step trimmed count), then by their person's seats in the review, then by turn.
 fn rotation_check(pre: &State, s: &State, now: Ms, free: &[&Agent], held: &BTreeMap<String, String>, turn: &dyn Fn(&Agent) -> (u64, u64), tag: &str) -> Option<String> {
     let seq = |id: &str| s.review(id).map_or(u64::MAX, Review::seq);
     let lapsed = |a: &Agent| s.reviews.iter().any(|o| o.lapsed.contains(&a.name));
     let trimmed = |a: &Agent| lapsed(a) || pre.reviews.iter().any(|o| s.review(&o.id).is_none() && o.lapsed.contains(&a.name));
     let t = turn;
-    let ahead = |f: &Agent, a: &Agent| (lapsed(f), t(f)) < (lapsed(a), t(a)) && (trimmed(f), t(f)) < (trimmed(a), t(a));
     for r in s.reviews.iter().filter(|r| r.phase == Phase::Offering && rotating(s, r, now)) {
         let to: Vec<&Agent> = free.iter().copied().filter(|a| held.get(&a.name) == Some(&r.id)).collect();
         let open = r.params.reviewers.saturating_sub(r.active_slots().count());
@@ -299,9 +298,14 @@ fn rotation_check(pre: &State, s: &State, now: Ms, free: &[&Agent], held: &BTree
         if !to.is_empty() && !any_team(r, &members.iter().copied().chain(to.iter().copied()).collect::<Vec<_>>(), &[]) {
             return Some(format!("{tag}: {} is offered to {:?}, who can't make a team it can start with", r.id, to.iter().map(|a| &a.name).collect::<Vec<_>>()));
         }
-        let logins: Vec<String> = members.iter().chain(to.iter()).map(|a| a.login.to_ascii_lowercase()).filter(|l| !own(r, l)).collect();
         let older = |f: &Agent| s.reviews.iter().any(|o| o.phase == Phase::Offering && o.seq() < r.seq() && can_join(o, f) && fillable(o, f, free));
         let open_to = |f: &Agent| held.get(&f.name).is_none_or(|o| seq(o) > r.seq()) && !older(f);
+        let seats = |a: &Agent, among: &[&Agent]| among.iter().filter(|x| x.login.eq_ignore_ascii_case(&a.login)).count();
+        let both: Vec<&Agent> = members.iter().chain(to.iter()).copied().collect();
+        let ahead = |f: &Agent, a: &Agent| {
+            let (sf, sa) = (seats(f, &both), seats(a, &members));
+            (lapsed(f), sf, t(f)) < (lapsed(a), sa, t(a)) && (trimmed(f), sf, t(f)) < (trimmed(a), sa, t(a))
+        };
         for a in to.iter().filter(|a| pre.offered(&a.name) != Some(r.id.as_str())) {
             let ahead = free.iter().find(|f| {
                 f.model == a.model
@@ -309,7 +313,6 @@ fn rotation_check(pre: &State, s: &State, now: Ms, free: &[&Agent], held: &BTree
                     && open_to(f)
                     && can_join(r, f)
                     && fillable(r, f, free)
-                    && (own(r, &f.login) || !logins.contains(&f.login.to_ascii_lowercase()))
                     && ahead(f, a)
             });
             if let Some(f) = ahead {
@@ -465,15 +468,13 @@ impl Passed {
                 .filter(|x| r.log.iter().any(|e| e.kind == "accept" && e.who == x.agent && !e.text.starts_with("assigned again")))
                 .filter_map(|x| pre.agents.get(&x.agent))
                 .collect();
-            let logins: Vec<String> = r.active_slots().map(|x| x.login.to_ascii_lowercase()).filter(|l| !own(r, l)).collect();
             for f in pre_free.iter().filter(|f| s.busy_with(&f.name).is_none() && s.agents.online(&f.name, now) && !lapsed(f)) {
                 let older = offered(pre, &f.name, now).first().and_then(|o| pre.review(o)).is_some_and(|o| o.seq() < r.seq())
                     || pre.reviews.iter().any(|o| o.phase == Phase::Offering && o.seq() < r.seq() && can_join(o, f) && fillable(o, f, &pre_free));
                 let allowed = f.name != r.author
                     && (r.picked.is_empty() || r.picked.contains(&f.name))
                     && !r.declined.contains(&f.name)
-                    && !r.offered.contains(&f.name)
-                    && (own(r, &f.login) || !logins.contains(&f.login.to_ascii_lowercase()));
+                    && !r.offered.contains(&f.name);
                 if !older && allowed && accepted.iter().any(|a| a.model == f.model && turn(a) > turn(f)) {
                     let n = self.times.entry(f.name.clone()).or_default();
                     *n += 1;
@@ -512,10 +513,6 @@ fn free(s: &State, now: Ms) -> Vec<&Agent> {
         .collect()
 }
 
-fn own(r: &Review, login: &str) -> bool {
-    r.author_login.eq_ignore_ascii_case(login)
-}
-
 /// The README's rules for who may take a place in a forming team.
 fn can_join(r: &Review, a: &Agent) -> bool {
     let n = r.active_slots().count();
@@ -531,7 +528,6 @@ fn can_join(r: &Review, a: &Agent) -> bool {
         && !r.lapsed.contains(&a.name)
         && (r.picked.is_empty() || r.picked.contains(&a.name))
         && n < r.params.reviewers
-        && (own(r, &a.login) || !r.active_slots().any(|x| x.login.eq_ignore_ascii_case(&a.login)))
         && !leaves_out
 }
 
@@ -554,19 +550,14 @@ fn fillable(r: &Review, a: &Agent, free: &[&Agent]) -> bool {
     })
 }
 
-/// Count members, or for three or more at least two; both programs when two or more; one per
-/// login other than the author's.
+/// Count members, or for three or more at least two; both programs when two or more.
 fn valid(r: &Review, team: &[(&str, Option<Model>)]) -> bool {
     let c = r.params.reviewers;
     let n = team.len();
     if !(n == c || (c >= 3 && (2..c).contains(&n))) {
         return false;
     }
-    if c >= 2 && !Model::ALL.iter().all(|m| team.iter().any(|(_, x)| *x == Some(*m))) {
-        return false;
-    }
-    let logins: Vec<String> = team.iter().map(|(l, _)| l.to_ascii_lowercase()).filter(|l| !own(r, l)).collect();
-    logins.iter().collect::<BTreeSet<_>>().len() == logins.len()
+    c < 2 || Model::ALL.iter().all(|m| team.iter().any(|(_, x)| *x == Some(*m)))
 }
 
 fn valid_team(s: &State, r: &Review, team: &[&str]) -> bool {
@@ -578,9 +569,8 @@ fn valid_team(s: &State, r: &Review, team: &[&str]) -> bool {
 /// with these members plus the reviewers free for it, and can't without them. A reviewer is
 /// free for a review when online, allowed, on no running review, and not spoken for (offered or
 /// kept in its turns) by an even older review that can start. An older review still in its first
-/// 30s of offers needs only those it offers, which F3 covers. (The model lets the older review swap out its own forming
-/// members too; the relay never does, which matters only when one other person runs both
-/// programs.)
+/// 30s of offers needs only those it offers, which F3 covers. (The model lets the older review
+/// swap out its own forming members too; the relay never does.)
 fn needed_by_older(pre: &State, started: &Review, team: &[&str], now: Ms) -> Option<String> {
     let reviewers: Vec<&Agent> = pre.agents.all().filter(|a| a.role == Role::Reviewer && a.model.is_some()).collect();
     let allowed = |r: &Review, a: &Agent| (r.picked.is_empty() || r.picked.contains(&a.name)) && !r.declined.contains(&a.name) && !r.lapsed.contains(&a.name) && r.slot(&a.name).is_none_or(|x| x.active());

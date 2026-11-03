@@ -133,7 +133,7 @@ impl World {
                 self.s = fresh;
                 "restart".into()
             }
-            _ if self.rng.chance(2) && self.s.reviews.iter().all(|r| !r.phase.active()) => {
+            _ if self.rng.chance(5) && self.s.reviews.iter().all(|r| !r.phase.active()) => {
                 self.now += 25 * 3600 * 1000;
                 self.touch_alive();
                 "a day passes".into()

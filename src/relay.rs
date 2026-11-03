@@ -795,12 +795,6 @@ impl Review {
         lapsed.chain(declined).collect()
     }
 
-    /// Whether `login` already holds a slot. Other people take one slot each; the author's own
-    /// agents may take any number.
-    fn login_taken(&self, login: &str) -> bool {
-        !self.author_login.eq_ignore_ascii_case(login) && self.active_slots().any(|s| s.login.eq_ignore_ascii_case(login))
-    }
-
     /// The program a review of two or more reviewers has none of yet; it needs both.
     pub fn missing_model(&self) -> Option<Model> {
         if self.params.reviewers < 2 {
@@ -839,18 +833,14 @@ impl Review {
             && !self.lapsed.contains(&a.name)
             && (self.picked.is_empty() || self.picked.contains(&a.name))
             && self.active_slots().count() < self.params.reviewers
-            && !self.login_taken(&a.login)
             && self.fits(a.model)
     }
 
     /// Whether a team it can start with could form from its members, `a` and the `free`
-    /// reviewers: a program `a` leaves missing must come from a free reviewer of another login.
+    /// reviewers: a program `a` leaves missing must come from another free reviewer.
     fn fillable(&self, a: &Agent, free: &[&Agent]) -> bool {
         let Some(m) = self.missing_with(a.model) else { return true };
-        let own = |l: &str| self.author_login.eq_ignore_ascii_case(l);
-        free.iter().any(|y| {
-            y.name != a.name && y.model == Some(m) && self.can_join(y) && (own(&y.login) || !y.login.eq_ignore_ascii_case(&a.login))
-        })
+        free.iter().any(|y| y.name != a.name && y.model == Some(m) && self.can_join(y))
     }
 
     /// When its forming team must be complete, else it is released (or, for three or more
@@ -1955,8 +1945,6 @@ impl State {
     fn check_picked(&self, author: &str, names: &[String], now: Ms) -> Result<Vec<String>> {
         let mut picked: Vec<String> = Vec::new();
         let mut bad = Vec::new();
-        let author_login = self.login_of(author);
-        let mut logins: Vec<String> = Vec::new();
         for name in names.iter().map(|n| n.trim()) {
             if picked.iter().any(|p| p == name) {
                 continue;
@@ -1967,8 +1955,6 @@ impl State {
                 Some(_) if !self.agents.online(name, now) => bad.push(format!("{name} (not online)")),
                 Some(a) if a.role != Role::Reviewer => bad.push(format!("{name} (not a reviewer)")),
                 Some(a) if a.model.is_none() => bad.push(format!("{name} (hasn't said whether it is claude or codex)")),
-                Some(a) if logins.contains(&a.login.to_ascii_lowercase()) => bad.push(format!("{name} (another picked reviewer's Tailscale login)")),
-                Some(a) if !a.login.eq_ignore_ascii_case(&author_login) => logins.push(a.login.to_ascii_lowercase()),
                 Some(_) => {}
             }
             picked.push(name.to_string());
@@ -2010,9 +1996,6 @@ impl State {
         }
         if r.active_slots().count() >= r.params.reviewers {
             bail!("{} already has enough reviewers", r.id);
-        }
-        if r.login_taken(&login) {
-            bail!("another agent of your Tailscale login already reviews {}: each person takes one slot", r.id);
         }
         let Some(model) = model else {
             bail!("call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program you run in) first");
@@ -2519,7 +2502,7 @@ impl State {
     }
 
     /// Puts into re-review `r`'s team the reviewers who finished `prev` and are online, idle and
-    /// not declining it, one per login other than the author's, as far as both programs still fit.
+    /// not declining it, as far as both programs still fit.
     fn seat_again(&self, r: &mut Review, prev: &Review, now: Ms) {
         let busy: HashSet<String> = self
             .reviews
@@ -2535,11 +2518,7 @@ impl State {
                 && !busy.contains(&s.agent)
                 && self.agents.get(&s.agent).is_some_and(|a| a.role == Role::Reviewer && a.login.eq_ignore_ascii_case(&s.login))
         }) {
-            let author = s.login.eq_ignore_ascii_case(&r.author_login);
-            let model = self.agents.get(&s.agent).and_then(|a| a.model);
-            if let Some(model) = model
-                && (author || !candidates.iter().any(|(_, l, _)| l.eq_ignore_ascii_case(&s.login)))
-            {
+            if let Some(model) = self.agents.get(&s.agent).and_then(|a| a.model) {
                 candidates.push((s.agent.clone(), s.login.clone(), model));
             }
         }
@@ -3049,8 +3028,9 @@ impl State {
 
 /// The review of `reviews` each of `pool` is offered: oldest first, each review takes the
 /// reviewers it can form a team with, and younger ones count only those left. For `ROTATION_MS`
-/// after its offers (`offers`) begin, a review is offered to only as many as it has open seats:
-/// those it is offered now first, then by turn (`Agents::turn`), any that let an offer lapse last; it still keeps
+/// after its offers (`offers`) begin, a review is offered to only as many as it has open seats,
+/// one at a time: those it is offered now first, any that let an offer lapse last, and otherwise
+/// the one whose person has the fewest seats in it, then by turn (`Agents::turn`). It still keeps
 /// from younger reviews the others it could take once its offers open to all. A review's own team
 /// members in `pool` are only for older reviews.
 struct Assigned<'a> {
@@ -3070,24 +3050,23 @@ fn assign<'a>(reviews: &[Review], mut pool: Vec<&'a Agent>, agents: &Agents, off
         let usable: Vec<String> = pool.iter().filter(|a| r.can_join(a) && r.fillable(a, &pool)).map(|a| a.name.clone()).collect();
         let since = pool.iter().filter(|a| held(a) && usable.contains(&a.name)).filter_map(|a| offers.get(&a.name)).map(|(_, at)| *at).min();
         let takers = if since.is_none_or(|t| now < t + ROTATION_MS) {
-            let mut order = pool.clone();
-            order.sort_by_key(|a| (!held(a), lapsed(a)));
             let mut team = r.clone();
-            let mut takers = Vec::new();
-            for a in order {
-                if team.active_slots().count() < team.params.reviewers && team.can_join(a) && team.fillable(a, &pool) {
-                    team.slots.push(Slot {
-                        agent: a.name.clone(),
-                        login: a.login.clone(),
-                        model: a.model,
-                        joined: now,
-                        dropped: None,
-                        submission: None,
-                        tasked: None,
-                        tickets: BTreeMap::new(),
-                    });
-                    takers.push(a.name.clone());
-                }
+            let mut takers: Vec<String> = Vec::new();
+            while team.active_slots().count() < team.params.reviewers {
+                let seats = |a: &Agent| team.active_slots().filter(|s| s.login.eq_ignore_ascii_case(&a.login)).count();
+                let next = pool.iter().filter(|a| team.can_join(a) && team.fillable(a, &pool)).min_by_key(|a| (!held(a), lapsed(a), seats(a), agents.turn(a)));
+                let Some(a) = next.copied() else { break };
+                team.slots.push(Slot {
+                    agent: a.name.clone(),
+                    login: a.login.clone(),
+                    model: a.model,
+                    joined: now,
+                    dropped: None,
+                    submission: None,
+                    tasked: None,
+                    tickets: BTreeMap::new(),
+                });
+                takers.push(a.name.clone());
             }
             takers
         } else {

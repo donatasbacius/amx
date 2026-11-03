@@ -1,7 +1,7 @@
 //! Every interleaving of the actors' actions and the deadlines they race, within small bounds:
 //! a breadth-first search over the relay's real state, checking the state machine model's
-//! safety properties across every step. `EXPLORE=large` raises the bounds (about half an hour and
-//! 8 GB with `--release`).
+//! safety properties across every step. `EXPLORE=large` raises the bounds (about fifteen minutes
+//! and 4 GB with `--release`).
 
 #[path = "common/props.rs"]
 mod props;
@@ -9,7 +9,8 @@ mod props;
 use amx::config::{Consensus, Timing};
 use amx::relay::{FindingIn, Model, Ms, NewReview, Phase, Role, State, SubmitIn, VoteIn, rereview};
 use amx::tailscale::Identity;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::fmt::Write;
 
 const SHAS: [&str; 2] = ["0123456789abcdef0123456789abcdef01234567", "89abcdef0123456789abcdef0123456789abcdef"];
@@ -69,9 +70,10 @@ const SMALL: [Bounds; 5] = [
     Bounds { name: "a review no team takes in time is queued again", reviewers: 2, absences: 1, requeues: 1, cancels: 0, ..BASE },
 ];
 
-const LARGE: [Bounds; 5] = [
+const LARGE: [Bounds; 6] = [
     Bounds { name: "two requests queue for three reviewers", requests: 2, absences: 1, counts: &[2, 3], strays: true, ..BASE },
-    Bounds { name: "two authors and four reviewers", authors: 2, reviewers: 4, requests: 2, ..BASE },
+    Bounds { name: "two authors and three reviewers", authors: 2, requests: 2, ..BASE },
+    Bounds { name: "four reviewers, one of the author's", reviewers: 4, requests: 2, ..BASE },
     Bounds {
         name: "a review and its re-review",
         reviewers: 2,
@@ -85,7 +87,7 @@ const LARGE: [Bounds; 5] = [
 ];
 
 /// States one search may keep before it gives up, a few kilobytes each.
-const MAX_STATES: usize = 2_600_000;
+const MAX_STATES: usize = 1_500_000;
 
 #[derive(Debug)]
 enum Act {
@@ -410,12 +412,22 @@ fn trace(trail: &[(usize, String)], mut at: usize, last: &Act) -> String {
     steps.iter().rev().enumerate().map(|(i, s)| format!("{:3}. {s}", i + 1)).collect::<Vec<_>>().join("\n")
 }
 
+/// A state's key in 128 bits, so the search can keep millions of them.
+fn digest(k: &str) -> u128 {
+    let half = |salt: u8| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (salt, k).hash(&mut h);
+        h.finish() as u128
+    };
+    half(0) << 64 | half(1)
+}
+
 /// Every state reachable within `b`, checking the properties across every step; the shortest
 /// trace to a violation fails the test.
 fn explore(b: &Bounds, seen: &mut BTreeMap<&'static str, usize>) {
     let started = std::time::Instant::now();
     let (s, now) = fresh(b);
-    let mut index: HashMap<String, usize> = HashMap::from([(format!("0{}", key(&s, now)), 0)]);
+    let mut index: HashSet<u128> = HashSet::from([digest(&format!("0{}", key(&s, now)))]);
     let mut trail: Vec<(usize, String)> = vec![(0, String::new())];
     let mut todo = VecDeque::from([(s, now, 0, 0, (props::Churn::default(), props::Passed::default()))]);
     let mut steps = 0;
@@ -430,9 +442,8 @@ fn explore(b: &Bounds, seen: &mut BTreeMap<&'static str, usize>) {
             reached(&s, &next, seen);
             let absences = absences + usize::from(matches!(act, Act::Offline(_)));
             let k = format!("{absences}{}", key(&next, then));
-            if !index.contains_key(&k) {
-                assert!(index.len() < MAX_STATES, "{}: more than {MAX_STATES} states; lower the bounds", b.name);
-                index.insert(k, trail.len());
+            if index.insert(digest(&k)) {
+                assert!(index.len() <= MAX_STATES, "{}: more than {MAX_STATES} states; lower the bounds", b.name);
                 trail.push((at, format!("{act:?}")));
                 todo.push_back((next, then, absences, trail.len() - 1, (churn, passed)));
             }
