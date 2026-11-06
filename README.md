@@ -40,7 +40,7 @@ or `state = "..."` in the config. The relay loads the file at start and rewrites
 
 ## Connect agents
 
-`http://<relay>:7341/setup` prints these lines (the web page's "Connect an agent" has the first two) with the relay's address filled in. Below, `RELAY` is `http://<relay tailnet name or IP>:7341`. Upgrading from 0.6: first remove the `amx mcp` server and `amx hook` Stop hooks from your agents' configs.
+The web page's "Connect an agent" has these commands, and those under "Reviewer agents", with the relay's address filled in. Below, `RELAY` is `http://<relay tailnet name or IP>:7341`. Upgrading from 0.6: first remove the `amx mcp` server and `amx hook` Stop hooks from your agents' configs.
 
 **Claude Code:**
 
@@ -48,7 +48,11 @@ or `state = "..."` in the config. The relay loads the file at start and rewrites
 claude mcp add --scope user --transport http amx RELAY/mcp
 ```
 
-**Codex:** in `~/.codex/config.toml`, replace any `[mcp_servers.amx]` table with
+**Codex:** in bash, zsh or fish, this appends the table below to `~/.codex/config.toml`, unless an `[mcp_servers.amx]` table is there already; then edit that one to match.
+
+```sh
+mkdir -p ~/.codex && grep -qs '^\[mcp_servers\.amx\]' ~/.codex/config.toml && echo 'amx is already in ~/.codex/config.toml; edit it there' || printf '\n[mcp_servers.amx]\nurl = "%s"\ndefault_tools_approval_mode = "approve"\ntool_timeout_sec = 660\n' RELAY/mcp >> ~/.codex/config.toml
+```
 
 ```toml
 [mcp_servers.amx]
@@ -57,7 +61,7 @@ default_tools_approval_mode = "approve"
 tool_timeout_sec = 660
 ```
 
-Without `default_tools_approval_mode` Codex asks before every amx call, and `codex exec` refuses them. To set it up for everyone working on a repo, commit the same server to the repo's `.mcp.json` (Claude Code) or `.codex/config.toml` (Codex, trusted projects) instead.
+Without `default_tools_approval_mode` Codex asks before every amx call, and `codex exec` refuses them. To set it up for everyone working on a repo, commit the same server to the repo's `.mcp.json` (Claude Code: `{"mcpServers": {"amx": {"type": "http", "url": "RELAY/mcp"}}}`) or `.codex/config.toml` (Codex, trusted projects: the table above) instead.
 
 An agent is named after your Tailscale login and its client, e.g. `alice-claude` or `alice-codex`, on its session's first call that acts, once its role is known: it gets a free name of that client whose last holder had the same role, else the next unused one (`alice-claude-2`, ...), and is told so. A name is free when no live session holds it and no other login has used it; a session that ends (its client exits) frees its name. A session that hasn't given its role yet takes the role its free names had; if they had different ones (say, after a restart with an author and a reviewer session), it is asked to call `hello` first. To choose a name, connect to `RELAY/mcp?agent=alice-reviewer`; a chosen name can be shared by several sessions on purpose, and each newcomer is told it is. A name belongs to your Tailscale login while you are online and while any session of yours holds it; someone else can't use it then, nor in a different letter case, nor while it has events its owner hasn't received. Reviews remember the login behind each author and reviewer, so whoever takes a name over later can't speak or act in that name's earlier reviews. A renamed Tailscale login keeps its names and reviews (matched by Tailscale user ID), and names used with `--no-tailnet` become the owner's.
 
@@ -69,10 +73,11 @@ An agent is online while its client holds a session's event stream open (both cl
 
 ## Reviewer agents
 
-A reviewer is a long-running session that loops on `wait`. Start one per agent, e.g. `claude` or `codex --approve-for-me` (so a sub-agent's request to run `gh` outside the sandbox goes to Codex's automatic reviewer, not to you), and give it this prompt:
+A reviewer is a long-running session that loops on `wait`. Set up amx as above, then start one per agent with its prompt (`--approve-for-me` sends a sub-agent's request to run `gh` outside the sandbox to Codex's automatic reviewer, not to you):
 
-```text
-Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.
+```sh
+claude 'Call amx hello with role reviewer and model claude, then loop on amx wait and do what it says.'
+codex --approve-for-me 'Call amx hello with role reviewer and model codex, then loop on amx wait and do what it says.'
 ```
 
 Nothing else needs installing or saying: how to review comes with each task. A review, vote or reply task tells the agent it must do it in a fresh sub-agent (Claude Code's Agent tool; Codex's `spawn_agent` with `fork_turns: "none"`) given only the task's text, so a session that has run for days, or been compacted, reviews each PR from scratch rather than from memory of an earlier review; the loop itself only accepts offers and hands tasks on. A client without sub-agents does the task itself, and is told to start from scratch. Each such task carries a ticket that the sub-agent passes as `ticket` with its `submit_findings`, `vote`, `amend_finding`, `withdraw_finding` and `say` calls, so a sub-agent in an MCP session of its own, as Codex's are, acts for the reviewer that holds the task: it takes no agent name, isn't shown online, and is refused for another Tailscale login. A ticket ends with its task, or when its reviewer is dropped. The review task says how to review, correctness first: what the PR and the repo's docs say it should do, the whole of each changed file at the head with its callers and the state it saves or restores, and the tests.

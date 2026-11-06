@@ -3572,7 +3572,7 @@ fn the_agents_panel_counts_each_program_and_names_the_one_short() {
     let waiting = request_pr(&mut sim, "alice-codex", 2, 2);
     assert!(sim.s.accept("cl-b", &waiting, sim.now).is_err(), "no codex reviewer is free to complete the team");
     let index = amx::web::render_index(&sim.s, sim.now, &View::anyone());
-    assert!(index.contains("<p class=\"prog\"><span><b>claude</b> 1 idle, 1 busy</span><span><b>codex</b> 0 idle, 1 busy</span></p>"), "{index}");
+    assert!(index.contains("<span class=\"count\">4</span></h2><ul class=\"agents\"><li>"), "no summary above the agents: {index}");
     assert!(index.contains(&format!("<p class=\"warn\">No codex reviewer is idle: <a href=\"/r/{waiting}\">rust#2</a> waits for one.</p>")), "{index}");
     assert!(index.contains("<a class=\"ag-sum\" href=\"#agents\">Agents: <span>1 reviewer idle ·</span> <span>2 reviewing ·</span> <span>1 author ·</span> <span>no codex idle</span></a>"), "the phone's summary: {index}");
     assert!(index.find("class=\"list\"").unwrap() < index.find("<aside class=\"side\"><section id=\"agents\" class=\"panel\">").unwrap(), "{index}");

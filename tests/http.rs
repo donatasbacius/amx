@@ -367,22 +367,28 @@ fn well_formed_for_screen_readers(page: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn setup() {
+async fn connect() {
     let relay = start(None, vec![]).await;
     let base = relay.local.clone();
-    let setup = reqwest::get(format!("{base}/setup")).await.unwrap().text().await.unwrap();
-    for line in [
-        format!("claude mcp add --scope user --transport http amx {base}/mcp"),
-        format!("replace any [mcp_servers.amx] table with\n\n[mcp_servers.amx]\nurl = \"{base}/mcp\"\ndefault_tools_approval_mode = \"approve\"\ntool_timeout_sec = 660\n"),
-        "local-claude and local-codex".into(),
-    ] {
-        assert!(setup.contains(&line), "{line} in {setup}");
-    }
-    assert!(!setup.contains("hook"), "{setup}");
+    assert_eq!(reqwest::get(format!("{base}/setup")).await.unwrap().status(), 404, "the page has it all");
     assert_eq!(reqwest::get(format!("{base}/api/hook/stop?agent=rev")).await.unwrap().status(), 404);
     let page = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
-    assert!(page.contains("Connect an agent</summary>") && page.contains("claude mcp add"), "{page}");
-    assert!(page.contains("local-claude</code> and <code>local-codex</code>. <a href=\"/setup\">Full setup</a>"), "the rest is on /setup: {page}");
+    let block = |label: &str, cmd: &str| format!("<p>{label} <button type=\"button\" class=\"copy\">Copy</button></p><pre><code>{cmd}</code></pre>");
+    let prompt = |m: &str| format!("&#39;Call amx hello with role reviewer and model {m}, then loop on amx wait and do what it says.&#39;");
+    let panel = format!(
+        "Connect an agent</summary><h3>Claude Code</h3>{}{}<h3>Codex</h3>{}{}</details>",
+        block("Set up amx (once)", &format!("claude mcp add --scope user --transport http amx {base}/mcp")),
+        block("Start a reviewer", &format!("claude {}", prompt("claude"))),
+        block(
+            "Set up amx (once)",
+            &format!(
+                "mkdir -p ~/.codex &amp;&amp; grep -qs &#39;^\\[mcp_servers\\.amx\\]&#39; ~/.codex/config.toml &amp;&amp; echo &#39;amx is already in ~/.codex/config.toml; edit it there&#39; || \
+                 printf &#39;\\n[mcp_servers.amx]\\nurl = &quot;%s&quot;\\ndefault_tools_approval_mode = &quot;approve&quot;\\ntool_timeout_sec = 660\\n&#39; {base}/mcp &gt;&gt; ~/.codex/config.toml"
+            )
+        ),
+        block("Start a reviewer", &format!("codex --approve-for-me {}", prompt("codex"))),
+    );
+    assert!(page.contains(&panel), "{panel} in {page}");
     assert!(page.contains("No agents online") && page.contains("<details id=\"connect\" class=\"side-d connect\" open>"), "open while nobody is online: {page}");
     assert!(page.contains("<span class=\"sr\">Viewing on </span>This machine</span></header>"), "--no-tailnet: {page}");
     assert!(!page.contains(">local<") && !page.contains("Viewing as"), "its placeholder login is never shown: {page}");
@@ -1127,7 +1133,6 @@ async fn loopback_waits_for_the_owner_then_takes_over_local_names() {
     for path in ["/", "/r/r1", "/api/reviews", "/static/app.js"] {
         assert_eq!(reqwest::get(format!("{early}{path}")).await.unwrap().status(), 200, "{path} is read-only");
     }
-    assert_eq!(reqwest::get(format!("{early}/setup")).await.unwrap().status(), 503);
     starting.stop().await;
 
     let up = write_script(

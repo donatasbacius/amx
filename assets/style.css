@@ -78,7 +78,7 @@ summary > .i:first-child { margin: 0 .3em 0 -.3em; }
 details[open] > summary > .i { transform: rotate(90deg); }
 
 /* Relay chrome: small and grey. */
-.live, .meta, .newer, .ref, .rv-meta, .rv-when, .foot, .reviewers .why, .prog, .key, .warn, .ag-sum, .vw, .fid, .facts, .h-gist, .h-when, .log li, .rule .q {
+.live, .meta, .newer, .ref, .rv-meta, .rv-when, .foot, .reviewers .why, .key, .warn, .ag-sum, .vw, .fid, .facts, .h-gist, .h-when, .log li, .rule .q {
   color: var(--muted); font-size: var(--fs-1); line-height: var(--lh-1);
 }
 .th time, .filters a, .side-d > summary, .more > summary, .key dd, .muted, .count, .empty, .me > .i, .vbox > summary > .i, .votes .md, .dim .ft, .dim .sev, .agents .role, .pg { color: var(--muted); }
@@ -161,8 +161,6 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .side { position: sticky; top: var(--sp-4); max-height: calc(100vh - var(--sp-6)); overflow-y: auto; margin-top: var(--sp-5); }
 .panel { padding: var(--sp-3) var(--row-x); }
 .ph { font-size: var(--fs-2); line-height: var(--lh-2); margin: 0 0 var(--sp-1); }
-.prog { display: flex; flex-wrap: wrap; gap: 0 var(--sp-4); margin: 0 0 6px; padding-bottom: var(--sp-2); border-bottom: 1px solid var(--line); }
-.prog b { color: var(--text); }
 .agents li { display: flex; flex-wrap: wrap; column-gap: var(--sp-2); padding: 3px 0; overflow-wrap: anywhere; }
 .agents b { min-width: 0; }
 .agents .role { margin-left: auto; text-align: right; }
@@ -170,8 +168,9 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .side-d { margin-top: var(--sp-3); }
 .side-d > summary { padding: var(--sp-1) 0; }
 .connect h3 { font-size: inherit; font-weight: 650; margin: var(--sp-3) 0 var(--sp-1); }
-.connect p, .connect pre { margin: 0 0 var(--sp-2); }
-.connect pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--sp-2) 10px; }
+.connect p { display: flex; justify-content: space-between; align-items: baseline; margin: 0 0 4px; }
+.connect pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 var(--sp-2); padding: var(--sp-2) 10px; }
+.copy { font: inherit; color: var(--link); background: none; border: 0; padding: 2px 0; cursor: pointer; }
 .key { display: grid; gap: 2px; margin: var(--sp-2) 0 0; }
 .key dd { margin: 0 0 6px 14px; }
 

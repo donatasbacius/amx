@@ -167,7 +167,6 @@ pub fn router(hub: Arc<Hub>, listener: Listener) -> Router {
         .route("/static/app.js", get(static_js))
         .route("/api/reviews", get(crate::web::api_reviews))
         .route("/api/reviews/{id}", get(crate::web::api_review))
-        .route("/setup", get(setup))
         .route("/mcp", get(mcp_get).post(mcp).delete(mcp_delete))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .layer(middleware::from_fn_with_state((hub.clone(), listener), identify))
@@ -818,11 +817,6 @@ async fn mcp_delete(State(hub): St, Extension(who): Extension<Identity>, headers
         }
     }
     StatusCode::OK
-}
-
-/// How to connect each client, with this relay's address and the caller's default names.
-async fn setup(State(hub): St, Extension(who): Extension<Identity>) -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], crate::text::setup(&hub.web_url(), &who.login))
 }
 
 #[cfg(test)]

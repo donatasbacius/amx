@@ -160,6 +160,23 @@
       });
   });
 
+  // Over plain http (a tailnet address) there is no navigator.clipboard: select the command instead.
+  document.addEventListener("click", function (e) {
+    var b = e.target.closest("button.copy");
+    if (!b) return;
+    var code = b.parentNode.nextElementSibling, text = code.textContent;
+    function done() { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy"; }, 1500); }
+    function select() {
+      var r = document.createRange();
+      r.selectNodeContents(code);
+      getSelection().removeAllRanges();
+      getSelection().addRange(r);
+      if (document.execCommand("copy")) done();
+    }
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, select);
+    else select();
+  });
+
   document.addEventListener("DOMContentLoaded", function () {
     var main = document.getElementById("main");
     tag = main.getAttribute("data-etag") || "";

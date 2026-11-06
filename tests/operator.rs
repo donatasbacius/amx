@@ -279,8 +279,6 @@ async fn the_author_or_owner_cancels_a_running_review_which_frees_the_pr_and_the
         assert!(page.contains("demo#1") && !page.contains("Cancel review"), "no controls behind a proxy ({h}): {page}");
         let index = browser("owner").get(format!("{}/", hub.local)).header(h, "x").send().await.unwrap().text().await.unwrap();
         assert!(index.contains("demo#1") && !index.contains("Connect an agent"), "a proxied caller is nobody ({h}): {index}");
-        let setup = browser("owner").get(format!("{}/setup", hub.local)).header(h, "x").send().await.unwrap();
-        assert_eq!(setup.status(), StatusCode::FORBIDDEN, "{h}");
         let mcp = browser("owner").post(format!("{}/mcp?agent=rv", hub.local)).header(h, "x").header("accept", "application/json, text/event-stream")
             .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "wait", "arguments": {"timeout_seconds": 1}}})).send().await.unwrap();
         assert_eq!(mcp.status(), StatusCode::FORBIDDEN, "a proxied agent can't use the owner's agents ({h})");

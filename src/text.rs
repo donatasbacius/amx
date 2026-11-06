@@ -719,36 +719,46 @@ pub fn nothing_pending(finished: &[&str]) -> String {
 pub const QUIET: &str = "No new events.\nNEXT: call `wait` again.";
 pub const QUIET_PARKED: &str = "No new events.\nNEXT: call `wait` again, or stop and call it later: the result waits for you.";
 
-/// How to connect each client, for `/setup` and the web page. Codex gets its whole table, so
-/// pasting it again replaces it: tools run without asking, and `wait` may block 10 minutes.
+/// The two commands per client on the web page. Codex's set-up appends the whole table, unless
+/// one is there: tools run without asking, and `wait` may block 10 minutes.
 pub fn claude_add(url: &str) -> String {
-    format!("claude mcp add --scope user --transport http amx {url}/mcp")
+    format!("claude mcp add --scope user --transport http amx {}", sh(&format!("{url}/mcp")))
 }
 
-pub fn codex_toml(url: &str) -> String {
+pub fn codex_add(url: &str) -> String {
+    let toml_url = format!("{url}/mcp").replace('\\', "\\\\").replace('"', "\\\"");
     format!(
-        "[mcp_servers.amx]\nurl = \"{url}/mcp\"\ndefault_tools_approval_mode = \"approve\"\ntool_timeout_sec = {}",
-        crate::mcp::WAIT_STREAM + 60
+        "mkdir -p ~/.codex && grep -qs '^\\[mcp_servers\\.amx\\]' ~/.codex/config.toml && echo 'amx is already in ~/.codex/config.toml; edit it there' || \
+         printf '\\n[mcp_servers.amx]\\nurl = \"%s\"\\ndefault_tools_approval_mode = \"approve\"\\ntool_timeout_sec = {}\\n' {} >> ~/.codex/config.toml",
+        crate::mcp::WAIT_STREAM + 60,
+        sh(&toml_url)
     )
 }
 
-pub fn mcp_json(url: &str) -> String {
-    format!("{{\"mcpServers\": {{\"amx\": {{\"type\": \"http\", \"url\": \"{url}/mcp\"}}}}}}")
+pub fn reviewer_prompt(model: &str) -> String {
+    format!("Call amx hello with role reviewer and model {model}, then loop on amx wait and do what it says.")
 }
 
-pub fn setup(url: &str, login: &str) -> String {
-    let claude = crate::server::default_agent(login, "claude");
-    let codex = crate::server::default_agent(login, "codex");
-    format!(
-        "Claude Code:\n  {}\n\n\
-         Codex: in ~/.codex/config.toml, replace any [mcp_servers.amx] table with\n\n{}\n\n\
-         Agents are named {claude} and {codex}; a second session becomes {claude}-2. To pick a name, use {url}/mcp?agent=NAME.\n\
-         For everyone on a repo, commit {} as .mcp.json (Claude Code), or the table above as .codex/config.toml (Codex).\n\n\
-         Reviewers: tell the agent \"Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\" Start a Codex reviewer with `codex --approve-for-me`, so its sub-agents' requests to run `gh` outside the sandbox are approved without you.\n",
-        claude_add(url),
-        codex_toml(url),
-        mcp_json(url),
-    )
+/// `claude` or `codex` started on the reviewer prompt; Codex approves its sub-agents' `gh` runs itself.
+pub fn reviewer_start(program: &str) -> String {
+    let flag = if program == "codex" { " --approve-for-me" } else { "" };
+    format!("{program}{flag} {}", sh(&reviewer_prompt(program)))
+}
+
+/// `s` as one word in sh, bash, zsh and fish: backslashes go outside the quotes, where all four read `\\`.
+fn sh(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./:@,+=".contains(&b)) {
+        return s.into();
+    }
+    let mut q = String::from("'");
+    for c in s.chars() {
+        match c {
+            '\'' => q.push_str("'\\''"),
+            '\\' => q.push_str("'\\\\'"),
+            c => q.push(c),
+        }
+    }
+    q + "'"
 }
 
 pub fn phase_badge(p: Phase) -> &'static str {
@@ -770,17 +780,10 @@ mod tests {
     }
 
     #[test]
-    fn setup_text() {
-        assert_eq!(
-            super::setup("http://relay:7341", "sam@example.com"),
-            "Claude Code:\n  claude mcp add --scope user --transport http amx http://relay:7341/mcp\n\n\
-             Codex: in ~/.codex/config.toml, replace any [mcp_servers.amx] table with\n\n\
-             [mcp_servers.amx]\nurl = \"http://relay:7341/mcp\"\ndefault_tools_approval_mode = \"approve\"\ntool_timeout_sec = 660\n\n\
-             Agents are named sam-claude and sam-codex; a second session becomes sam-claude-2. To pick a name, use http://relay:7341/mcp?agent=NAME.\n\
-             For everyone on a repo, commit {\"mcpServers\": {\"amx\": {\"type\": \"http\", \"url\": \"http://relay:7341/mcp\"}}} \
-             as .mcp.json (Claude Code), or the table above as .codex/config.toml (Codex).\n\n\
-             Reviewers: tell the agent \"Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\" Start a Codex reviewer with `codex --approve-for-me`, so its sub-agents' requests to run `gh` outside the sandbox are approved without you.\n"
-        );
+    fn shell_words() {
+        assert_eq!(super::sh("http://relay:7341/mcp"), "http://relay:7341/mcp");
+        assert_eq!(super::sh("a b'c\\d"), "'a b'\\''c'\\\\'d'");
+        assert_eq!(super::sh(""), "''");
     }
 
     #[test]

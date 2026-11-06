@@ -572,13 +572,7 @@ fn agents_panel(out: &mut String, st: &State, online: &[OnlineAgent], short: &[(
         out.push_str("<p class=\"empty\">No agents online.</p></section>");
         return;
     }
-    out.push_str("<p class=\"prog\">");
-    for m in Model::ALL {
-        let of = online.iter().filter(|a| a.role == Role::Reviewer && a.model == Some(m));
-        let idle = of.clone().filter(|a| a.busy.is_none()).count();
-        let _ = write!(out, "<span><b>{}</b> {idle} idle, {} busy</span>", m.as_str(), of.count() - idle);
-    }
-    out.push_str("</p><ul class=\"agents\">");
+    out.push_str("<ul class=\"agents\">");
     for a in online {
         let what = match (&a.busy, a.role) {
             (Some(id), _) => match st.review(id) {
@@ -782,18 +776,17 @@ fn index_title(prs: &[Pr]) -> String {
     parts.join(" · ")
 }
 
-/// The connect commands for both clients; `/setup` has the rest.
-fn connect(url: &str, login: &str, open: bool) -> String {
+/// Each client's two commands, each with a copy button.
+fn connect(url: &str, open: bool) -> String {
+    let cmd = |label: &str, c: String| format!("<p>{label} <button type=\"button\" class=\"copy\">Copy</button></p><pre><code>{}</code></pre>", esc(&c));
     format!(
         "<details id=\"connect\" class=\"side-d connect\"{open}><summary>{CHEVRON}Connect an agent</summary>\
-         <h3>Claude Code</h3><pre><code>{add}</code></pre>\
-         <h3>Codex</h3><p>In <code>~/.codex/config.toml</code>, replace any <code>[mcp_servers.amx]</code> table with:</p><pre><code>{toml}</code></pre>\
-         <p>Agents are named <code>{claude}</code> and <code>{codex}</code>. <a href=\"/setup\">Full setup</a> covers reviewers, other names and a repo's own config.</p></details>",
+         <h3>Claude Code</h3>{}{}<h3>Codex</h3>{}{}</details>",
+        cmd("Set up amx (once)", crate::text::claude_add(url)),
+        cmd("Start a reviewer", crate::text::reviewer_start("claude")),
+        cmd("Set up amx (once)", crate::text::codex_add(url)),
+        cmd("Start a reviewer", crate::text::reviewer_start("codex")),
         open = if open { " open" } else { "" },
-        add = esc(&crate::text::claude_add(url)),
-        toml = esc(&crate::text::codex_toml(url)),
-        claude = esc(&crate::server::default_agent(login, "claude")),
-        codex = esc(&crate::server::default_agent(login, "codex")),
     )
 }
 
@@ -1651,7 +1644,7 @@ pub async fn index(
     let mine = |r: &Review| login.is_some_and(|l| r.author_login.eq_ignore_ascii_case(l));
     let (main, title) = hub.read(|s, now| {
         let quiet = s.reviews.is_empty() || s.online(now).is_empty();
-        let connect = login.map(|l| connect(&s.web_url, l, quiet));
+        let connect = login.is_some().then(|| connect(&s.web_url, quiet));
         let view = View { filter: q.f.as_deref(), page: q.page.as_deref(), connect, may: &may, mine: &mine };
         index_page(s, now, &view)
     });
