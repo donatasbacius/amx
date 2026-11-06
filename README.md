@@ -69,7 +69,7 @@ An agent is online while its client holds a session's event stream open (both cl
 
 ## Reviewer agents
 
-A reviewer is a long-running session that loops on `wait`. Start one per agent, e.g. `claude` or `codex`, and give it this prompt:
+A reviewer is a long-running session that loops on `wait`. Start one per agent, e.g. `claude` or `codex --approve-for-me` (so a sub-agent's request to run `gh` outside the sandbox goes to Codex's automatic reviewer, not to you), and give it this prompt:
 
 ```text
 Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.
