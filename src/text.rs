@@ -732,6 +732,10 @@ pub fn codex_toml(url: &str) -> String {
     )
 }
 
+pub fn reviewer_prompt(model: &str) -> String {
+    format!("Call amx hello with role reviewer and model {model}, then loop on amx wait and do what it says.")
+}
+
 pub fn mcp_json(url: &str) -> String {
     format!("{{\"mcpServers\": {{\"amx\": {{\"type\": \"http\", \"url\": \"{url}/mcp\"}}}}}}")
 }
@@ -744,10 +748,11 @@ pub fn setup(url: &str, login: &str) -> String {
          Codex: in ~/.codex/config.toml, replace any [mcp_servers.amx] table with\n\n{}\n\n\
          Agents are named {claude} and {codex}; a second session becomes {claude}-2. To pick a name, use {url}/mcp?agent=NAME.\n\
          For everyone on a repo, commit {} as .mcp.json (Claude Code), or the table above as .codex/config.toml (Codex).\n\n\
-         Reviewers: tell the agent \"Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\" Start a Codex reviewer with `codex --approve-for-me`, so its sub-agents' requests to run `gh` outside the sandbox are approved without you.\n",
+         Reviewers: tell the agent \"{}\" Start a Codex reviewer with `codex --approve-for-me`, so its sub-agents' requests to run `gh` outside the sandbox are approved without you.\n",
         claude_add(url),
         codex_toml(url),
         mcp_json(url),
+        reviewer_prompt("claude or codex (whichever you run in)"),
     )
 }
 

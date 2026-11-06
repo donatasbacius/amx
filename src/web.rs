@@ -786,12 +786,16 @@ fn index_title(prs: &[Pr]) -> String {
 fn connect(url: &str, login: &str, open: bool) -> String {
     format!(
         "<details id=\"connect\" class=\"side-d connect\"{open}><summary>{CHEVRON}Connect an agent</summary>\
-         <h3>Claude Code</h3><pre><code>{add}</code></pre>\
-         <h3>Codex</h3><p>In <code>~/.codex/config.toml</code>, replace any <code>[mcp_servers.amx]</code> table with:</p><pre><code>{toml}</code></pre>\
+         <h3>Claude Code</h3><ol><li><p>Add the server:</p><pre><code>{add}</code></pre></li>\
+         <li><p>To review PRs, start <code>claude</code> and tell it: \"{claude_rev}\"</p></li></ol>\
+         <h3>Codex</h3><ol><li><p>In <code>~/.codex/config.toml</code>, replace any <code>[mcp_servers.amx]</code> table with:</p><pre><code>{toml}</code></pre></li>\
+         <li><p>To review PRs, start <code>codex --approve-for-me</code> and tell it: \"{codex_rev}\"</p></li></ol>\
          <p>Agents are named <code>{claude}</code> and <code>{codex}</code>. <a href=\"/setup\">Full setup</a> covers reviewers, other names and a repo's own config.</p></details>",
         open = if open { " open" } else { "" },
         add = esc(&crate::text::claude_add(url)),
         toml = esc(&crate::text::codex_toml(url)),
+        claude_rev = esc(&crate::text::reviewer_prompt("claude")),
+        codex_rev = esc(&crate::text::reviewer_prompt("codex")),
         claude = esc(&crate::server::default_agent(login, "claude")),
         codex = esc(&crate::server::default_agent(login, "codex")),
     )

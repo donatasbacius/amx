@@ -171,6 +171,7 @@ h2 { font-size: var(--fs-3); line-height: var(--lh-3); font-weight: 650; margin:
 .side-d > summary { padding: var(--sp-1) 0; }
 .connect h3 { font-size: inherit; font-weight: 650; margin: var(--sp-3) 0 var(--sp-1); }
 .connect p, .connect pre { margin: 0 0 var(--sp-2); }
+.connect ol { margin: 0; padding-left: 1.5em; }
 .connect pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--sp-2) 10px; }
 .key { display: grid; gap: 2px; margin: var(--sp-2) 0 0; }
 .key dd { margin: 0 0 6px 14px; }

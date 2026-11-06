@@ -383,6 +383,12 @@ async fn setup() {
     let page = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
     assert!(page.contains("Connect an agent</summary>") && page.contains("claude mcp add"), "{page}");
     assert!(page.contains("local-claude</code> and <code>local-codex</code>. <a href=\"/setup\">Full setup</a>"), "the rest is on /setup: {page}");
+    for (start, model) in [("claude", "claude"), ("codex --approve-for-me", "codex")] {
+        let step = format!(
+            "<li><p>To review PRs, start <code>{start}</code> and tell it: \"Call amx hello with role reviewer and model {model}, then loop on amx wait and do what it says.\"</p></li></ol>"
+        );
+        assert!(page.contains(&step), "{step} in {page}");
+    }
     assert!(page.contains("No agents online") && page.contains("<details id=\"connect\" class=\"side-d connect\" open>"), "open while nobody is online: {page}");
     assert!(page.contains("<span class=\"sr\">Viewing on </span>This machine</span></header>"), "--no-tailnet: {page}");
     assert!(!page.contains(">local<") && !page.contains("Viewing as"), "its placeholder login is never shown: {page}");
