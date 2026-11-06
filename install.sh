@@ -26,12 +26,7 @@ case "$os" in
             *) echo "unsupported Linux architecture: $arch" >&2; exit 1 ;;
         esac
         ;;
-    Darwin)
-        case "$arch" in
-            x86_64|arm64) asset="amx-macos-universal" ;;
-            *) echo "unsupported macOS architecture: $arch" >&2; exit 1 ;;
-        esac
-        ;;
+    Darwin) echo "no macOS binary; build from source: cargo install --locked --git $REPO_URL" >&2; exit 1 ;;
     *) echo "unsupported OS: $os (try: cargo install --git $REPO_URL)" >&2; exit 1 ;;
 esac
 
