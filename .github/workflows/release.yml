@@ -32,6 +32,9 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
           rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
       - name: Build
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
@@ -50,34 +53,8 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
-  macos:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target aarch64-apple-darwin --target x86_64-apple-darwin
-          rustup default "$RUST_TOOLCHAIN"
-      - name: Build
-        run: |
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
-      - name: Universal binary
-        run: |
-          mkdir -p dist
-          lipo -create -output dist/amx-macos-universal \
-            target/aarch64-apple-darwin/release/amx \
-            target/x86_64-apple-darwin/release/amx
-          lipo -info dist/amx-macos-universal
-          dist/amx-macos-universal --version
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: amx-macos-universal
-          path: dist/amx-macos-universal
-          if-no-files-found: error
-
   release:
-    needs: [linux, macos]
+    needs: [linux]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
@@ -102,5 +79,4 @@ jobs:
             --generate-notes \
             dist/amx-linux-x86_64 \
             dist/amx-linux-aarch64 \
-            dist/amx-macos-universal \
             dist/SHA256SUMS
