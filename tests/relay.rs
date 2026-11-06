@@ -4393,6 +4393,7 @@ fn every_task_goes_to_a_fresh_sub_agent_and_a_new_review_starts_from_scratch() {
     let task = sim.task("rev-a");
     assert!(task.contains(&format!("You must do this review {fresh}")) && task.contains("It calls `submit_findings` itself"), "{task}");
     assert!(task.contains("pass it the whole text of this task and nothing of your own") && task.contains("If you are that sub-agent, or your client has none, do it yourself, from scratch."), "{task}");
+    assert!(task.contains("Never ask the user or wait for approval: spawn it at once, and if a command fails, carry on and say so in your review."), "{task}");
     assert!(task.contains(scratch) && task.contains("How to review, correctness first:") && !task.contains("Focus on what changed"), "{task}");
     assert!(task.contains("gh api -H 'Accept: application/vnd.github.raw' 'repos/rust-lang/rust/contents/<path>?ref=<head_sha>'"), "{task}");
     sim.submit("rev-a", &id, &[("major", "cache never invalidated")]);
@@ -4409,7 +4410,7 @@ fn every_task_goes_to_a_fresh_sub_agent_and_a_new_review_starts_from_scratch() {
     let task = sim.task("rev-a");
     assert!(task.contains("Focus on what changed since 0123456") && !task.contains(scratch) && task.contains(&format!("You must do this review {fresh}")), "{task}");
     let s = amx::text::instructions(Some(Role::Reviewer));
-    assert!(s.contains("Each review is a new one: you must do its review, vote and reply tasks in a fresh sub-agent as each task says, never from memory of an earlier review"), "{s}");
+    assert!(s.contains("Each review is a new one: you must do its review, vote and reply tasks in a fresh sub-agent as each task says, never from memory of an earlier review") && s.contains("Never ask the user or wait for approval."), "{s}");
     let tools = amx::mcp::tools().to_string();
     assert!(tools.contains("Review from scratch: read the whole diff and the files it touches at the head") && tools.contains("agree and disagree each need a short reason"), "{tools}");
 }

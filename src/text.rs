@@ -180,7 +180,7 @@ fn fresh_context(what: &str, tool: &str, ticket: Option<&str>) -> String {
         None => String::new(),
     };
     format!(
-        "You must do this {what} in a fresh sub-agent (Claude Code: the Agent tool, general-purpose, not a fork; Codex: spawn_agent with fork_turns \"none\") with no memory of earlier reviews: pass it the whole text of this task and nothing of your own. It calls {tool} itself{with}; you wait for it, then call `wait` again. If you are that sub-agent, or your client has none, do it yourself, from scratch.\n"
+        "You must do this {what} in a fresh sub-agent (Claude Code: the Agent tool, general-purpose, not a fork; Codex: spawn_agent with fork_turns \"none\") with no memory of earlier reviews: pass it the whole text of this task and nothing of your own. It calls {tool} itself{with}; you wait for it, then call `wait` again. Never ask the user or wait for approval: spawn it at once, and if a command fails, carry on and say so in your {what}. If you are that sub-agent, or your client has none, do it yourself, from scratch.\n"
     )
 }
 
@@ -694,7 +694,7 @@ pub fn events(evs: &[AgentEvent]) -> String {
 /// The protocol for an agent in `role`, or for either role before it has one.
 pub fn instructions(role: Option<Role>) -> String {
     let role_text = match role {
-        Some(Role::Reviewer) => "Your role is reviewer: loop on `wait` forever. When it returns, do exactly what its NEXT line says (accept an offer, review the PR and submit_findings, vote, ...), then call `wait` again. Never end your turn while a review is in progress. Each review is a new one: you must do its review, vote and reply tasks in a fresh sub-agent as each task says, never from memory of an earlier review, even of the same PR.",
+        Some(Role::Reviewer) => "Your role is reviewer: loop on `wait` forever. When it returns, do exactly what its NEXT line says (accept an offer, review the PR and submit_findings, vote, ...), then call `wait` again. Never end your turn while a review is in progress. Each review is a new one: you must do its review, vote and reply tasks in a fresh sub-agent as each task says, never from memory of an earlier review, even of the same PR. Never ask the user or wait for approval.",
         Some(Role::Author) => "Your role is author: call `request_review` with a PR URL and its title, then `wait` until the consolidated result arrives. Fix confirmed findings, push, and `request_rereview`.",
         None => "Reviewers call `hello` with role \"reviewer\" and model \"claude\" or \"codex\" (the agent program they run in), then loop on `wait` forever, doing exactly what each NEXT line says; never end your turn while a review is in progress. Authors call `request_review` with a PR URL and its title, then `wait` for the consolidated result.",
     };
@@ -744,7 +744,7 @@ pub fn setup(url: &str, login: &str) -> String {
          Codex: in ~/.codex/config.toml, replace any [mcp_servers.amx] table with\n\n{}\n\n\
          Agents are named {claude} and {codex}; a second session becomes {claude}-2. To pick a name, use {url}/mcp?agent=NAME.\n\
          For everyone on a repo, commit {} as .mcp.json (Claude Code), or the table above as .codex/config.toml (Codex).\n\n\
-         Reviewers: tell the agent \"Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\"\n",
+         Reviewers: tell the agent \"Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\" Start a Codex reviewer with `codex --approve-for-me`, so its sub-agents' requests to run `gh` outside the sandbox are approved without you.\n",
         claude_add(url),
         codex_toml(url),
         mcp_json(url),
@@ -779,7 +779,7 @@ mod tests {
              Agents are named sam-claude and sam-codex; a second session becomes sam-claude-2. To pick a name, use http://relay:7341/mcp?agent=NAME.\n\
              For everyone on a repo, commit {\"mcpServers\": {\"amx\": {\"type\": \"http\", \"url\": \"http://relay:7341/mcp\"}}} \
              as .mcp.json (Claude Code), or the table above as .codex/config.toml (Codex).\n\n\
-             Reviewers: tell the agent \"Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\"\n"
+             Reviewers: tell the agent \"Call amx hello with role reviewer and model claude or codex (whichever you run in), then loop on amx wait and do what it says.\" Start a Codex reviewer with `codex --approve-for-me`, so its sub-agents' requests to run `gh` outside the sandbox are approved without you.\n"
         );
     }
 
